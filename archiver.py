@@ -368,6 +368,10 @@ def cleanup_old_files(
     orphaned_jpgs: List[Tuple[str, int]] = []
     cutoff_dt = datetime.now() - timedelta(days=max_days_old)
 
+    log(
+        f"Scanning for orphaned JPG files older than {max_days_old} days (cutoff: {cutoff_dt.strftime('%Y-%m-%d %H:%M:%S')})"
+    )
+
     for root, _, files in os.walk(directory):
         for file in files:
             if not file.lower().endswith(".jpg"):
@@ -377,26 +381,42 @@ def cleanup_old_files(
 
             # Skip if we already marked it for deletion (paired with MP4)
             if any(jpg_path == p for p, _ in files_to_remove):
+                log(f"Skipping JPG (already paired with MP4): {jpg_path}")
                 continue
 
             ts = extract_timestamp(file)
-            if not ts or ts >= cutoff_dt:
+            if not ts:
+                log(f"Skipping JPG (no valid timestamp found): {jpg_path}")
+                continue
+
+            if ts >= cutoff_dt:
+                log(
+                    f"Skipping JPG (too recent - {ts.strftime('%Y-%m-%d %H:%M:%S')}): {jpg_path}"
+                )
                 continue  # not old enough
 
             try:
                 size = os.path.getsize(jpg_path)
-            except OSError:
+            except OSError as e:
+                log(f"Warning: Could not get size for {jpg_path}: {e}")
                 size = 0
 
+            log(
+                f"Marking orphaned JPG for deletion ({size} bytes, {ts.strftime('%Y-%m-%d %H:%M:%S')}): {jpg_path}"
+            )
             orphaned_jpgs.append((jpg_path, size))
 
     # Add all orphaned JPGs to the removal list (bypassing size limits)
     if orphaned_jpgs:
+        total_orphaned_size = sum(size for _, size in orphaned_jpgs)
         log(
-            f"Found {len(orphaned_jpgs)} orphaned JPG files to remove (bypassing size limits)"
+            f"Found {len(orphaned_jpgs)} orphaned JPG files to remove "
+            f"({total_orphaned_size / 1024:.1f} KB total, bypassing size limits)"
         )
         files_to_remove.extend(orphaned_jpgs)
-        total_size_bytes += sum(size for _, size in orphaned_jpgs)
+        total_size_bytes += total_orphaned_size
+    else:
+        log("No orphaned JPG files found for deletion")
 
     if not files_to_remove:
         log("No files to cleanup!")
