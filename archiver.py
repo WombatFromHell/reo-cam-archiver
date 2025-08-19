@@ -1,14 +1,12 @@
 #!/usr/bin/python3
 
 import argparse
-import io
 import logging
 import os
 import re
-import shutil
+import select
 import subprocess
 import sys
-import threading
 from datetime import datetime, timedelta
 
 base_dir = "/camera"
@@ -226,11 +224,6 @@ def remove_empty(path, dry_run=False):
     return count
 
 
-def _normalize_path(path: str) -> str:
-    """Return an absolute, normalized path with forward slashes."""
-    return os.path.normpath(os.path.abspath(path))
-
-
 def collect_files_to_delete(directory: str, max_days_old: int) -> list:
     """
     Collect files older than *max_days_old* days for deletion.
@@ -347,18 +340,16 @@ def cleanup_old_files(
     return total_size / (1024**2)  # Return size in MB
 
 
-def transcode_file(input_file, output_file):
-    """Transcode a video file using FFmpeg with hardware acceleration
-
-    Args:
-        input_file (str): Path to source file
-        output_file (str): Path to output file
-
-    Note: This function is tailored for Intel Celeron J3455 processors.
+def transcode_file(input_file: str, output_file: str) -> None:
     """
-    command = [
+    Transcode with FFmpeg while streaming stdout/stderr to the terminal *immediately*.
+    Guarantees that no zombie process is left behind – even if FFmpeg exits early or
+    an exception occurs inside this function.
+    """
+
+    cmd = [
         "ffmpeg",
-        "-y",
+        "-y",  # overwrite without asking
         "-hwaccel",
         "vaapi",
         "-hwaccel_output_format",
@@ -371,36 +362,32 @@ def transcode_file(input_file, output_file):
         "26",
         "-c:v",
         "h264_qsv",
-        "-an",  # No audio
+        "-an",
         output_file,
     ]
 
-    process = subprocess.Popen(
-        command, stdin=subprocess.PIPE, stderr=subprocess.PIPE, stdout=subprocess.PIPE
-    )
-
-    if not process.stderr:
-        log("Error: stderr is None!")
-        return
-
-    err_buf = io.BytesIO()
-    err_thread = threading.Thread(
-        target=shutil.copyfileobj, args=(process.stderr, err_buf)
-    )
-    err_thread.start()
-
-    # Read and log stdout output
-    if process.stdout:
-        for line in process.stdout:
-            log(line.decode().strip())
-
-    # Wait for process to finish
-    process.wait()
-    err_thread.join()
-
-    if err_buf.tell() > 0:
-        err_buf.seek(0)
-        log(f"FFmpeg Errors: {err_buf.read().decode()}")
+    with subprocess.Popen(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1
+    ) as proc:
+        try:
+            while proc.poll() is None:
+                rlist, _, _ = select.select([proc.stdout, proc.stderr], [], [], 0.1)
+                for stream in rlist:
+                    if line := stream.readline():
+                        (sys.stdout if stream is proc.stdout else sys.stderr).write(
+                            line
+                        )
+            # Read any remaining output after process ends
+            for stream in [proc.stdout, proc.stderr]:
+                if stream:
+                    while line := stream.readline():
+                        (sys.stdout if stream is proc.stdout else sys.stderr).write(
+                            line
+                        )
+        finally:
+            if proc.poll() is None:
+                proc.terminate()
+                proc.wait(timeout=5)  # This prevents zombies
 
 
 def transcode_list(file_list, dry_run=False):
