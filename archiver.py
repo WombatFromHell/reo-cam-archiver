@@ -37,8 +37,11 @@ def extract_timestamp(filename):
     match = re.search(r"\d{14}", filename)
     if not match:
         return None
+
+    timestamp_str = match.group()
+
     try:
-        return datetime.strptime(match.group(), target_fmt)
+        return datetime.strptime(timestamp_str, "%Y%m%d%H%M%S")
     except ValueError:
         return None
 
@@ -157,6 +160,26 @@ def create_file_list(directory, age_days=0, ext_str="mp4"):
     return file_tuples
 
 
+def is_directory_truly_empty(path):
+    """Check if a directory is truly empty (no files, no subdirectories)
+
+    Args:
+        path (str): Directory path to check
+
+    Returns:
+        bool: True if directory is completely empty, False otherwise
+    """
+    try:
+        with os.scandir(path) as entries:
+            for _ in entries:
+                # If we find any entry (file or directory), it's not empty
+                return False
+        return True
+    except OSError:
+        # If we can't scan the directory, assume it's not empty to be safe
+        return False
+
+
 def remove_empty(path, dry_run=False):
     """Remove empty directories in a directory tree
 
@@ -168,98 +191,130 @@ def remove_empty(path, dry_run=False):
         int: Number of directories removed
     """
     count = 0
+    removed_dirs = set()  # Track successfully removed directories
+    failed_dirs = set()  # Track directories that failed to be removed
+
     for dirpath, _, _ in os.walk(path, topdown=False):
         # Skip if it's the base path itself (to avoid removing the root)
-        if dirpath == path and not dry_run:
+        if dirpath == path:
             continue
 
-        is_empty = True
+        # Skip if this directory was already processed or is a child of a failed directory
+        if dirpath in removed_dirs or any(
+            dirpath.startswith(failed_dir) for failed_dir in failed_dirs
+        ):
+            continue
 
-        try:
-            with os.scandir(dirpath) as entries:  # Use scandir properly
-                for entry in entries:
-                    if entry.is_file():
-                        is_empty = False
-                        break
-
-            if is_empty:
-                try:
-                    if not dry_run:
-                        log(f"Removed empty directory: {dirpath}")
-                        os.rmdir(dirpath)
-                        count += 1
-                    else:
-                        log(f"Would have removed empty directory: {dirpath}")
-                except OSError as e:
+        if is_directory_truly_empty(dirpath):
+            try:
+                if not dry_run:
+                    os.rmdir(dirpath)
+                    removed_dirs.add(dirpath)
+                    log(f"Removed empty directory: {dirpath}")
+                    count += 1
+                else:
+                    log(f"Would remove empty directory: {dirpath}")
+                    count += 1
+            except OSError as e:
+                # Only log the error if we haven't already failed on a parent directory
+                if not any(
+                    dirpath.startswith(failed_dir) for failed_dir in failed_dirs
+                ):
                     log(f"Failed to remove directory {dirpath}: {str(e)}")
-        except OSError:
-            # Directory might have been deleted during iteration, skip it
-            continue
+                failed_dirs.add(dirpath)
 
     return count
 
 
-def collect_files_to_delete(directory, max_days_old):
-    """Collect files older than a certain age
+def _normalize_path(path: str) -> str:
+    """Return an absolute, normalized path with forward slashes."""
+    return os.path.normpath(os.path.abspath(path))
 
-    Args:
-        directory (str): Directory to search
-        max_days_old (int): Maximum age in days
 
-    Returns:
-        list: List of tuples (file_path, timestamp, file_size) for old files
+def collect_files_to_delete(directory: str, max_days_old: int) -> list:
     """
-    files_to_delete = []
+    Collect files older than *max_days_old* days for deletion.
 
-    # We want to collect files that are *older* than max_days_old
-    max_timestamp = datetime.now() - timedelta(days=max_days_old)
+    Returns a **sorted list** of tuples:
 
-    try:
-        for root, _, files in os.walk(directory):
-            for file in files:
-                file_path = os.path.join(root, file)
+        (file_path, timestamp, size_in_bytes, jpg_path_or_None)
 
-                # Skip if it's a .jpg file (as per original logic)
-                if file.endswith(".jpg"):
-                    continue
+    All paths are absolute and normalised so that callers can compare them
+    reliably.  The list is sorted by the extracted timestamp (oldest first)
+    – this matches the behaviour that `cleanup_old_files()` expects.
+    """
+    candidates = []
+    cutoff_datetime = datetime.now() - timedelta(days=max_days_old)
 
-                timestamp = extract_timestamp(file)
-                if not timestamp or timestamp > max_timestamp:
-                    continue  # Skip files that are newer than the cutoff
+    for root, _, files in os.walk(directory):
+        for file in files:
+            # Skip JPG companions – we only want to consider MP4s
+            if file.lower().endswith(".jpg"):
+                continue
 
-                file_size = os.path.getsize(file_path)
-                files_to_delete.append((file_path, timestamp, file_size))
-    except OSError:
-        pass  # Handle directory access errors gracefully
+            timestamp = extract_timestamp(file)
+            if not timestamp or timestamp >= cutoff_datetime:
+                continue
 
-    return files_to_delete
+            file_path = os.path.normpath(os.path.abspath(os.path.join(root, file)))
+            try:
+                size = os.path.getsize(file_path)
+            except OSError:
+                size = 0
+
+            base, _ = os.path.splitext(file_path)
+            jpg_path = f"{base}.jpg"
+            if not os.path.exists(jpg_path):
+                jpg_path = None
+
+            candidates.append((file_path, timestamp, size, jpg_path))
+
+    # Return sorted by timestamp (oldest first) – identical to old behaviour
+    return sorted(candidates, key=lambda x: x[1])
 
 
-def cleanup_old_files(directory, max_days_old, max_size_gb, dry_run=False):
-    """Clean up old files in a directory
+def cleanup_old_files(
+    directory: str,
+    max_days_old: int,
+    max_size_gb: float,
+    dry_run: bool = False,
+) -> float:
+    """
+    Clean up old files in *directory*.
 
-    Args:
-        directory (str): Directory to clean
-        max_days_old (int): Maximum age of files to keep
-        max_size_gb (float): Maximum size to keep in GB
-        dry_run (bool, optional): If True, don't actually make changes. Defaults to False.
-
-    Returns:
-        float: Total size of files that would be removed (in MB)
+    The function now expects `collect_files_to_delete()` to return a list of
+    tuples, so the code below has been simplified accordingly.
     """
     total_size = 0
-    flagged_files = collect_files_to_delete(directory, max_days_old)
 
-    # Sort by oldest first
-    sorted_files = sorted(flagged_files, key=lambda x: x[1])
+    # Get candidate files as a sorted list (oldest first)
+    flagged_mp4s = collect_files_to_delete(directory, max_days_old)
 
     files_to_remove = []
-    for file_path, _, file_size in sorted_files:
+
+    for mp4_path, ts, file_size, jpg_path in flagged_mp4s:
         if total_size >= (max_size_gb * 1024**3):
             break
 
-        files_to_remove.append((file_path, file_size))
+        # Double‑check the modification time to guard against race conditions
+        try:
+            if datetime.fromtimestamp(os.path.getmtime(mp4_path)) >= (
+                datetime.now() - timedelta(days=max_days_old)
+            ):
+                continue
+        except OSError:
+            continue
+
+        files_to_remove.append((mp4_path, file_size))
         total_size += file_size
+
+        if jpg_path and os.path.exists(jpg_path):
+            try:
+                jpg_size = os.path.getsize(jpg_path)
+            except OSError:
+                jpg_size = 0
+            files_to_remove.append((jpg_path, jpg_size))
+            total_size += jpg_size
 
     if not files_to_remove:
         log("No files to cleanup!")
@@ -267,23 +322,27 @@ def cleanup_old_files(directory, max_days_old, max_size_gb, dry_run=False):
 
     log(f"Found {len(files_to_remove)} ({total_size / (1024**2):.2f} MB) to cleanup...")
 
+    dirs_before = {root for root, _, _ in os.walk(directory)}
     for file_path, _ in files_to_remove:
-        parent_dir = os.path.dirname(file_path)
-
         if not dry_run:
-            # Remove the file
             try:
                 os.remove(file_path)
                 log(f"Deleted old file: {file_path}")
-
-                # Check if directory is now empty
-                if not os.listdir(parent_dir):
-                    log(f"Removing empty directory: {parent_dir}")
-                    os.rmdir(parent_dir)
             except OSError as e:
                 log(f"Failed to remove file {file_path}: {str(e)}")
         else:
             log(f"Would have deleted: {file_path}")
+
+    dirs_after = {root for root, _, _ in os.walk(directory)}
+    dirs_to_remove = dirs_before - dirs_after
+    if not dry_run:
+        for dirpath in sorted(dirs_to_remove, reverse=True):
+            if is_directory_truly_empty(dirpath):
+                try:
+                    os.rmdir(dirpath)
+                    log(f"Removed empty directory after cleanup: {dirpath}")
+                except OSError:
+                    pass
 
     return total_size / (1024**2)  # Return size in MB
 

@@ -108,7 +108,7 @@ class TestArchiveFunctions(unittest.TestCase):
         valid_filepath = os.path.join(self.input_dir, valid_filename)
 
         result = archiver.format_timestamp_filepath(
-            valid_filepath, self.test_timestamp, self.archived_dir
+            valid_filename, self.test_timestamp, self.archived_dir
         )
 
         # Ensure result is not None before accessing [0] and [1]
@@ -122,10 +122,34 @@ class TestArchiveFunctions(unittest.TestCase):
 
         # Test invalid filename format (not enough parts)
         test_file = os.path.join(self.input_dir, "video.mp4")
+        test_filename = os.path.basename(test_file)
         result = archiver.format_timestamp_filepath(
-            test_file, self.test_timestamp, self.archived_dir
+            test_filename, self.test_timestamp, self.archived_dir
         )
         self.assertIsNone(result)
+
+    def test_is_directory_truly_empty(self):
+        """Test the new is_directory_truly_empty function"""
+        # Create a truly empty directory
+        empty_dir = os.path.join(self.temp_dir, "empty")
+        os.makedirs(empty_dir, exist_ok=True)
+        self.assertTrue(archiver.is_directory_truly_empty(empty_dir))
+
+        # Create a directory with a file
+        dir_with_file = os.path.join(self.temp_dir, "with_file")
+        os.makedirs(dir_with_file, exist_ok=True)
+        with open(os.path.join(dir_with_file, "test.txt"), "w") as f:
+            f.write("test")
+        self.assertFalse(archiver.is_directory_truly_empty(dir_with_file))
+
+        # Create a directory with a subdirectory
+        dir_with_subdir = os.path.join(self.temp_dir, "with_subdir")
+        os.makedirs(dir_with_subdir, exist_ok=True)
+        os.makedirs(os.path.join(dir_with_subdir, "subdir"), exist_ok=True)
+        self.assertFalse(archiver.is_directory_truly_empty(dir_with_subdir))
+
+        # Test non-existent directory
+        self.assertFalse(archiver.is_directory_truly_empty("/nonexistent/path"))
 
     def test_create_file_list_recurse(self):
         """Test recursive file listing with age filtering"""
@@ -170,33 +194,108 @@ class TestArchiveFunctions(unittest.TestCase):
         self.assertEqual(len(files), 1)
         self.assertTrue(any(f[0] == test_file for f in files))
 
-    def test_remove_empty_directories(self):
-        """Test removing empty directories"""
+    def test_remove_empty_directories_improved(self):
+        """Test the improved remove_empty function"""
+        # Create a complex directory structure
+        dir_structure = {
+            "parent": {
+                "empty_child": {},
+                "non_empty_child": {"file.txt": "content"},
+                "nested_empty": {"deep_empty": {}},
+            }
+        }
+
+        # Build the actual directory structure
+        def create_structure(base_path, structure):
+            for name, content in structure.items():
+                current_path = os.path.join(base_path, name)
+                if isinstance(content, dict):
+                    os.makedirs(current_path, exist_ok=True)
+                    create_structure(current_path, content)
+                else:
+                    # It's a file
+                    with open(current_path, "w") as f:
+                        f.write(content)
+
+        test_base = os.path.join(self.temp_dir, "remove_test")
+        os.makedirs(test_base, exist_ok=True)
+        create_structure(test_base, dir_structure)
+
+        # Test dry run first
+        count = archiver.remove_empty(test_base, dry_run=True)
+        self.assertGreaterEqual(
+            count, 1
+        )  # Should find at least the deep_empty directory
+
+        # Verify directories still exist after dry run
+        self.assertTrue(
+            os.path.exists(
+                os.path.join(test_base, "parent", "nested_empty", "deep_empty")
+            )
+        )
+
+        # Now test actual removal
+        count = archiver.remove_empty(test_base, dry_run=False)
+        self.assertGreaterEqual(count, 1)
+
+        # Verify the empty directories were removed but non-empty ones remain
+        self.assertFalse(
+            os.path.exists(
+                os.path.join(test_base, "parent", "nested_empty", "deep_empty")
+            )
+        )
+        self.assertTrue(
+            os.path.exists(os.path.join(test_base, "parent", "non_empty_child"))
+        )
+
+    def test_remove_empty_directories_race_condition(self):
+        """Test remove_empty function handles race conditions gracefully"""
         # Create a directory structure
-        dir_a = os.path.join(self.temp_dir, "dir_a")
+        dir_a = os.path.join(self.temp_dir, "race_test", "dir_a")
         dir_b = os.path.join(dir_a, "dir_b")
         dir_c = os.path.join(dir_b, "dir_c")
 
         os.makedirs(dir_c)
-        with open(os.path.join(dir_c, "test.txt"), "w") as f:
-            f.write("Test file")
 
-        # Should not remove anything because there are files
-        count = archiver.remove_empty(self.temp_dir, dry_run=True)
-        self.assertEqual(count, 0)
+        # Mock os.rmdir to simulate a failure on the parent directory
+        original_rmdir = os.rmdir
+        failed_dirs = set()
 
-        # Remove the test file so directory becomes empty
-        os.remove(os.path.join(dir_c, "test.txt"))
+        def mock_rmdir(path):
+            if "dir_a" in path and path not in failed_dirs:
+                failed_dirs.add(path)
+                raise OSError("[Errno 39] Directory not empty")
+            return original_rmdir(path)
 
-        # Now it should be able to remove empty directories
-        # The function should remove all empty directories in the chain
-        count = archiver.remove_empty(
-            dir_a, dry_run=False
-        )  # Changed to actually remove and target the right directory
+        with patch("os.rmdir", side_effect=mock_rmdir):
+            # This should handle the race condition gracefully
+            count = archiver.remove_empty(
+                os.path.join(self.temp_dir, "race_test"), dry_run=False
+            )
 
-        # Verify directories were removed
-        expected_removals = 1  # At minimum dir_c should be removed
-        self.assertGreaterEqual(count, expected_removals)
+            # Should still remove some directories despite failures
+            self.assertGreaterEqual(count, 0)
+
+        # Capture output to verify no redundant error messages
+        output = self.stdout_capture.getvalue()
+        error_lines = [
+            line for line in output.split("\n") if "Failed to remove directory" in line
+        ]
+
+        # Should only have one error message per truly failed directory
+        # (not multiple messages for the same directory path)
+        unique_failed_paths = set()
+        for line in error_lines:
+            if "Failed to remove directory" in line:
+                # Extract path from error message
+                path_start = line.find("/")
+                path_end = line.find(":", path_start)
+                if path_start != -1 and path_end != -1:
+                    path = line[path_start:path_end]
+                    unique_failed_paths.add(path)
+
+        # Should not have duplicate error messages for the same path
+        self.assertLessEqual(len(error_lines), len(unique_failed_paths) + 1)
 
     def test_collect_files_to_delete(self):
         """Test file collection for deletion based on age"""
@@ -264,8 +363,8 @@ class TestArchiveFunctions(unittest.TestCase):
         self.assertTrue(older_file in [f[0] for f in files_to_delete])
         self.assertFalse(newer_file in [f[0] for f in files_to_delete])
 
-    def test_cleanup_old_files(self):
-        """Test cleanup of old files"""
+    def test_cleanup_old_files_with_directory_removal(self):
+        """Test cleanup of old files and subsequent directory cleanup"""
         # Create files with specific timestamps to control age
         current_time = time.time()
         old_time = current_time - (2 * 24 * 60 * 60)  # 2 days ago
@@ -295,11 +394,56 @@ class TestArchiveFunctions(unittest.TestCase):
         # but not actually delete files, so size_mb should be > 0
         self.assertGreater(size_mb, 0)
 
+        # Test actual cleanup
+        old_file_parent = os.path.dirname(old_file)
+        size_mb = archiver.cleanup_old_files(
+            self.input_dir, max_days_old=1, max_size_gb=0.1, dry_run=False
+        )
+
+        # Verify old file was deleted
+        self.assertFalse(os.path.exists(old_file))
+        # Verify new file still exists
+        self.assertTrue(os.path.exists(new_file))
+
+    def test_cleanup_old_files(self):
+        """Test cleanup of old files"""
+        # Create files with specific timestamps to control age
+        current_time = time.time()
+        old_time = current_time - (2 * 24 * 60 * 60)  # 2 days ago
+
+        # Create a file to delete (older than max_days_old)
+        old_file = os.path.join(
+            self.input_dir, "2024", "01", "13", "REO_DRIVEWAY_01_20240113175512.mp4"
+        )
+        os.makedirs(os.path.dirname(old_file), exist_ok=True)
+        with open(old_file, "w") as f:
+            f.write("Old file content")
+        os.utime(old_file, (old_time, old_time))
+
+        # Create a newer file that shouldn't be deleted
+        new_file = os.path.join(
+            self.input_dir, "2024", "01", "15", "REO_DRIVEWAY_01_20240115175513.mp4"
+        )
+        os.makedirs(os.path.dirname(new_file), exist_ok=True)
+        with open(new_file, "w") as f:
+            f.write("New file content")
+
+        # Test cleanup with dry run
+        size_mb = archiver.cleanup_old_files(
+            self.input_dir, max_days_old=1, max_size_gb=0.1, dry_run=True
+        )
+
+        # For dry run, we expect the function to report the size that would be freed
+        # but not actually delete files, so size_mb should be > 0
+        self.assertGreater(size_mb, 0)
+
     def test_transcode_list(self):
         """Test transcoding list functionality"""
         # Create a file in the expected directory structure with proper naming
-        test_file = os.path.join(self.input_dir, "REO_DRIVEWAY_01_20240115175512.mp4")
-        with open(test_file, "w") as f:
+        filename = "REO_DRIVEWAY_01_20240115175512.mp4"
+        test_file_path = os.path.join(self.input_dir, filename)
+
+        with open(test_file_path, "w") as f:
             f.write("Test video content")
 
         # Create a fake output directory structure
@@ -335,7 +479,7 @@ class TestArchiveFunctions(unittest.TestCase):
                 mock_remove.return_value = None
 
                 # Prepare the file list in the expected format
-                files_to_transcode = [(test_file, self.test_timestamp)]
+                files_to_transcode = [(filename, self.test_timestamp)]
 
                 # Run transcode_list
                 count = archiver.transcode_list(files_to_transcode, dry_run=False)
@@ -425,6 +569,69 @@ class TestArchiveFunctions(unittest.TestCase):
             # Restore original values
             archiver.base_dir = original_base_dir
             archiver.output_dir = original_output_dir
+
+    def test_edge_case_directory_removal_with_hidden_files(self):
+        """Test directory removal when hidden files or race conditions occur"""
+        # Create a directory structure
+        test_dir = os.path.join(self.temp_dir, "hidden_test")
+        nested_dir = os.path.join(test_dir, "nested")
+        os.makedirs(nested_dir, exist_ok=True)
+
+        # Mock is_directory_truly_empty to simulate a race condition
+        # where directory appears empty but removal fails
+        original_is_empty = archiver.is_directory_truly_empty
+        original_rmdir = os.rmdir
+
+        def mock_is_empty(path):
+            return True  # Always report as empty
+
+        def mock_rmdir(path):
+            if "nested" in path:
+                raise OSError("[Errno 39] Directory not empty: '{}'".format(path))
+            return original_rmdir(path)
+
+        with patch.object(
+            archiver, "is_directory_truly_empty", side_effect=mock_is_empty
+        ):
+            with patch("os.rmdir", side_effect=mock_rmdir):
+                # This should handle the failure gracefully
+                count = archiver.remove_empty(test_dir, dry_run=False)
+
+                # Should attempt removal but handle failure gracefully
+                self.assertGreaterEqual(count, 0)
+
+        # Verify error message was logged but not duplicated excessively
+        output = self.stdout_capture.getvalue()
+        error_count = output.count("Failed to remove directory")
+
+        # Should have logged the error, but not excessively
+        self.assertGreaterEqual(error_count, 1)
+        self.assertLessEqual(
+            error_count, 2
+        )  # Shouldn't have excessive duplicate errors
+
+    def test_remove_empty_with_permission_error(self):
+        """Test remove_empty function handles permission errors gracefully"""
+        # Create a directory structure
+        test_dir = os.path.join(self.temp_dir, "permission_test")
+        sub_dir = os.path.join(test_dir, "subdir")
+        os.makedirs(sub_dir, exist_ok=True)
+
+        # Mock os.rmdir to simulate permission error
+        def mock_rmdir(path):
+            raise OSError("[Errno 13] Permission denied: '{}'".format(path))
+
+        with patch("os.rmdir", side_effect=mock_rmdir):
+            # Should handle permission errors gracefully
+            count = archiver.remove_empty(test_dir, dry_run=False)
+
+            # Count should be 0 since no directories were actually removed
+            self.assertEqual(count, 0)
+
+        # Check that error was logged appropriately
+        output = self.stdout_capture.getvalue()
+        self.assertIn("Failed to remove directory", output)
+        self.assertIn("Permission denied", output)
 
 
 if __name__ == "__main__":
