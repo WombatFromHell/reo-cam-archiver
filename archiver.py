@@ -316,7 +316,7 @@ def cleanup_old_files(
 
       - Any .jpg that has a matching old .mp4 is deleted together with the mp4.
       - Any orphaned .jpg (no matching .mp4 at all) is also removed if it
-        is older than *max_days_old*.
+        is older than *max_days_old* - REGARDLESS of size limits.
 
     The total size returned is in **MB** and includes both video and photo data.
     """
@@ -329,8 +329,8 @@ def cleanup_old_files(
     # Build a complete list of files to delete (MP4 + paired JPG) **before**
     # applying the size limit.  The original implementation stopped adding
     # files as soon as the cumulative size exceeded `max_size_gb`.  This
-    # meant that for small test files – which is exactly what our unit tests
-    # create – nothing was ever queued for deletion.
+    # meant that for small test files — which is exactly what our unit tests
+    # create — nothing was ever queued for deletion.
     #
     # We now first gather all qualifying MP4s and their JPG partners,
     # then apply the size limit.  Any file that would push the total over
@@ -359,48 +359,51 @@ def cleanup_old_files(
                 trimmed.append((path, sz))
                 cur_total += sz
         files_to_remove = trimmed
+        total_size_bytes = cur_total
 
     # ------------------------------------------------------------------
-    # Add orphaned JPGs (no matching MP4) only after the size limit has
-    # been applied to the MP4/JPG pairs above.  This keeps the logic
-    # straightforward and mirrors the behaviour of the original script.
+    # Add orphaned JPGs (no matching MP4) REGARDLESS of size limits.
+    # These are typically small files and help with disk cleanup.
     # ------------------------------------------------------------------
-    if total_size_bytes < (max_size_gb * 1024**3):
-        cutoff_dt = datetime.now() - timedelta(days=max_days_old)
-        for root, _, files in os.walk(directory):
-            for file in files:
-                if not file.lower().endswith(".jpg"):
-                    continue
+    orphaned_jpgs: List[Tuple[str, int]] = []
+    cutoff_dt = datetime.now() - timedelta(days=max_days_old)
 
-                jpg_path = os.path.normpath(os.path.abspath(os.path.join(root, file)))
-
-                # Skip if we already marked it for deletion
-                if any(jpg_path == p for p, _ in files_to_remove):
-                    continue
-
-                ts = extract_timestamp(file)
-                if not ts or ts >= cutoff_dt:
-                    continue  # not old enough
-
-                try:
-                    size = os.path.getsize(jpg_path)
-                except OSError:
-                    size = 0
-                files_to_remove.append((jpg_path, size))
-                total_size_bytes += size
-
-                if total_size_bytes >= (max_size_gb * 1024**3):
-                    break
-            else:
+    for root, _, files in os.walk(directory):
+        for file in files:
+            if not file.lower().endswith(".jpg"):
                 continue
-            break  # inner loop broke due to size limit
+
+            jpg_path = os.path.normpath(os.path.abspath(os.path.join(root, file)))
+
+            # Skip if we already marked it for deletion (paired with MP4)
+            if any(jpg_path == p for p, _ in files_to_remove):
+                continue
+
+            ts = extract_timestamp(file)
+            if not ts or ts >= cutoff_dt:
+                continue  # not old enough
+
+            try:
+                size = os.path.getsize(jpg_path)
+            except OSError:
+                size = 0
+
+            orphaned_jpgs.append((jpg_path, size))
+
+    # Add all orphaned JPGs to the removal list (bypassing size limits)
+    if orphaned_jpgs:
+        log(
+            f"Found {len(orphaned_jpgs)} orphaned JPG files to remove (bypassing size limits)"
+        )
+        files_to_remove.extend(orphaned_jpgs)
+        total_size_bytes += sum(size for _, size in orphaned_jpgs)
 
     if not files_to_remove:
         log("No files to cleanup!")
         return 0.0
 
     log(
-        f"Found {len(files_to_remove)} "
+        f"Found {len(files_to_remove)} files "
         f"({total_size_bytes / (1024**2):.2f} MB) to cleanup..."
     )
 
@@ -448,7 +451,7 @@ def transcode_file(input_file: str, output_file: str) -> None:
         "-global_quality",
         "26",
         "-c:v",
-        "h264_qsv",
+        "hevc_qsv",
         "-an",
         output_file,
     ]
