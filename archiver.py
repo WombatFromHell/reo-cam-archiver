@@ -622,7 +622,7 @@ def organize(dry=False):
         dry (bool): If True, don't actually make changes
     """
     # Clean archived files
-    cleanup_old_files(output_dir, max_days_old=30, max_size_gb=300, dry_run=dry)
+    cleanup_old_files(output_dir, max_days_old=30, max_size_gb=500, dry_run=dry)
 
     # Remove empty directories in the archive
     remove_empty(output_dir, dry_run=dry)
