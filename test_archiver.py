@@ -26,6 +26,8 @@ from archiver import (
     cleanup_archived_files,
     transcode_with_progress,
     CameraArchiver,
+    FFMpegTranscoder,
+    ProgressBar,
 )
 
 # ----------------------------------------------------------------------
@@ -349,6 +351,57 @@ class TestTranscoding(unittest.TestCase):
 
         self.assertFalse(result)
         logger.error.assert_called_with("FFmpeg not found. Please install ffmpeg.")
+
+    @patch.object(ProgressBar, "update", return_value=None)
+    def test_bail_on_error(self, mock_update):
+        """Ensure that a failure stops the batch and only earlier files are returned."""
+        tmp_dir = Path(tempfile.mkdtemp())
+        try:
+            f1 = tmp_dir / "file1.mp4"
+            f2 = tmp_dir / "file2.mp4"
+            f1.touch()
+            f2.touch()
+
+            ts = datetime.now()
+            files_to_process = [(f1, ts, ts), (f2, ts, ts)]
+
+            archiver = CameraArchiver(tmp_dir, tmp_dir, MagicMock())
+
+            # First run succeeds, second fails
+            with patch.object(
+                FFMpegTranscoder, "run", side_effect=[True, False]
+            ) as mock_run:
+                result = archiver.transcode_all(files_to_process)
+
+            self.assertEqual(len(result), 1)
+            self.assertIn((f1, ts, ts), result)
+            self.assertNotIn((f2, ts, ts), result)
+        finally:
+            shutil.rmtree(tmp_dir)
+
+    @patch.object(ProgressBar, "update", return_value=None)
+    def test_all_success(self, mock_update):
+        """Verify that when all files succeed we get the full list."""
+        tmp_dir = Path(tempfile.mkdtemp())
+        try:
+            f1 = tmp_dir / "file1.mp4"
+            f2 = tmp_dir / "file2.mp4"
+            f1.touch()
+            f2.touch()
+
+            ts = datetime.now()
+            files_to_process = [(f1, ts, ts), (f2, ts, ts)]
+
+            archiver = CameraArchiver(tmp_dir, tmp_dir, MagicMock())
+
+            with patch.object(FFMpegTranscoder, "run", return_value=True) as mock_run:
+                result = archiver.transcode_all(files_to_process)
+
+            self.assertEqual(len(result), 2)
+            self.assertIn((f1, ts, ts), result)
+            self.assertIn((f2, ts, ts), result)
+        finally:
+            shutil.rmtree(tmp_dir)
 
 
 class TestArchiveCleanup(unittest.TestCase):

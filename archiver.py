@@ -332,12 +332,13 @@ class FFMpegTranscoder:
         self.logger.info(f"Transcoding: {self.input_file} -> {self.output_file}")
 
         try:
+            # Capture ffmpeg output in a buffer – we’ll read it ourselves.
             proc = subprocess.Popen(
                 cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
-                bufsize=1,
+                bufsize=1,  # line‑buffered
             )
         except FileNotFoundError:
             self.logger.error("FFmpeg not found. Please install ffmpeg.")
@@ -345,6 +346,8 @@ class FFMpegTranscoder:
 
         start = time.time()
         filled = 0
+
+        # Read the output line by line **without printing it**.
         for raw in iter(proc.stdout.readline, ""):  # type: ignore[arg-type]
             if not raw:
                 continue
@@ -353,6 +356,7 @@ class FFMpegTranscoder:
             if t_sec is not None:
                 filled = min(int(t_sec / max(1, t_sec)), self.progress_bar.num_blocks)
 
+            # The progress bar prints *only* the status line.
             self.progress_bar.update(
                 file_index=self.file_index,
                 elapsed_sec=elapsed,
@@ -366,7 +370,7 @@ class FFMpegTranscoder:
                 f"Failed to transcode {self.input_file} (rc={proc.returncode})"
             )
 
-        # Final bar – fully filled
+        # Final bar – fully filled.
         self.progress_bar.update(
             file_index=self.file_index,
             elapsed_sec=time.time() - start,
@@ -420,6 +424,13 @@ class CameraArchiver:
         files_to_process: Iterable[Tuple[Path, datetime, datetime]],
         dry_run: bool = False,
     ) -> List[Tuple[Path, datetime, datetime]]:
+        """
+        Transcode all MP4 files in *files_to_process*.
+
+        If a single file fails to transcode the method stops immediately
+        and returns the list of files that were processed successfully up
+        until that point.  This behaviour matches the new requirement.
+        """
         mp4s = [f for f in files_to_process if f[0].suffix.lower() == ".mp4"]
         bar = ProgressBar(total_files=len(mp4s))
         successful: List[Tuple[Path, datetime, datetime]] = []
@@ -439,8 +450,12 @@ class CameraArchiver:
                 file_index=idx,
                 logger=self.logger,
             )
-            if transcoder.run():
-                successful.append((fp, ts, mtime))
+            if not transcoder.run():
+                # A failure – stop processing the rest of the batch
+                self.logger.error(f"Stopping further transcodes due to error on {fp}")
+                break
+
+            successful.append((fp, ts, mtime))
 
         return successful
 
