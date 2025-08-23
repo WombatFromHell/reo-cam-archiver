@@ -10,8 +10,7 @@ import shutil
 import unittest
 from datetime import datetime, timedelta
 from pathlib import Path
-from unittest.mock import patch, MagicMock
-from typing import cast
+from unittest.mock import patch, MagicMock, call
 
 # ----------------------------------------------------------------------
 # Import the functions that we want to test
@@ -24,8 +23,9 @@ from archiver import (
     get_output_path,
     get_directory_size,
     setup_logging,
-    transcode_mp4_file,
     cleanup_archived_files,
+    transcode_with_progress,
+    CameraArchiver,
 )
 
 # ----------------------------------------------------------------------
@@ -245,7 +245,7 @@ class TestDirectorySize(unittest.TestCase):
 
         patcher = patch.object(Path, "write_text", new=write_text_with_mkdir)
         patcher.start()
-        self.addCleanup(patcher.stop)  # clean up after the test
+        self.addCleanup(patcher.stop)
 
         # Now the original test code works
         (self.test_dir / "file1.txt").write_text("A" * 100)
@@ -267,7 +267,6 @@ class TestLogging(unittest.TestCase):
     def test_setup_logging(self):
         import logging
 
-        # Create a temporary file to act as our log file.
         with tempfile.NamedTemporaryFile(delete=False) as tmp:
             log_path = Path(tmp.name)
 
@@ -276,7 +275,6 @@ class TestLogging(unittest.TestCase):
             self.assertEqual(logger.name, "camera_archiver")
             self.assertEqual(len(logger.handlers), 2)
 
-            # Identify the console handler (the one that writes to stdout).
             console_handler = next(
                 h for h in logger.handlers if isinstance(h, logging.StreamHandler)
             )
@@ -284,22 +282,19 @@ class TestLogging(unittest.TestCase):
             original_emit = console_handler.emit
 
             def silent_console_emit(record):
-                """Skip printing the exact “Hello world” message."""
                 if record.getMessage() == "Hello world":
                     return
                 original_emit(record)
 
             patcher = patch.object(console_handler, "emit", new=silent_console_emit)
             patcher.start()
-            self.addCleanup(patcher.stop)  # restore after the test
+            self.addCleanup(patcher.stop)
 
             logger.info("Hello world")
 
-            # The log file should still contain the message (the file handler writes to it).
             self.assertTrue(log_path.exists())
             content = log_path.read_text()
             self.assertIn("Hello world", content)
-
         finally:
             if log_path.exists():
                 log_path.unlink()
@@ -312,7 +307,7 @@ class TestTranscoding(unittest.TestCase):
     def test_success(self, mock_popen):
         proc = MagicMock()
         proc.returncode = 0
-        proc.stdout.readline.side_effect = ["frame=100", ""]  # EOF
+        proc.stdout.readline.side_effect = ["frame=100", ""]
         mock_popen.return_value = proc
 
         inp = Path("/tmp/input.mp4")
@@ -320,7 +315,7 @@ class TestTranscoding(unittest.TestCase):
         logger = MagicMock()
 
         with patch.object(Path, "mkdir"):
-            result = transcode_mp4_file(inp, out, logger)
+            result = transcode_with_progress(inp, out, logger)
 
         self.assertTrue(result)
         mock_popen.assert_called_once()
@@ -338,7 +333,7 @@ class TestTranscoding(unittest.TestCase):
         logger = MagicMock()
 
         with patch.object(Path, "mkdir"):
-            result = transcode_mp4_file(inp, out, logger)
+            result = transcode_with_progress(inp, out, logger)
 
         self.assertFalse(result)
         logger.error.assert_called()
@@ -350,7 +345,7 @@ class TestTranscoding(unittest.TestCase):
         logger = MagicMock()
 
         with patch.object(Path, "mkdir"):
-            result = transcode_mp4_file(inp, out, logger)
+            result = transcode_with_progress(inp, out, logger)
 
         self.assertFalse(result)
         logger.error.assert_called_with("FFmpeg not found. Please install ffmpeg.")
@@ -384,10 +379,8 @@ class TestArchiveCleanup(unittest.TestCase):
 
     def test_dry_run_over_limit(self):
         logger = MagicMock()
-        # 3 MB total; set limit to 1 KB (0.000976 GB) → definitely over
         removed = cleanup_archived_files(self.archive_dir, 0.001, True, logger)
         self.assertGreater(removed, 0)
-        # Files should still exist
         for f in self.files:
             self.assertTrue(f.exists())
 
@@ -415,18 +408,15 @@ class TestIntegration(unittest.TestCase):
         self.input_dir = Path(tempfile.mkdtemp())
         self.output_dir = Path(tempfile.mkdtemp())
 
-        # Create a single day folder
         day_folder = self.input_dir / "2024" / "08" / "21"
         day_folder.mkdir(parents=True, exist_ok=True)
 
-        # Fake camera files
         self.mp4 = day_folder / "REO_DRIVEWAY_01_20240821123456.mp4"
         self.jpg = day_folder / "REO_DRIVEWAY_01_20240821123456.jpg"
 
         self.mp4.write_bytes(b"fake mp4")
         self.jpg.write_bytes(b"fake jpg")
 
-        # Make them old enough
         old_ts = (datetime.now() - timedelta(days=35)).timestamp()
         os.utime(self.mp4, (old_ts, old_ts))
         os.utime(self.jpg, (old_ts, old_ts))
@@ -436,13 +426,14 @@ class TestIntegration(unittest.TestCase):
         shutil.rmtree(self.output_dir, ignore_errors=True)
 
     def test_discovery_and_filtering(self):
-        all_files = find_camera_files(self.input_dir)
-        self.assertEqual(len(all_files), 2)
+        archiver = CameraArchiver(self.input_dir, self.output_dir, MagicMock())
+        archiver.discover_files()
+        self.assertEqual(len(archiver.all_files), 2)
 
-        old = filter_old_files(all_files, 30)
+        old = archiver.filter_old_files(30)
         self.assertEqual(len(old), 2)
 
-        recent = filter_old_files(all_files, 40)
+        recent = archiver.filter_old_files(40)
         self.assertEqual(len(recent), 0)
 
     def test_output_path_generation(self):
