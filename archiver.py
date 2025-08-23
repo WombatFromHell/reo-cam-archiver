@@ -1,461 +1,135 @@
-#!/usr/bin/python3
+#!/usr/bin/env python3
+"""
+Camera Archive Manager
+
+Processes camera files in YYYY/MM/DD directory structure, transcodes old MP4 files,
+and optionally cleans up processed files.
+"""
 
 import argparse
 import logging
-import os
 import re
-import select
 import subprocess
 import sys
 from datetime import datetime, timedelta
-from typing import Optional, List, Tuple
-
-base_dir = "/camera"
-output_dir = f"{base_dir}/archived"
-target_fmt = "%Y%m%d%H%M%S"
-log_path = f"{base_dir}/transcoding.log"
-
-logging.basicConfig(level=logging.INFO, format="%(message)s")
+from pathlib import Path
+from typing import List, Tuple, Optional
 
 
-def log(message):
-    """Log message to stdout and flush immediately"""
-    sys.stdout.write(f"{message}\n")
-    sys.stdout.flush()
+def setup_logging(log_file: Path) -> logging.Logger:
+    """Set up logging to both console and file."""
+    logger = logging.getLogger("camera_archiver")
+    logger.setLevel(logging.INFO)
+
+    # Clear any existing handlers
+    logger.handlers.clear()
+
+    # Create formatters
+    formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+
+    # Console handler
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setLevel(logging.INFO)
+    console_handler.setFormatter(formatter)
+    logger.addHandler(console_handler)
+
+    # File handler
+    file_handler = logging.FileHandler(log_file)
+    file_handler.setLevel(logging.INFO)
+    file_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
+
+    return logger
 
 
-def extract_timestamp(filename):
-    """Extract timestamp from filename in the format YYYYMMDDHHMMSS
-
-    Args:
-        filename (str): Filename containing a timestamp
-
-    Returns:
-        datetime: Extracted timestamp or None if no timestamp found
+def parse_timestamp_from_filename(filename: str) -> Optional[datetime]:
     """
-    match = re.search(r"\d{14}", filename)
-    if not match:
-        return None
-
-    timestamp_str = match.group()
-
-    try:
-        return datetime.strptime(timestamp_str, "%Y%m%d%H%M%S")
-    except ValueError:
-        return None
-
-
-def format_timestamp_filepath(
-    file_str, timestamp, base_dir, prefix_str="archived-", ext_str="mp4"
-):
+    Extract timestamp from filename with pattern REO_*_<timestamp>.(mp4|jpg)
+    Examples: REO_DRIVEWAY_01_20250821211345.mp4, REO_BACKYARD_CAM2_20250821211345.jpg
     """
-    Build a destination filename and directory path based on the timestamp that is
-    embedded in *file_str*.
+    # Pattern matches: REO_<any characters>_<14-digit timestamp>.<extension>
+    pattern = r"REO_.*_(\d{14})\.(mp4|jpg)$"
+    match = re.search(pattern, filename, re.IGNORECASE)
+    if match:
+        timestamp_str = match.group(1)
+        try:
+            # Validate timestamp format: YYYYMMDDHHMSS
+            timestamp = datetime.strptime(timestamp_str, "%Y%m%d%H%M%S")
+            # Additional sanity check: ensure year is reasonable (between 2000-2099)
+            if 2000 <= timestamp.year <= 2099:
+                return timestamp
+            else:
+                return None
+        except ValueError:
+            return None
+    return None
 
-    The original implementation used the ``timestamp`` argument supplied by the
-    caller to generate the output filename.  The unit tests, however,
-    expect the output name to reflect the timestamp that appears inside the
-    source file’s name (e.g. “REO_DRIVEWAY_01_20240115175512.mp4” should
-    become ``archived-20240115175512.mp4``).  To satisfy this behaviour we
-    now derive the timestamp from the source filename and ignore the supplied
-    ``timestamp`` for the naming of the output file.  The caller can still
-    provide a ``timestamp`` if they want to control the *directory* layout,
-    but the actual filename will always match the embedded date/time.
 
-    Parameters
-    ----------
-    file_str : str
-        Original filename (may be a full path or just the basename).
-    timestamp : datetime.datetime
-        Timestamp supplied by the caller.  It is used only for determining
-        the destination directory hierarchy.
-    base_dir : str
-        Base directory where the output should be written.
-    prefix_str : str, optional
-        Prefix to prepend to the new filename (default: ``archived-``).
-    ext_str : str, optional
-        Extension of the new file (default: ``mp4``).
-
-    Returns
-    -------
-    tuple | None
-        ``(new_filename, new_dirpath)`` if formatting succeeds,
-        otherwise ``None``.
+def find_camera_files(base_dir: Path) -> List[Tuple[Path, datetime, datetime]]:
     """
-    # Accept both relative and absolute paths – normalise first.
-    file_name_only = os.path.basename(file_str)
-
-    file_ts_split = file_name_only.split("_")
-    if len(file_ts_split) < 4:
-        return None
-
-    # Extract the timestamp from the fourth component (index 3).
-    parsed_ts_str = file_ts_split[3].split(".")[0]
-
-    try:
-        dt = datetime.strptime(parsed_ts_str, target_fmt)
-    except ValueError:
-        return None
-
-    # Use the extracted timestamp for the output filename.
-    timestamp_str = dt.strftime(target_fmt)
-    new_filename = f"{prefix_str}{timestamp_str}.{ext_str}"
-
-    # The destination directory hierarchy is still based on the *provided*
-    # ``timestamp`` argument so that callers can group files by any
-    # criteria they wish (e.g. current date/time).
-    year = timestamp.strftime("%Y")
-    month = timestamp.strftime("%m")
-    day = timestamp.strftime("%d")
-    new_dirpath = os.path.join(base_dir, year, month, day)
-
-    return (new_filename, new_dirpath)
-
-
-def create_file_list_recurse(directory, age_days=0, ext_str="mp4", excluded=None):
-    """Recursively list files in directory based on timestamp and age
-
-    Args:
-        directory (str): Directory to search
-        age_days (int, optional): Minimum age of files to include. Defaults to 0.
-        ext_str (str, optional): File extension to filter by. Defaults to "mp4".
-        excluded (str, optional): Subdirectory path containing this string will be skipped. Default: None.
-
-    Returns:
-        list: List of tuples (file_path, timestamp) matching criteria
+    Find all camera files in the directory structure.
+    Returns list of (file_path, filename_timestamp, modification_time) tuples.
     """
-    file_tuples = []
-    cutoff_date = datetime.now() - timedelta(days=age_days)
+    files = []
 
-    # Use os.walk with proper directory exclusion logic
-    for root, _, files in os.walk(directory):
-        if excluded and excluded in str(root):
-            continue  # skip this directory
-
-        for file in files:
-            if not file.endswith(f".{ext_str}"):
-                continue
-
-            file_path = os.path.join(root, file)
-            timestamp = extract_timestamp(file)
-
-            if not timestamp:
-                continue
-
-            # Filter by age
-            if age_days > 0 and timestamp < cutoff_date:
-                continue
-
-            file_tuples.append((file_path, timestamp))
-
-    return file_tuples
-
-
-def create_file_list(directory, age_days=0, ext_str="mp4"):
-    """List files in a directory based on timestamp and age
-
-    Args:
-        directory (str): Directory to search
-        age_days (int, optional): Minimum age of files to include. Defaults to 0.
-        ext_str (str, optional): File extension to filter by. Defaults to "mp4".
-
-    Returns:
-        list: List of tuples (file_path, timestamp) matching criteria
-    """
-    file_tuples = []
-
-    try:
-        with os.scandir(directory) as entries:
-            for entry in entries:
-                if not entry.is_file():
-                    continue
-
-                filename = entry.name
-                if not filename.endswith(f".{ext_str}"):
-                    continue
-
-                timestamp = extract_timestamp(filename)
-                if not timestamp:
-                    continue
-
-                # Filter by age (only check day of month for simplicity)
-                if age_days > 0 and int(timestamp.strftime("%d")) <= datetime.now().day:
-                    continue
-
-                file_tuples.append((entry.path, timestamp))
-    except OSError:
-        pass  # Handle directory access errors gracefully
-
-    return file_tuples
-
-
-def is_directory_truly_empty(path):
-    """Check if a directory is truly empty (no files, no subdirectories)
-
-    Args:
-        path (str): Directory path to check
-
-    Returns:
-        bool: True if directory is completely empty, False otherwise
-    """
-    try:
-        with os.scandir(path) as entries:
-            for _ in entries:
-                # If we find any entry (file or directory), it's not empty
-                return False
-        return True
-    except OSError:
-        # If we can't scan the directory, assume it's not empty to be safe
-        return False
-
-
-def remove_empty(path, dry_run=False):
-    """Remove empty directories in a directory tree
-
-    Args:
-        path (str): Base directory to clean
-        dry_run (bool, optional): If True, don't actually make changes. Defaults to False.
-
-    Returns:
-        int: Number of directories removed
-    """
-    count = 0
-    removed_dirs = set()  # Track successfully removed directories
-    failed_dirs = set()  # Track directories that failed to be removed
-
-    for dirpath, _, _ in os.walk(path, topdown=False):
-        # Skip if it's the base path itself (to avoid removing the root)
-        if dirpath == path:
-            continue
-
-        # Skip if this directory was already processed or is a child of a failed directory
-        if dirpath in removed_dirs or any(
-            dirpath.startswith(failed_dir) for failed_dir in failed_dirs
+    # Walk through YYYY/MM/DD structure
+    for year_dir in base_dir.iterdir():
+        if (
+            not year_dir.is_dir()
+            or not year_dir.name.isdigit()
+            or len(year_dir.name) != 4
         ):
             continue
 
-        if is_directory_truly_empty(dirpath):
-            try:
-                if not dry_run:
-                    os.rmdir(dirpath)
-                    removed_dirs.add(dirpath)
-                    log(f"Removed empty directory: {dirpath}")
-                    count += 1
-                else:
-                    log(f"Would remove empty directory: {dirpath}")
-                    count += 1
-            except OSError as e:
-                # Only log the error if we haven't already failed on a parent directory
-                if not any(
-                    dirpath.startswith(failed_dir) for failed_dir in failed_dirs
+        for month_dir in year_dir.iterdir():
+            if (
+                not month_dir.is_dir()
+                or not month_dir.name.isdigit()
+                or len(month_dir.name) != 2
+            ):
+                continue
+
+            for day_dir in month_dir.iterdir():
+                if (
+                    not day_dir.is_dir()
+                    or not day_dir.name.isdigit()
+                    or len(day_dir.name) != 2
                 ):
-                    log(f"Failed to remove directory {dirpath}: {str(e)}")
-                failed_dirs.add(dirpath)
+                    continue
 
-    return count
+                # Find camera files in this day directory
+                for file_path in day_dir.iterdir():
+                    if file_path.is_file() and file_path.suffix.lower() in [
+                        ".mp4",
+                        ".jpg",
+                    ]:
+                        filename_timestamp = parse_timestamp_from_filename(
+                            file_path.name
+                        )
+                        if filename_timestamp:
+                            mod_time = datetime.fromtimestamp(file_path.stat().st_mtime)
+                            files.append((file_path, filename_timestamp, mod_time))
+
+    return files
 
 
-def _get_jpg_for_mp4(mp4_path: str) -> Optional[str]:
+def filter_old_files(
+    files: List[Tuple[Path, datetime, datetime]], age_days: int
+) -> List[Tuple[Path, datetime, datetime]]:
+    """Filter files older than specified age in days."""
+    cutoff_date = datetime.now() - timedelta(days=age_days)
+    return [f for f in files if f[2] < cutoff_date]  # f[2] is modification time
+
+
+def transcode_mp4_file(
+    input_file: Path, output_file: Path, logger: logging.Logger
+) -> bool:
     """
-    Return the absolute path to a .jpg file that lives in the same directory
-    as *mp4_path* and has the same base name, or None if it does not exist.
+    Transcode MP4 file using ffmpeg with hardware acceleration.
+    Returns True if successful, False otherwise.
     """
-    base, _ = os.path.splitext(os.path.abspath(mp4_path))
-    jpg_candidate = f"{base}.jpg"
-    return jpg_candidate if os.path.exists(jpg_candidate) else None
-
-
-def collect_files_to_delete(
-    directory: str, max_days_old: int
-) -> List[Tuple[str, datetime, int]]:
-    """
-    Return a sorted list of **only mp4 files** that are older than *max_days_old*.
-    The returned tuples contain:
-
-        (mp4_path, timestamp, size_in_bytes)
-
-    The caller will then add any associated .jpg files to the delete‑list.
-
-    This function no longer returns jpg paths; those are added later
-    in ``cleanup_old_files()``.
-    """
-    candidates = []
-    cutoff_datetime = datetime.now() - timedelta(days=max_days_old)
-
-    for root, _, files in os.walk(directory):
-        for file in files:
-            if not file.lower().endswith(".mp4"):
-                continue
-
-            timestamp = extract_timestamp(file)
-            # Include only files older than the cutoff
-            if not timestamp or timestamp >= cutoff_datetime:
-                continue  # Skip newer files (>= cutoff) and those without a valid date
-
-            mp4_path = os.path.normpath(os.path.abspath(os.path.join(root, file)))
-            try:
-                size = os.path.getsize(mp4_path)
-            except OSError:
-                size = 0
-
-            candidates.append((mp4_path, timestamp, size))
-
-    # Keep the same “oldest first” ordering that the rest of the script expects
-    return sorted(candidates, key=lambda x: x[1])
-
-
-def cleanup_old_files(
-    directory: str,
-    max_days_old: int,
-    max_size_gb: float,
-    dry_run: bool = False,
-) -> float:
-    """
-    Clean up old files in *directory*.
-    This routine now guarantees that:
-
-      - Any .jpg that has a matching old .mp4 is deleted together with the mp4.
-      - Any orphaned .jpg (no matching .mp4 at all) is also removed if it
-        is older than *max_days_old* - REGARDLESS of size limits.
-
-    The total size returned is in **MB** and includes both video and photo data.
-    """
-    flagged_mp4s = collect_files_to_delete(directory, max_days_old)
-
-    files_to_remove: List[Tuple[str, int]] = []  # (path, size)
-    total_size_bytes = 0
-
-    # ------------------------------------------------------------------
-    # Build a complete list of files to delete (MP4 + paired JPG) **before**
-    # applying the size limit.  The original implementation stopped adding
-    # files as soon as the cumulative size exceeded `max_size_gb`.  This
-    # meant that for small test files — which is exactly what our unit tests
-    # create — nothing was ever queued for deletion.
-    #
-    # We now first gather all qualifying MP4s and their JPG partners,
-    # then apply the size limit.  Any file that would push the total over
-    # the limit is simply omitted, but the rest are processed normally.
-    # ------------------------------------------------------------------
-    for mp4_path, ts, file_size in flagged_mp4s:
-        files_to_remove.append((mp4_path, file_size))
-        total_size_bytes += file_size
-
-        jpg_path = _get_jpg_for_mp4(mp4_path)
-        if jpg_path:
-            try:
-                jpg_size = os.path.getsize(jpg_path)
-            except OSError:
-                jpg_size = 0
-            files_to_remove.append((jpg_path, jpg_size))
-            total_size_bytes += jpg_size
-
-    # If the accumulated size already exceeds the limit we trim the list.
-    if total_size_bytes > (max_size_gb * 1024**3):
-        allowed = max_size_gb * 1024**3
-        trimmed: List[Tuple[str, int]] = []
-        cur_total = 0
-        for path, sz in files_to_remove:
-            if cur_total + sz <= allowed:
-                trimmed.append((path, sz))
-                cur_total += sz
-        files_to_remove = trimmed
-        total_size_bytes = cur_total
-
-    # ------------------------------------------------------------------
-    # Add orphaned JPGs (no matching MP4) REGARDLESS of size limits.
-    # These are typically small files and help with disk cleanup.
-    # ------------------------------------------------------------------
-    orphaned_jpgs: List[Tuple[str, int]] = []
-    cutoff_dt = datetime.now() - timedelta(days=max_days_old)
-
-    log(
-        f"Scanning for orphaned JPG files older than {max_days_old} days (cutoff: {cutoff_dt.strftime('%Y-%m-%d %H:%M:%S')})"
-    )
-
-    for root, _, files in os.walk(directory):
-        for file in files:
-            if not file.lower().endswith(".jpg"):
-                continue
-
-            jpg_path = os.path.normpath(os.path.abspath(os.path.join(root, file)))
-
-            # Skip if we already marked it for deletion (paired with MP4)
-            if any(jpg_path == p for p, _ in files_to_remove):
-                log(f"Skipping JPG (already paired with MP4): {jpg_path}")
-                continue
-
-            ts = extract_timestamp(file)
-            if not ts:
-                log(f"Skipping JPG (no valid timestamp found): {jpg_path}")
-                continue
-
-            if ts >= cutoff_dt:
-                log(
-                    f"Skipping JPG (too recent - {ts.strftime('%Y-%m-%d %H:%M:%S')}): {jpg_path}"
-                )
-                continue  # not old enough
-
-            try:
-                size = os.path.getsize(jpg_path)
-            except OSError as e:
-                log(f"Warning: Could not get size for {jpg_path}: {e}")
-                size = 0
-
-            log(
-                f"Marking orphaned JPG for deletion ({size} bytes, {ts.strftime('%Y-%m-%d %H:%M:%S')}): {jpg_path}"
-            )
-            orphaned_jpgs.append((jpg_path, size))
-
-    # Add all orphaned JPGs to the removal list (bypassing size limits)
-    if orphaned_jpgs:
-        total_orphaned_size = sum(size for _, size in orphaned_jpgs)
-        log(
-            f"Found {len(orphaned_jpgs)} orphaned JPG files to remove "
-            f"({total_orphaned_size / 1024:.1f} KB total, bypassing size limits)"
-        )
-        files_to_remove.extend(orphaned_jpgs)
-        total_size_bytes += total_orphaned_size
-    else:
-        log("No orphaned JPG files found for deletion")
-
-    if not files_to_remove:
-        log("No files to cleanup!")
-        return 0.0
-
-    log(
-        f"Found {len(files_to_remove)} files "
-        f"({total_size_bytes / (1024**2):.2f} MB) to cleanup..."
-    )
-
-    for file_path, _ in files_to_remove:
-        if not dry_run:
-            try:
-                os.remove(file_path)
-                log(f"Deleted old file: {file_path}")
-            except OSError as e:
-                log(f"Failed to remove file {file_path}: {str(e)}")
-        else:
-            log(f"Would have deleted: {file_path}")
-
-    dirs_before = {root for root, _, _ in os.walk(directory)}
-    if not dry_run:
-        for dirpath in sorted(dirs_before, reverse=True):
-            if is_directory_truly_empty(dirpath):
-                try:
-                    os.rmdir(dirpath)
-                    log(f"Removed empty directory after cleanup: {dirpath}")
-                except OSError:
-                    pass
-
-    return total_size_bytes / (1024**2)  # size in MB
-
-
-def transcode_file(input_file: str, output_file: str) -> None:
-    """
-    Transcode with FFmpeg while streaming stdout/stderr to the terminal *immediately*.
-    Guarantees that no zombie process is left behind – even if FFmpeg exits early or
-    an exception occurs inside this function.
-    """
+    # Ensure output directory exists
+    output_file.parent.mkdir(parents=True, exist_ok=True)
 
     cmd = [
         "ffmpeg",
@@ -465,7 +139,7 @@ def transcode_file(input_file: str, output_file: str) -> None:
         "-hwaccel_output_format",
         "vaapi",
         "-i",
-        input_file,
+        str(input_file),
         "-vf",
         "scale_vaapi=1024:768,hwmap=derive_device=qsv,format=qsv",
         "-global_quality",
@@ -473,241 +147,442 @@ def transcode_file(input_file: str, output_file: str) -> None:
         "-c:v",
         "hevc_qsv",
         "-an",
-        output_file,
+        str(output_file),
     ]
 
-    with subprocess.Popen(
-        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1
-    ) as proc:
-        try:
-            while proc.poll() is None:
-                rlist, _, _ = select.select([proc.stdout, proc.stderr], [], [], 0.1)
-                for stream in rlist:
-                    if line := stream.readline():
-                        (sys.stdout if stream is proc.stdout else sys.stderr).write(
-                            line
-                        )
-            # Read any remaining output after process ends
-            for stream in [proc.stdout, proc.stderr]:
-                if stream:
-                    while line := stream.readline():
-                        (sys.stdout if stream is proc.stdout else sys.stderr).write(
-                            line
-                        )
-        finally:
-            if proc.poll() is None:
-                proc.terminate()
-                proc.wait(timeout=5)  # This prevents zombies
+    logger.info(f"Transcoding: {input_file} -> {output_file}")
 
-
-def transcode_list(file_list, dry_run=False):
-    """Transcode a list of files
-
-    Args:
-        file_list (list): List of tuples (file_path, timestamp) to transcode
-        dry_run (bool, optional): If True, don't actually make changes. Defaults to False.
-
-    Returns:
-        int: Number of files successfully transcoded
-    """
-    if not file_list:
-        log("Error: transcode_list got an empty list!")
-        return 0
-
-    total_transcoded = 0
-
-    for idx, (filepath, timestamp) in enumerate(file_list):
-        result = format_timestamp_filepath(filepath, timestamp, output_dir)
-
-        if not result:
-            log(f"Warning: Failed to format path for {filepath}")
-            continue
-
-        out_file, out_dir = result
-        output_path = os.path.join(out_dir, out_file)
-
-        log(
-            f"Transcoding file {idx + 1} of {len(file_list)}: {filepath} -> {output_path}"
+    proc = None
+    try:
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1
         )
 
-        if dry_run:
-            log("Would have transcoded and deleted source")
-            continue
+        # Stream output in real-time to prevent blocking
+        output_lines = []
+        if proc.stdout:
+            for line in iter(proc.stdout.readline, ""):
+                line = line.rstrip()
+                if line:
+                    # Log FFmpeg progress/info lines at debug level to avoid spam
+                    if any(
+                        keyword in line.lower()
+                        for keyword in ["frame=", "fps=", "time=", "speed="]
+                    ):
+                        logger.debug(f"FFmpeg: {line}")
+                    else:
+                        logger.info(f"FFmpeg: {line}")
+                    output_lines.append(line)
 
-        # Create directory structure
-        os.makedirs(out_dir, exist_ok=True)
+        # Wait for process to complete
+        proc.wait()
 
-        try:
-            transcode_file(filepath, output_path)
+        if proc.returncode == 0:
+            logger.info(f"Successfully transcoded: {output_file}")
+            return True
+        else:
+            logger.error(
+                f"Failed to transcode {input_file} (exit code: {proc.returncode})"
+            )
+            # Log last few lines of output for debugging
+            if output_lines:
+                logger.error("Last FFmpeg output:")
+                for line in output_lines[-5:]:  # Show last 5 lines
+                    logger.error(f"  {line}")
+            return False
 
-            # Count the file as successfully processed regardless of whether the output file exists.
-            total_transcoded += 1
+    except FileNotFoundError:
+        logger.error("FFmpeg not found. Please install ffmpeg.")
+        return False
+    except Exception as e:
+        logger.error(f"Error transcoding {input_file}: {e}")
+        return False
+    finally:
+        # Ensure child process is properly reaped to prevent zombies
+        if proc is not None and proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                logger.warning(
+                    f"FFmpeg process did not terminate gracefully for {input_file}, killing forcefully"
+                )
+                proc.kill()
+                proc.wait()
 
-            # Verify file was created successfully and delete source if so
-            if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
-                log(f"Deleting old source file: {filepath}")
-                os.remove(filepath)
-        except Exception as e:
-            log(f"Error transcoding {filepath}: {str(e)}")
 
-    return total_transcoded
+def get_output_path(
+    input_file: Path, output_base: Path, filename_timestamp: datetime
+) -> Path:
+    """Generate output path maintaining directory structure."""
+    # Extract year, month, day from the input file path
+    parts = input_file.parts
+    year = parts[-4]  # Assuming structure: .../YYYY/MM/DD/file
+    month = parts[-3]
+    day = parts[-2]
+
+    # Create timestamp string for filename
+    timestamp_str = filename_timestamp.strftime("%Y%m%d%H%M%S")
+    output_filename = f"archived-{timestamp_str}.mp4"
+
+    return output_base / year / month / day / output_filename
 
 
-def setup_logging():
-    """Configure logging to both a file and stdout"""
-    if not os.path.exists(os.path.dirname(log_path)):
-        os.makedirs(os.path.dirname(log_path), exist_ok=True)
+def get_directory_size(directory: Path) -> int:
+    """Get total size of directory in bytes."""
+    total_size = 0
+    try:
+        for file_path in directory.rglob("*"):
+            if file_path.is_file():
+                try:
+                    total_size += file_path.stat().st_size
+                except (OSError, FileNotFoundError):
+                    # Skip files that can't be accessed
+                    pass
+    except (OSError, FileNotFoundError):
+        # Directory doesn't exist or can't be accessed
+        pass
+    return total_size
 
-    # Configure the logger
-    log_format = "[%(asctime)s] [%(levelname)s]: %(message)s"
 
-    # File handler
-    logging.basicConfig(
-        filename=log_path,
-        level=logging.INFO,
-        format=log_format,
+def cleanup_archived_files(
+    archive_dir: Path, max_size_gb: int | float, dry_run: bool, logger: logging.Logger
+) -> int:
+    """
+    Clean up archived files if directory exceeds maximum size.
+    Returns number of files that were (or would be) removed.
+    """
+    if not archive_dir.exists():
+        logger.info(
+            f"Archive directory {archive_dir} does not exist, skipping archive cleanup"
+        )
+        return 0
+
+    # Calculate current size
+    current_size_bytes = get_directory_size(archive_dir)
+    current_size_gb = current_size_bytes / (1024**3)  # Convert bytes to GB
+    max_size_bytes = max_size_gb * (1024**3)
+
+    logger.info(
+        f"Archive directory size: {current_size_gb:.2f} GB / {max_size_gb} GB limit"
     )
 
-    # Console handler (stdout and stderr)
-    console_handler = logging.StreamHandler(sys.stdout)
-    console_handler.setLevel(logging.INFO)
-    console_handler.setFormatter(logging.Formatter(log_format))
-    logging.getLogger().addHandler(console_handler)
-
-    error_handler = logging.StreamHandler(sys.stderr)
-    error_handler.setLevel(logging.ERROR)
-    error_handler.setFormatter(logging.Formatter(log_format))
-    logging.getLogger().addHandler(error_handler)
-
-
-def find_year_directories(base_path):
-    """Find top-level year directories (2000-2099) in a base directory
-
-    Args:
-        base_path (str): Base path to search for year directories
-
-    Returns:
-        list: List of paths to valid year directories
-    """
-    if not os.path.exists(base_path):
-        log(f"Base directory does not exist: {base_path}")
-        return []
-
-    year_dirs = []
-
-    try:
-        # Only look at direct children of base_path
-        for item in os.listdir(base_path):
-            item_path = os.path.join(base_path, item)
-
-            if (
-                os.path.isdir(item_path)
-                and len(item) == 4
-                and item.isdigit()
-                and item.startswith("20")
-                and 2000 <= int(item) <= 2099
-            ):
-                year_dirs.append(item_path)
-
-    except OSError as e:
-        log(f"Error reading directory {base_path}: {e}")
-
-    return sorted(year_dirs)
-
-
-def organize(dry=False):
-    """Clean up archived files and source directories
-
-    Args:
-        dry (bool): If True, don't actually make changes
-    """
-    # Clean archived files
-    cleanup_old_files(output_dir, max_days_old=30, max_size_gb=500, dry_run=dry)
-
-    # Remove empty directories in the archive
-    remove_empty(output_dir, dry_run=dry)
-
-    # Clean source directories (year folders only)
-    year_dirs = find_year_directories(base_dir)
-    for year_dir in year_dirs:
-        remove_empty(year_dir, dry_run=dry)
-
-
-def transcode(dry=False):
-    """Process files for transcoding
-
-    Args:
-        dry (bool): If True, don't actually make changes
-    """
-    # Only process top-level year directories
-    year_dirs = find_year_directories(base_dir)
-
-    if not year_dirs:
-        log("No year directories found!")
+    if current_size_bytes <= max_size_bytes:
+        logger.info("Archive directory is within size limit, no cleanup needed")
         return 0
 
-    total_files_processed = 0
+    # Need to clean up
+    excess_bytes = current_size_bytes - max_size_bytes
+    logger.info(f"Archive directory exceeds limit by {excess_bytes / (1024**3):.2f} GB")
 
-    for year_dir in year_dirs:
-        log(f"Processing year directory: {year_dir}")
+    # Find all archived MP4 files with their modification times
+    archived_files = []
+    for file_path in archive_dir.rglob("archived-*.mp4"):
+        if file_path.is_file():
+            try:
+                mod_time = datetime.fromtimestamp(file_path.stat().st_mtime)
+                file_size = file_path.stat().st_size
+                archived_files.append((file_path, mod_time, file_size))
+            except (OSError, FileNotFoundError):
+                # Skip files that can't be accessed
+                pass
 
-        # List files to transcode
-        files_to_transcode = create_file_list_recurse(year_dir, age_days=1)
+    if not archived_files:
+        logger.info("No archived MP4 files found for cleanup")
+        return 0
 
-        if not files_to_transcode:
-            continue
+    # Sort by modification time (oldest first)
+    archived_files.sort(key=lambda x: x[1])
 
-        log(f"Found {len(files_to_transcode)} files in {year_dir}")
+    logger.info(
+        f"Found {len(archived_files)} archived MP4 files to evaluate for cleanup"
+    )
 
-        # Process the files
-        num_processed = transcode_list(files_to_transcode, dry_run=dry)
-        total_files_processed += num_processed
+    # Remove files until we're under the limit
+    bytes_to_remove = excess_bytes
+    files_removed = 0
 
-        # Clean up empty directories for this year only
-        remove_empty(year_dir, dry_run=dry)
+    for file_path, mod_time, file_size in archived_files:
+        if bytes_to_remove <= 0:
+            break
 
-    if total_files_processed == 0:
-        log("No valid media files found in any year directory!")
+        if dry_run:
+            logger.info(
+                f"[DRY RUN] Would remove archived file: {file_path} ({file_size / (1024**2):.1f} MB, modified: {mod_time})"
+            )
+            files_removed += 1
+        else:
+            try:
+                file_path.unlink()
+                logger.info(
+                    f"Removed archived file: {file_path} ({file_size / (1024**2):.1f} MB, modified: {mod_time})"
+                )
+                files_removed += 1
+            except Exception as e:
+                logger.error(f"Failed to remove archived file {file_path}: {e}")
+                # Don't increment files_removed for failed removals
+                continue
+
+        bytes_to_remove -= file_size
+
+    # Final reporting
+    if dry_run:
+        logger.info(
+            f"[DRY RUN] Would remove {files_removed} archived files to free up space"
+        )
     else:
-        log(
-            f"Finished processing {total_files_processed} files across {len(year_dirs)} year directories"
+        # Recalculate size after cleanup
+        new_size_bytes = get_directory_size(archive_dir)
+        new_size_gb = new_size_bytes / (1024**3)
+        logger.info(
+            f"Archive cleanup completed: removed {files_removed} files, new size: {new_size_gb:.2f} GB"
         )
 
-    return total_files_processed
+    return files_removed
 
 
 def main():
-    """Main entry point for the application"""
-    setup_logging()
-
     parser = argparse.ArgumentParser(
-        description="Archive and organize ReoLink media files"
+        description="Archive and transcode camera files",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  %(prog)s --age 30                    # Process files older than 30 days
+  %(prog)s --age 7 --cleanup           # Process and cleanup files older than 7 days
+  %(prog)s --dry-run --cleanup         # Show what would be done without making changes
+  %(prog)s --max-size 750 --cleanup    # Set archive limit to 750GB and enable cleanup
+  %(prog)s --directory /path/to/camera --output /path/to/archive --age 14
+        """,
     )
-    group = parser.add_mutually_exclusive_group()
-    group.add_argument(
-        "-t", "--transcode", action="store_true", help="Transcode only (no cleanup)"
-    )
-    group.add_argument(
-        "-c", "--cleanup", action="store_true", help="Cleanup only (no transcode)"
-    )
+
     parser.add_argument(
+        "--directory",
         "-d",
+        type=Path,
+        default=Path.cwd(),
+        help="Input directory (default: current working directory, fallback: /camera)",
+    )
+
+    parser.add_argument(
+        "--output",
+        "-o",
+        type=Path,
+        help="Output directory for transcoded files (default: <directory>/archived or /camera/archived)",
+    )
+
+    parser.add_argument(
+        "--age",
+        type=int,
+        default=30,
+        help="Minimum age in days for files to be processed (default: 30)",
+    )
+
+    parser.add_argument(
+        "--cleanup",
+        "-c",
+        action="store_true",
+        help="Remove successfully processed files",
+    )
+
+    parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Do a dry run without making any changes",
+        help="Show what would be done without actually transcoding or removing files",
     )
+
+    parser.add_argument(
+        "--max-size",
+        type=int,
+        default=500,
+        help="Maximum size of archived folder in GB before cleaning oldest files (default: 500)",
+    )
+
     args = parser.parse_args()
 
-    if not any(vars(args).values()):
-        transcode(dry=False)
-        organize(dry=False)
-    elif args.transcode:
-        transcode(dry=args.dry_run)
-    elif args.cleanup:
-        organize(dry=args.dry_run)
+    # Set up directories
+    base_dir = args.directory
+    if not base_dir.exists():
+        # Try fallback to /camera
+        base_dir = Path("/camera")
+        if not base_dir.exists():
+            print(
+                f"Error: Directory {args.directory} does not exist and fallback /camera not found"
+            )
+            sys.exit(1)
+
+    # Set up output directory
+    if args.output:
+        output_dir = args.output
     else:
-        log("No action specified. Use -t for transcoding or -c for cleanup.")
-        parser.print_help()
+        output_dir = base_dir / "archived"
+        if base_dir == Path("/camera"):
+            output_dir = Path("/camera/archived")
+
+    # Set up logging
+    log_file = base_dir / "transcoding.log"
+    if base_dir == Path("/camera"):
+        log_file = Path("/camera/transcoding.log")
+
+    logger = setup_logging(log_file)
+
+    logger.info("Starting camera archive process...")
+    logger.info(f"Input directory: {base_dir}")
+    logger.info(f"Output directory: {output_dir}")
+    logger.info(f"Age threshold: {args.age} days")
+    logger.info(f"Archive size limit: {args.max_size} GB")
+    logger.info(f"Cleanup mode: {args.cleanup}")
+    logger.info(f"Dry run mode: {args.dry_run}")
+
+    if args.dry_run:
+        logger.info("*** DRY RUN MODE - No files will be transcoded or removed ***")
+
+    # Find all camera files
+    logger.info("Scanning for camera files...")
+    all_files = find_camera_files(base_dir)
+    logger.info(f"Found {len(all_files)} total camera files")
+
+    # Filter by age
+    old_files = filter_old_files(all_files, args.age)
+    logger.info(f"Found {len(old_files)} files older than {args.age} days")
+
+    # Separate MP4 and JPG files
+    mp4_files = [f for f in old_files if f[0].suffix.lower() == ".mp4"]
+    jpg_files = [f for f in old_files if f[0].suffix.lower() == ".jpg"]
+
+    logger.info(f"MP4 files to transcode: {len(mp4_files)}")
+    logger.info(f"JPG files found: {len(jpg_files)}")
+
+    # Process MP4 files
+    successfully_processed = []
+
+    for file_path, filename_timestamp, mod_time in mp4_files:
+        output_path = get_output_path(file_path, output_dir, filename_timestamp)
+
+        if args.dry_run:
+            logger.info(f"[DRY RUN] Would transcode: {file_path} -> {output_path}")
+            # In dry run mode, assume all transcodes would succeed
+            successfully_processed.append((file_path, filename_timestamp, mod_time))
+        else:
+            if transcode_mp4_file(file_path, output_path, logger):
+                successfully_processed.append((file_path, filename_timestamp, mod_time))
+
+    if args.dry_run:
+        logger.info(
+            f"[DRY RUN] Would transcode {len(successfully_processed)} MP4 files"
+        )
+    else:
+        logger.info(f"Successfully transcoded {len(successfully_processed)} MP4 files")
+
+    # Cleanup if requested
+    if args.cleanup:
+        if args.dry_run:
+            logger.info("[DRY RUN] Starting cleanup simulation...")
+        else:
+            logger.info("Starting cleanup process...")
+
+        # Remove successfully processed MP4 files and their corresponding JPGs
+        processed_timestamps = set()
+        for file_path, filename_timestamp, mod_time in successfully_processed:
+            output_path = get_output_path(file_path, output_dir, filename_timestamp)
+
+            # Verify archived file exists and is not empty before removing original
+            if args.dry_run:
+                logger.info(
+                    f"[DRY RUN] Would verify archived file exists: {output_path}"
+                )
+                logger.info(f"[DRY RUN] Would remove: {file_path}")
+                processed_timestamps.add(filename_timestamp)
+            else:
+                # Check if archived file exists and has content
+                if output_path.exists() and output_path.stat().st_size > 0:
+                    try:
+                        file_path.unlink()
+                        logger.info(f"Removed: {file_path} (archived to {output_path})")
+                        processed_timestamps.add(filename_timestamp)
+                    except Exception as e:
+                        logger.error(f"Failed to remove {file_path}: {e}")
+                else:
+                    if not output_path.exists():
+                        logger.error(
+                            f"Cannot remove {file_path}: archived file {output_path} does not exist"
+                        )
+                    else:
+                        logger.error(
+                            f"Cannot remove {file_path}: archived file {output_path} is empty (0 bytes)"
+                        )
+                    # Don't add to processed_timestamps since we didn't remove it
+                    continue
+
+            # Look for corresponding JPG file
+            jpg_path = file_path.with_suffix(".jpg")
+            if jpg_path.exists():
+                if args.dry_run:
+                    logger.info(f"[DRY RUN] Would remove: {jpg_path}")
+                else:
+                    # Only remove JPG if the MP4 was successfully removed (i.e., archived file is valid)
+                    if filename_timestamp in processed_timestamps:
+                        try:
+                            jpg_path.unlink()
+                            logger.info(f"Removed: {jpg_path}")
+                        except Exception as e:
+                            logger.error(f"Failed to remove {jpg_path}: {e}")
+                    else:
+                        logger.info(
+                            f"Preserving JPG {jpg_path} because MP4 was not removed"
+                        )
+
+        # Find and remove orphaned JPG files (JPGs without matching MP4s)
+        if args.dry_run:
+            logger.info("[DRY RUN] Scanning for orphaned JPG files...")
+        else:
+            logger.info("Scanning for orphaned JPG files...")
+
+        # Get all JPG files from the filtered old files
+        jpg_files_to_check = [f for f in old_files if f[0].suffix.lower() == ".jpg"]
+
+        orphaned_count = 0
+        for jpg_path, jpg_timestamp, jpg_mod_time in jpg_files_to_check:
+            # Check if there's a corresponding MP4 file with the same timestamp
+            mp4_path = jpg_path.with_suffix(".mp4")
+
+            # JPG is orphaned if:
+            # 1. No corresponding MP4 exists, OR
+            # 2. The MP4 was successfully processed and removed
+            is_orphaned = (not mp4_path.exists()) or (
+                jpg_timestamp in processed_timestamps
+            )
+
+            if is_orphaned:
+                orphaned_count += 1
+                if args.dry_run:
+                    logger.info(f"[DRY RUN] Would remove orphaned JPG: {jpg_path}")
+                else:
+                    try:
+                        jpg_path.unlink()
+                        logger.info(f"Removed orphaned JPG: {jpg_path}")
+                    except Exception as e:
+                        logger.error(f"Failed to remove orphaned JPG {jpg_path}: {e}")
+
+        if args.dry_run:
+            logger.info(
+                f"[DRY RUN] Cleanup summary: Would process {len(successfully_processed)} MP4 files and remove {orphaned_count} orphaned JPGs"
+            )
+        else:
+            actually_removed = len(processed_timestamps)
+            logger.info(
+                f"Cleanup completed. Successfully removed {actually_removed} MP4 files and {orphaned_count} orphaned JPGs"
+            )
+
+    # Archive size management - clean up old archived files if directory is too large
+    logger.info("Checking archive directory size...")
+    archived_files_cleaned = cleanup_archived_files(
+        output_dir, args.max_size, args.dry_run, logger
+    )
+
+    if args.dry_run:
+        logger.info("Archive process simulation completed")
+    else:
+        logger.info("Archive process completed")
 
 
 if __name__ == "__main__":

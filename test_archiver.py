@@ -1,316 +1,488 @@
-#!/usr/bin/python3
+#!/usr/bin/env python3
+"""
+Test suite for archiver.py – rewritten to use only unittest.
+"""
 
 import os
 import sys
 import tempfile
+import shutil
 import unittest
-from io import StringIO
 from datetime import datetime, timedelta
-from unittest.mock import patch
+from pathlib import Path
+from unittest.mock import patch, MagicMock
+from typing import cast
 
-import archiver
+# ----------------------------------------------------------------------
+# Import the functions that we want to test
+# ----------------------------------------------------------------------
+sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
+from archiver import (
+    parse_timestamp_from_filename,
+    find_camera_files,
+    filter_old_files,
+    get_output_path,
+    get_directory_size,
+    setup_logging,
+    transcode_mp4_file,
+    cleanup_archived_files,
+)
+
+# ----------------------------------------------------------------------
+# Helper classes / fixtures
+# ----------------------------------------------------------------------
 
 
-class TestArchiveFunctions(unittest.TestCase):
-    """Comprehensive unit tests for the archive script"""
+class TempDirMixin:
+    """
+    A mix‑in that creates a temporary directory in setUp() and removes it in tearDown().
+    Sub‑classes can use self.test_dir (or any other name you prefer).
+    """
 
-    temp_dir: str
-    input_dir: str
-    archived_dir: str
-    test_timestamp: datetime
+    def setUp(self):
+        self.test_dir = Path(tempfile.mkdtemp())
 
-    @patch("archiver.setup_logging")
-    def setUp(self, mock_setup_logging):
-        """Set up test environment and create temporary directories"""
-        self.temp_dir = tempfile.mkdtemp()
-        self.input_dir = os.path.join(self.temp_dir, "input")
-        os.makedirs(os.path.join(self.input_dir, "2024", "01", "15"), exist_ok=True)
-        self.archived_dir = os.path.join(self.temp_dir, "archived")
+    def tearDown(self):
+        shutil.rmtree(self.test_dir, ignore_errors=True)
 
-        archiver.base_dir = self.input_dir  # <-- source directory
-        archiver.output_dir = self.archived_dir  # <-- destination
 
-        self.sample_file = os.path.join(
-            self.input_dir,
-            "2024",
-            "01",
-            "15",
-            "REO_DRIVEWAY_01_20240115175512.mp4",
+# ----------------------------------------------------------------------
+# Individual test cases
+# ----------------------------------------------------------------------
+
+
+class TestTimestampParsing(unittest.TestCase):
+    """Test timestamp extraction from camera filenames."""
+
+    def test_valid_mp4_filenames(self):
+        test_cases = [
+            ("REO_DRIVEWAY_01_20250821211345.mp4", datetime(2025, 8, 21, 21, 13, 45)),
+            ("REO_BACKYARD_CAM2_20240101000000.mp4", datetime(2024, 1, 1, 0, 0, 0)),
+            ("REO_FRONT_20231231235959.mp4", datetime(2023, 12, 31, 23, 59, 59)),
+            ("REO_A_B_C_20220630120000.mp4", datetime(2022, 6, 30, 12, 0, 0)),
+        ]
+
+        for filename, expected in test_cases:
+            with self.subTest(filename=filename):
+                result = parse_timestamp_from_filename(filename)
+                self.assertEqual(result, expected)
+
+    def test_valid_jpg_filenames(self):
+        test_cases = [
+            ("REO_DRIVEWAY_01_20250821211345.jpg", datetime(2025, 8, 21, 21, 13, 45)),
+            ("REO_CAM_20240515143022.JPG", datetime(2024, 5, 15, 14, 30, 22)),
+        ]
+
+        for filename, expected in test_cases:
+            with self.subTest(filename=filename):
+                result = parse_timestamp_from_filename(filename)
+                self.assertEqual(result, expected)
+
+    def test_invalid_filenames(self):
+        invalid_files = [
+            "REO_CAM_2025082121134.mp4",
+            "REO_CAM_202508212113456.mp4",
+            "REO_CAM_20250821211345.avi",
+            "NOTCAM_20250821211345.mp4",
+            "REO_CAM_20250821211345",
+            "REO_CAM_20251301211345.mp4",
+            "REO_CAM_20250832211345.mp4",
+            "REO_CAM_20250821251345.mp4",
+            "REO_CAM_19990821211345.mp4",
+            "REO_CAM_21000821211345.mp4",
+            "regular_file.mp4",
+            "",
+        ]
+
+        for filename in invalid_files:
+            with self.subTest(filename=filename):
+                result = parse_timestamp_from_filename(filename)
+                self.assertIsNone(result)
+
+
+class TestFileDiscovery(TempDirMixin, unittest.TestCase):
+    """Test finding camera files in directory structure."""
+
+    def setUp(self):
+        super().setUp()
+
+        # Create a realistic YYYY/MM/DD tree
+        dirs_to_create = [
+            self.test_dir / "2024" / "08" / "21",
+            self.test_dir / "2024" / "08" / "22",
+            self.test_dir / "2023" / "12" / "31",
+            # invalid sub‑trees – should be ignored
+            self.test_dir / "invalid" / "dir",
+            self.test_dir / "2024" / "13" / "01",
+        ]
+        for d in dirs_to_create:
+            d.mkdir(parents=True, exist_ok=True)
+
+        # Create files inside the tree
+        self.files = [
+            # Valid camera file (good timestamp)
+            (
+                self.test_dir
+                / "2024"
+                / "08"
+                / "21"
+                / "REO_DRIVEWAY_01_20240821123456.mp4",
+                datetime(2024, 8, 21, 12, 34, 56),
+            ),
+            # Valid JPG – but seconds >59 → invalid timestamp
+            (
+                self.test_dir
+                / "2024"
+                / "08"
+                / "21"
+                / "REO_BACKYARD_20240821234567.jpg",
+                None,
+            ),
+            # Valid MP4
+            (
+                self.test_dir / "2024" / "08" / "22" / "REO_FRONT_20240822111111.mp4",
+                datetime(2024, 8, 22, 11, 11, 11),
+            ),
+            # Valid JPG
+            (
+                self.test_dir / "2023" / "12" / "31" / "REO_CAM1_20231231235959.jpg",
+                datetime(2023, 12, 31, 23, 59, 59),
+            ),
+            # Non‑camera file – should be ignored
+            (self.test_dir / "2024" / "08" / "21" / "not_a_camera_file.mp4", None),
+            # Wrong extension – ignore
+            (self.test_dir / "2024" / "08" / "21" / "REO_CAM_invalid.txt", None),
+        ]
+
+        for path, _ in self.files:
+            path.touch()
+            os.utime(path, (1692600000, 1692600000))  # set mtime to a fixed value
+
+    def test_find_camera_files(self):
+        found = find_camera_files(self.test_dir)
+        # Count expected valid files
+        expected_count = sum(
+            1 for _, ts in self.files if ts is not None and ts.second < 60
         )
-        with open(self.sample_file, "w") as f:
-            f.write("Sample video file content")
+        self.assertEqual(len(found), expected_count)
 
-        self.log_path = os.path.join(self.temp_dir, "transcoding.log")
-        if os.path.exists(self.log_path):
-            os.remove(self.log_path)
+        for fp, ts, mtime in found:
+            self.assertIsInstance(fp, Path)
+            self.assertIsInstance(ts, datetime)
+            self.assertIsInstance(mtime, datetime)
 
-        self.original_stdout = sys.stdout
-        self.stdout_capture: StringIO = StringIO()
-        sys.stdout = self.stdout_capture
-
-        self.test_timestamp = datetime.now()
-
-        archiver.setup_logging()
-
-    def test_cleanup_old_files(self):
-        """Test cleanup of old files (MP4 only)."""
-        # Create an MP4 older than max_days_old
-        old_file = self._make_file(
-            os.path.join(self.input_dir, "2024", "01", "13"), days_old=5
-        )
-        new_file = self._make_file(
-            os.path.join(self.input_dir, "2024", "01", "15"), days_old=0
-        )
-
-        # Dry‑run – should report size > 0
-        size_mb = archiver.cleanup_old_files(
-            self.input_dir, max_days_old=1, max_size_gb=0.1, dry_run=True
-        )
-        self.assertGreater(size_mb, 0)
-
-        # Actual cleanup
-        archiver.cleanup_old_files(
-            self.input_dir, max_days_old=1, max_size_gb=0.1, dry_run=False
-        )
-
-        # Old MP4 removed; new one stays
-        self.assertFalse(os.path.exists(old_file))
-        self.assertTrue(os.path.exists(new_file))
-
-    def test_transcode_list(self):
-        """Test transcoding list functionality"""
-        # Create a file in the expected directory structure with proper naming
-        filename = "REO_DRIVEWAY_01_20240115175512.mp4"
-        test_file_path = os.path.join(self.input_dir, "2024", "01", "15", filename)
-
-        with open(test_file_path, "w") as f:
-            f.write("Test video content")
-
-        # Create a fake output directory structure
-        output_dir = os.path.join(self.archived_dir, "2024", "01", "15")
-        os.makedirs(output_dir, exist_ok=True)
-
-        # Expected output file path
-        expected_output_file = os.path.join(output_dir, "archived-20240115175512.mp4")
-
-        # Override the archiver's output_dir for this test
-        original_output_dir = archiver.output_dir
-        archiver.output_dir = self.archived_dir
-
+    def test_find_camera_files_empty(self):
+        empty_dir = Path(tempfile.mkdtemp())
         try:
-            with (
-                patch.object(archiver, "transcode_file") as mock_transcode_file,
-                patch("os.path.exists", return_value=False) as mock_exists,
-                patch("os.path.getsize") as mock_getsize,
-                patch("os.remove") as mock_remove,
-            ):
-                mock_transcode_file.return_value = True
-                files_to_transcode = [(test_file_path, self.test_timestamp)]
-                count = archiver.transcode_list(files_to_transcode, dry_run=False)
-                # Verify it processed the file correctly
-                self.assertEqual(count, 1)  # Should now pass
-
+            result = find_camera_files(empty_dir)
+            self.assertEqual(len(result), 0)
         finally:
-            archiver.output_dir = original_output_dir
+            shutil.rmtree(empty_dir)
 
-    def test_find_year_directories(self):
-        """Test finding year directories"""
-        # Create fake year directories under temp_dir
-        os.makedirs(os.path.join(self.temp_dir, "2023"), exist_ok=True)
-        os.makedirs(os.path.join(self.temp_dir, "2024"), exist_ok=True)
 
-        # Test with valid year directories
-        dirs = archiver.find_year_directories(self.temp_dir)
-        self.assertEqual(len(dirs), 2)
-        self.assertIn(os.path.join(self.temp_dir, "2023"), dirs)
-        self.assertIn(os.path.join(self.temp_dir, "2024"), dirs)
+class TestFileFiltering(unittest.TestCase):
+    """Test filtering files by age."""
 
-        # Test with invalid year directories
-        os.makedirs(os.path.join(self.temp_dir, "1999"), exist_ok=True)
-        os.makedirs(os.path.join(self.temp_dir, "2100"), exist_ok=True)
-        self.assertEqual(len(archiver.find_year_directories(self.temp_dir)), 2)
-
-    def test_organize_and_transcode(self):
-        """Test the full organization and transcoding flow"""
-        # Override the base_dir and output_dir for this test
-        original_base_dir = archiver.base_dir
-        original_output_dir = archiver.output_dir
-
-        archiver.base_dir = self.input_dir
-        archiver.output_dir = self.archived_dir
-
-        try:
-            # Create a directory structure that mimics what would be in /camera
-            os.makedirs(os.path.join(self.input_dir, "2024", "01", "15"), exist_ok=True)
-
-            # Add sample files to test transcode functionality
-            test_file = os.path.join(
-                self.input_dir,
-                "2024",
-                "01",
-                "15",
-                "REO_DRIVEWAY_01_20240115175512.mp4",
-            )
-            with open(test_file, "w") as f:
-                f.write("Test video file")
-
-            # Mock multiple functions that might be called in the transcode flow
-            with (
-                patch.object(archiver, "find_year_directories") as mock_find_years,
-                patch.object(archiver, "create_file_list_recurse") as mock_file_list,
-                patch.object(archiver, "transcode_list") as mock_transcode_list,
-            ):
-                # Setup mocks to return expected values
-                mock_find_years.return_value = [os.path.join(self.input_dir, "2024")]
-                mock_file_list.return_value = [(test_file, self.test_timestamp)]
-                mock_transcode_list.return_value = 1  # Return count of 1 file processed
-
-                # Run the transcode function
-                count = archiver.transcode(dry=False)
-
-                # Verify it processed at least one file
-                self.assertEqual(count, 1)
-
-                # Verify the functions were called
-                self.assertTrue(mock_find_years.called)
-                self.assertTrue(mock_file_list.called)
-                self.assertTrue(mock_transcode_list.called)
-
-        finally:
-            # Restore original values
-            archiver.base_dir = original_base_dir
-            archiver.output_dir = original_output_dir
-
-    def test_edge_case_directory_removal_with_hidden_files(self):
-        """Test directory removal when hidden files or race conditions occur"""
-        test_dir = os.path.join(self.temp_dir, "hidden_test")
-        nested_dir = os.path.join(test_dir, "nested")
-        os.makedirs(nested_dir, exist_ok=True)
-
-        _ = archiver.is_directory_truly_empty
-        original_rmdir = os.rmdir
-
-        def mock_is_empty(_):
-            return True
-
-        def mock_rmdir(path):
-            if "nested" in path:
-                raise OSError("[Errno 39] Directory not empty: '{}'".format(path))
-            return original_rmdir(path)
-
-        with patch.object(
-            archiver, "is_directory_truly_empty", side_effect=mock_is_empty
-        ):
-            with patch("os.rmdir", side_effect=mock_rmdir):
-                count = archiver.remove_empty(test_dir, dry_run=False)
-                self.assertGreaterEqual(count, 0)
-
-        output = self.stdout_capture.getvalue()
-        error_count = output.count("Failed to remove directory")
-        self.assertGreaterEqual(error_count, 1)
-        self.assertLessEqual(error_count, 2)
-
-    def test_remove_empty_with_permission_error(self):
-        """Test remove_empty function handles permission errors gracefully"""
-        # Create a directory structure
-        test_dir = os.path.join(self.temp_dir, "permission_test")
-        sub_dir = os.path.join(test_dir, "subdir")
-        os.makedirs(sub_dir, exist_ok=True)
-
-        # Mock os.rmdir to simulate permission error
-        def mock_rmdir(path):
-            raise OSError("[Errno 13] Permission denied: '{}'".format(path))
-
-        with patch("os.rmdir", side_effect=mock_rmdir):
-            # Should handle permission errors gracefully
-            count = archiver.remove_empty(test_dir, dry_run=False)
-
-            # Count should be 0 since no directories were actually removed
-            self.assertEqual(count, 0)
-
-        # Check that error was logged appropriately
-        output = self.stdout_capture.getvalue()
-        self.assertIn("Failed to remove directory", output)
-        self.assertIn("Permission denied", output)
-
-    def _make_file(self, path: str, days_old: int = 0, ext: str = "mp4") -> str:
+    def test_filter_old_files(self):
         now = datetime.now()
-        past = now - timedelta(days=days_old)
-        ts = past.strftime("%Y%m%d%H%M%S")
+        samples = [
+            (Path("old1.mp4"), now - timedelta(days=5), now - timedelta(days=35)),
+            (Path("old2.mp4"), now - timedelta(days=10), now - timedelta(days=45)),
+            (Path("new1.mp4"), now - timedelta(days=1), now - timedelta(days=5)),
+            (Path("new2.mp4"), now - timedelta(days=2), now - timedelta(days=15)),
+        ]
 
-        dirname, basename = os.path.split(path)
+        old = filter_old_files(samples, 30)
+        self.assertEqual(len(old), 2)
+        self.assertIn(samples[0], old)
+        self.assertIn(samples[1], old)
 
-        # Create a proper filename with timestamp regardless of path type
-        filename = f"REO_DRIVEWAY_01_{ts}.{ext}"
+    def test_filter_no_old(self):
+        now = datetime.now()
+        samples = [
+            (Path("new1.mp4"), now, now - timedelta(days=5)),
+            (Path("new2.mp4"), now, now - timedelta(days=10)),
+        ]
+        result = filter_old_files(samples, 30)
+        self.assertEqual(len(result), 0)
 
-        if not basename or os.path.isdir(path):
-            full_path = os.path.join(path, filename)
-            # Ensure directory exists before creating file
-            os.makedirs(os.path.dirname(full_path), exist_ok=True)
-        else:
-            full_path = os.path.join(dirname, filename)
-            os.makedirs(os.path.dirname(full_path), exist_ok=True)
 
-        with open(full_path, "w") as f:
-            f.write("dummy")
+class TestOutputPath(unittest.TestCase):
+    """Test output path generation."""
 
-        if ext == "mp4" or ext == "jpg":
-            try:
-                import time
+    def test_get_output_path(self):
+        inp = Path("/base/2024/08/21/REO_CAM_20240821123456.mp4")
+        base = Path("/archive")
+        ts = datetime(2024, 8, 21, 12, 34, 56)
+        expected = Path("/archive/2024/08/21/archived-20240821123456.mp4")
+        self.assertEqual(get_output_path(inp, base, ts), expected)
 
-                # Parse the timestamp from filename
-                ts_str = filename.split("_")[-1].split(".")[0]
-                file_time = datetime.strptime(ts_str, "%Y%m%d%H%M%S")
-                # Set the modification time to match the filename's timestamp
-                os.utime(full_path, (time.time(), time.mktime(file_time.timetuple())))
-            except Exception as e:
-                print(f"Warning: Could not parse timestamp from {filename}: {e}")
+    def test_get_output_path_diff_timestamp(self):
+        inp = Path("/base/2024/01/15/REO_CAM_20240115000000.mp4")
+        base = Path("/archive")
+        ts = datetime(2024, 1, 15, 10, 30, 45)
+        expected = Path("/archive/2024/01/15/archived-20240115103045.mp4")
+        self.assertEqual(get_output_path(inp, base, ts), expected)
 
-        return full_path
 
-    def test_cleanup_old_files_with_paired_jpg(self):
-        """Verify that a paired .jpg is removed together with its old .mp4."""
-        # Create an MP4 that is older than the cutoff (5 days ago)
-        mp4_path = self._make_file(
-            os.path.join(self.input_dir, "2024", "01", "13"), days_old=5
+class TestDirectorySize(unittest.TestCase):
+    """Test directory size calculation."""
+
+    def setUp(self):
+        self.test_dir = Path(tempfile.mkdtemp())
+
+        # Patch Path.write_text to ensure parent dirs exist
+        original_write_text = Path.write_text
+
+        def write_text_with_mkdir(
+            self, data, encoding="utf-8", errors="strict", newline=None
+        ):
+            if not self.parent.exists():
+                self.parent.mkdir(parents=True, exist_ok=True)
+            return original_write_text(
+                self, data, encoding=encoding, errors=errors, newline=newline
+            )
+
+        patcher = patch.object(Path, "write_text", new=write_text_with_mkdir)
+        patcher.start()
+        self.addCleanup(patcher.stop)  # clean up after the test
+
+        # Now the original test code works
+        (self.test_dir / "file1.txt").write_text("A" * 100)
+        (self.test_dir / "subdir" / "file2.txt").write_text("B" * 200)
+
+    def tearDown(self):
+        shutil.rmtree(self.test_dir, ignore_errors=True)
+
+    def test_get_directory_size(self):
+        self.assertEqual(get_directory_size(self.test_dir), 300)
+
+    def test_nonexistent(self):
+        self.assertEqual(get_directory_size(Path("/nonexistent/directory")), 0)
+
+
+class TestLogging(unittest.TestCase):
+    """Test that the logger is configured correctly."""
+
+    def test_setup_logging(self):
+        import logging
+
+        # Create a temporary file to act as our log file.
+        with tempfile.NamedTemporaryFile(delete=False) as tmp:
+            log_path = Path(tmp.name)
+
+        try:
+            logger = setup_logging(log_path)
+            self.assertEqual(logger.name, "camera_archiver")
+            self.assertEqual(len(logger.handlers), 2)
+
+            # Identify the console handler (the one that writes to stdout).
+            console_handler = next(
+                h for h in logger.handlers if isinstance(h, logging.StreamHandler)
+            )
+
+            original_emit = console_handler.emit
+
+            def silent_console_emit(record):
+                """Skip printing the exact “Hello world” message."""
+                if record.getMessage() == "Hello world":
+                    return
+                original_emit(record)
+
+            patcher = patch.object(console_handler, "emit", new=silent_console_emit)
+            patcher.start()
+            self.addCleanup(patcher.stop)  # restore after the test
+
+            logger.info("Hello world")
+
+            # The log file should still contain the message (the file handler writes to it).
+            self.assertTrue(log_path.exists())
+            content = log_path.read_text()
+            self.assertIn("Hello world", content)
+
+        finally:
+            if log_path.exists():
+                log_path.unlink()
+
+
+class TestTranscoding(unittest.TestCase):
+    """Test transcoding logic with subprocess mocked."""
+
+    @patch("archiver.subprocess.Popen")
+    def test_success(self, mock_popen):
+        proc = MagicMock()
+        proc.returncode = 0
+        proc.stdout.readline.side_effect = ["frame=100", ""]  # EOF
+        mock_popen.return_value = proc
+
+        inp = Path("/tmp/input.mp4")
+        out = Path("/tmp/output.mp4")
+        logger = MagicMock()
+
+        with patch.object(Path, "mkdir"):
+            result = transcode_mp4_file(inp, out, logger)
+
+        self.assertTrue(result)
+        mock_popen.assert_called_once()
+        logger.info.assert_any_call(f"Transcoding: {inp} -> {out}")
+
+    @patch("archiver.subprocess.Popen")
+    def test_failure(self, mock_popen):
+        proc = MagicMock()
+        proc.returncode = 1
+        proc.stdout.readline.side_effect = ["Error occurred", ""]
+        mock_popen.return_value = proc
+
+        inp = Path("/tmp/input.mp4")
+        out = Path("/tmp/output.mp4")
+        logger = MagicMock()
+
+        with patch.object(Path, "mkdir"):
+            result = transcode_mp4_file(inp, out, logger)
+
+        self.assertFalse(result)
+        logger.error.assert_called()
+
+    @patch("archiver.subprocess.Popen", side_effect=FileNotFoundError())
+    def test_ffmpeg_not_found(self, mock_popen):
+        inp = Path("/tmp/input.mp4")
+        out = Path("/tmp/output.mp4")
+        logger = MagicMock()
+
+        with patch.object(Path, "mkdir"):
+            result = transcode_mp4_file(inp, out, logger)
+
+        self.assertFalse(result)
+        logger.error.assert_called_with("FFmpeg not found. Please install ffmpeg.")
+
+
+class TestArchiveCleanup(unittest.TestCase):
+    """Test cleanup_archived_files logic."""
+
+    def setUp(self):
+        self.archive_dir = Path(tempfile.mkdtemp())
+        # 3 files, each 1 MB
+        self.files = [
+            self.archive_dir / "2024" / "08" / "20" / "archived-20240820120000.mp4",
+            self.archive_dir / "2024" / "08" / "21" / "archived-20240821130000.mp4",
+            self.archive_dir / "2024" / "08" / "22" / "archived-20240822140000.mp4",
+        ]
+        for f in self.files:
+            f.parent.mkdir(parents=True, exist_ok=True)
+            f.write_bytes(b"A" * 1024 * 1024)
+
+    def tearDown(self):
+        shutil.rmtree(self.archive_dir, ignore_errors=True)
+
+    def test_under_limit(self):
+        logger = MagicMock()
+        removed = cleanup_archived_files(self.archive_dir, 10, False, logger)
+        self.assertEqual(removed, 0)
+        logger.info.assert_any_call(
+            "Archive directory is within size limit, no cleanup needed"
         )
 
-        # Create a matching JPG in the same directory
-        jpg_path = mp4_path.rsplit(".", 1)[0] + ".jpg"
-        with open(jpg_path, "w") as f:
-            f.write("dummy photo")
+    def test_dry_run_over_limit(self):
+        logger = MagicMock()
+        # 3 MB total; set limit to 1 KB (0.000976 GB) → definitely over
+        removed = cleanup_archived_files(self.archive_dir, 0.001, True, logger)
+        self.assertGreater(removed, 0)
+        # Files should still exist
+        for f in self.files:
+            self.assertTrue(f.exists())
 
-        # Ensure both files exist before cleanup
-        self.assertTrue(os.path.exists(mp4_path))
-        self.assertTrue(os.path.exists(jpg_path))
+    def test_real_cleanup_over_limit(self):
+        logger = MagicMock()
+        removed = cleanup_archived_files(self.archive_dir, 0.001, False, logger)
+        self.assertGreater(removed, 0)
+        remaining = [f for f in self.files if f.exists()]
+        self.assertLess(len(remaining), len(self.files))
 
-        # Run the cleanup – dry‑run is False to actually delete
-        archiver.cleanup_old_files(
-            self.input_dir, max_days_old=1, max_size_gb=0.1, dry_run=False
+    def test_nonexistent_directory(self):
+        non_existent = Path("/nonexistent/archive")
+        logger = MagicMock()
+        removed = cleanup_archived_files(non_existent, 100, False, logger)
+        self.assertEqual(removed, 0)
+        logger.info.assert_any_call(
+            f"Archive directory {non_existent} does not exist, skipping archive cleanup"
         )
 
-        # Both files should be gone
-        self.assertFalse(os.path.exists(mp4_path))
-        self.assertFalse(os.path.exists(jpg_path))
 
-    def test_cleanup_old_files_with_orphaned_jpg(self):
-        """Verify that an orphaned .jpg (no matching .mp4) is removed if old enough."""
-        # Create a JPG older than the cutoff, but no MP4 exists
-        jpg_path = self._make_file(
-            os.path.join(self.input_dir, "2024", "01", "12"), days_old=5, ext="jpg"
+class TestIntegration(unittest.TestCase):
+    """Small integration tests that exercise the main workflow."""
+
+    def setUp(self):
+        self.input_dir = Path(tempfile.mkdtemp())
+        self.output_dir = Path(tempfile.mkdtemp())
+
+        # Create a single day folder
+        day_folder = self.input_dir / "2024" / "08" / "21"
+        day_folder.mkdir(parents=True, exist_ok=True)
+
+        # Fake camera files
+        self.mp4 = day_folder / "REO_DRIVEWAY_01_20240821123456.mp4"
+        self.jpg = day_folder / "REO_DRIVEWAY_01_20240821123456.jpg"
+
+        self.mp4.write_bytes(b"fake mp4")
+        self.jpg.write_bytes(b"fake jpg")
+
+        # Make them old enough
+        old_ts = (datetime.now() - timedelta(days=35)).timestamp()
+        os.utime(self.mp4, (old_ts, old_ts))
+        os.utime(self.jpg, (old_ts, old_ts))
+
+    def tearDown(self):
+        shutil.rmtree(self.input_dir, ignore_errors=True)
+        shutil.rmtree(self.output_dir, ignore_errors=True)
+
+    def test_discovery_and_filtering(self):
+        all_files = find_camera_files(self.input_dir)
+        self.assertEqual(len(all_files), 2)
+
+        old = filter_old_files(all_files, 30)
+        self.assertEqual(len(old), 2)
+
+        recent = filter_old_files(all_files, 40)
+        self.assertEqual(len(recent), 0)
+
+    def test_output_path_generation(self):
+        ts = datetime(2024, 8, 21, 12, 34, 56)
+        out = get_output_path(self.mp4, self.output_dir, ts)
+        expected = (
+            self.output_dir / "2024" / "08" / "21" / "archived-20240821123456.mp4"
         )
+        self.assertEqual(out, expected)
 
-        # Verify file exists before cleanup
-        self.assertTrue(os.path.exists(jpg_path))
 
-        # Run the cleanup – dry‑run is False to actually delete
-        archiver.cleanup_old_files(
-            self.input_dir, max_days_old=1, max_size_gb=0.1, dry_run=False
-        )
+# ----------------------------------------------------------------------
+# Test runner
+# ----------------------------------------------------------------------
 
-        # The orphaned JPG should be gone
-        self.assertFalse(os.path.exists(jpg_path))
+
+def run_tests():
+    """Convenience wrapper to run all tests."""
+    loader = unittest.TestLoader()
+    suite = loader.loadTestsFromModule(sys.modules[__name__])
+
+    runner = unittest.TextTestRunner(verbosity=2)
+    result = runner.run(suite)
+
+    # Summary
+    print("\n" + "=" * 70)
+    print("Test Summary:")
+    print(f"  Tests run: {result.testsRun}")
+    print(f"  Failures: {len(result.failures)}")
+    print(f"  Errors:   {len(result.errors)}")
+    success_rate = (
+        (result.testsRun - len(result.failures) - len(result.errors))
+        / result.testsRun
+        * 100
+    )
+    print(f"  Success rate: {success_rate:.1f}%")
+    print("=" * 70)
+
+    return result.wasSuccessful()
 
 
 if __name__ == "__main__":
-    unittest.main()
+    sys.exit(0 if run_tests() else 1)
