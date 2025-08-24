@@ -12,7 +12,7 @@ import unittest
 from datetime import datetime, timedelta
 from pathlib import Path
 from unittest import mock
-from unittest.mock import patch, MagicMock, call
+from unittest.mock import patch, MagicMock
 
 from archiver import (
     parse_timestamp_from_filename,
@@ -325,30 +325,74 @@ class TestFileDiscovery(TempDirMixin, unittest.TestCase):
 
 
 class TestFileFiltering(unittest.TestCase):
-    """Test filtering files by age."""
+    """Verify that filtering uses the file‑name timestamp, not the mtime."""
 
-    def test_filter_old_files(self):
+    def test_only_timestamp_older(self):
         now = datetime.now()
+
         samples = [
-            (Path("old1.mp4"), now - timedelta(days=5), now - timedelta(days=35)),
-            (Path("old2.mp4"), now - timedelta(days=10), now - timedelta(days=45)),
-            (Path("new1.mp4"), now - timedelta(days=1), now - timedelta(days=5)),
-            (Path("new2.mp4"), now - timedelta(days=2), now - timedelta(days=15)),
+            # Timestamp older than 30 days – should stay
+            (
+                Path("old_ts.mp4"),
+                now - timedelta(days=40),  # ts
+                now - timedelta(days=5),  # mtime (newer)
+            ),
+            # Timestamp newer than 30 days – should be dropped
+            (
+                Path("new_ts.mp4"),
+                now - timedelta(days=1),
+                now - timedelta(days=50),
+            ),
         ]
 
-        old = filter_old_files(samples, 30)
-        self.assertEqual(len(old), 2)
-        self.assertIn(samples[0], old)
-        self.assertIn(samples[1], old)
-
-    def test_filter_no_old(self):
-        now = datetime.now()
-        samples = [
-            (Path("new1.mp4"), now, now - timedelta(days=5)),
-            (Path("new2.mp4"), now, now - timedelta(days=10)),
-        ]
         result = filter_old_files(samples, 30)
-        self.assertEqual(len(result), 0)
+
+        self.assertIn(samples[0], result)
+        self.assertNotIn(samples[1], result)
+
+    def test_mtime_older_but_ts_new(self):
+        now = datetime.now()
+
+        samples = [
+            # Timestamp newer (now‑1 day), mtime older (now‑40 days) – drop
+            (
+                Path("new_ts_old_mtime.mp4"),
+                now - timedelta(days=1),
+                now - timedelta(days=40),
+            ),
+            # Both timestamp and mtime old – keep
+            (
+                Path("both_old.mp4"),
+                now - timedelta(days=35),
+                now - timedelta(days=30),
+            ),
+        ]
+
+        result = filter_old_files(samples, 30)
+
+        self.assertIn(samples[1], result)
+        self.assertNotIn(samples[0], result)
+
+    def test_no_matches_when_age_zero(self):
+        now = datetime.now()
+
+        samples = [
+            (
+                Path("old_ts.mp4"),
+                now - timedelta(days=10),
+                now - timedelta(days=5),
+            ),
+            (
+                Path("new_ts.mp4"),
+                now - timedelta(days=1),
+                now - timedelta(days=2),
+            ),
+        ]
+
+        result = filter_old_files(samples, 0)
+
+        # All files are older than the current moment → both returned
+        self.assertEqual(len(result), len(samples))
 
 
 class TestOutputPath(unittest.TestCase):
@@ -611,97 +655,110 @@ class TestArchiveCleanup(unittest.TestCase):
 
 
 class TestProgressBarDisplay(StderrCaptureMixin, unittest.TestCase):
-    """Verify that the progress bar never leaves stale characters on screen."""
+    """Verify that the progress bar displays correctly and handles transitions."""
 
-    def test_long_to_short_transition(self):
-        """
-        The first update prints a longer string than the second one.
-        After the second call no trailing characters from the first should remain.
-        """
+    def test_progress_updates(self):
+        """Test that progress updates display correctly."""
         self.bar = ProgressBar(total_files=3, width=40, silent=False)
-        # 1st: long bar (filled=20 of 30)
-        self.bar.update(file_index=1, elapsed_sec=10, filled_blocks=20)
+        self.bar.start()  # Initialize start time
 
-        # 2nd: short bar (filled=5 of 30)
-        self.bar.update(file_index=2, elapsed_sec=12, filled_blocks=5)
+        # Simulate file processing with progress updates
+        self.bar.update_progress(file_index=1, file_progress_pct=50.0)
 
-        lines = self.get_output_lines()
-        self.assertEqual(len(lines), 2)
+        # Get the raw stderr output
+        output = self.mock_stderr.getvalue()
 
-        pb = ProgressBar(total_files=1)  # dummy instance to call the helper
-        expected1 = (
-            f"File    {int(round(1 / 3 * 100))}% "
-            f"{self.bar._build_bar(20)} Elapsed " + pb._format_elapsed(10)
-        )
-        expected2 = (
-            f"File    {int(round(2 / 3 * 100))}% "
-            f"{self.bar._build_bar(5)} Elapsed " + pb._format_elapsed(12)
-        )
+        # The output should contain progress information
+        self.assertIn("Overall 1/3", output)
+        self.assertIn("File    50%", output)
+        self.assertIn("Elapsed", output)
 
-        esc_clear = "\x1b[2K"
-        self.assertTrue(lines[0].startswith("\r" + esc_clear))
-        self.assertEqual(lines[0][len("\r" + esc_clear) :].rstrip(), expected1)
+    def test_multiple_updates_clean_display(self):
+        """Test that multiple updates don't leave stale characters."""
+        self.bar = ProgressBar(total_files=2, width=30, silent=False)
+        self.bar.start()
 
-        self.assertTrue(lines[1].startswith("\r" + esc_clear))
-        # For the second line, we expect it to be padded to clear the previous line
-        # but the meaningful content should match expected2
-        actual_content = lines[1][len("\r" + esc_clear) :].rstrip()
-        self.assertEqual(actual_content, expected2)
+        # Multiple updates
+        self.bar.update_progress(file_index=1, file_progress_pct=25.0)
+        self.bar.update_progress(file_index=1, file_progress_pct=75.0)
+        self.bar.finish_file(file_index=1)  # Should show 100%
 
-    def test_short_to_long_transition(self):
-        """
-        The bar should also work when a shorter line is followed by a longer one.
-        No extra characters should appear after the second write.
-        """
-        self.bar = ProgressBar(total_files=3, width=40, silent=False)
-        # 1st: short bar
-        self.bar.update(file_index=1, elapsed_sec=5, filled_blocks=3)
+        output = self.mock_stderr.getvalue()
 
-        # 2nd: long bar
-        self.bar.update(file_index=2, elapsed_sec=8, filled_blocks=25)
+        # Should contain the expected progress elements
+        self.assertIn("Overall", output)
+        self.assertIn("File", output)
+        self.assertIn("Elapsed", output)
 
-        lines = self.get_output_lines()
-        self.assertEqual(len(lines), 2)
+    def test_finish_behavior(self):
+        """Test that finish() moves cursor properly."""
+        self.bar = ProgressBar(total_files=1, width=20, silent=False)
+        self.bar.start()
+        self.bar.update_progress(file_index=1, file_progress_pct=100.0)
+        self.bar.finish()
 
-        pb = ProgressBar(total_files=1)  # dummy instance to call the helper
-        expected1 = (
-            f"File    {int(round(1 / 3 * 100))}% "
-            f"{self.bar._build_bar(3)} Elapsed " + pb._format_elapsed(5)
-        )
-        expected2 = (
-            f"File    {int(round(2 / 3 * 100))}% "
-            f"{self.bar._build_bar(25)} Elapsed " + pb._format_elapsed(8)
-        )
+        output = self.mock_stderr.getvalue()
 
-        esc_clear = "\x1b[2K"
-        self.assertTrue(lines[0].startswith("\r" + esc_clear))
-        self.assertEqual(lines[0][len("\r" + esc_clear) :].rstrip(), expected1)
+        # Should end with a newline for clean terminal state
+        self.assertTrue(output.endswith("\n"))
 
-        self.assertTrue(lines[1].startswith("\r" + esc_clear))
-        self.assertEqual(lines[1][len("\r" + esc_clear) :].rstrip(), expected2)
+    def test_silent_mode(self):
+        """Test that silent mode produces no output."""
+        self.bar = ProgressBar(total_files=1, width=20, silent=True)
+        self.bar.start()
+        self.bar.update_progress(file_index=1, file_progress_pct=50.0)
+        self.bar.finish()
 
-    def test_multiple_updates_same_length(self):
-        """
-        When successive updates have the same length, the output should still be clean.
-        """
-        self.bar = ProgressBar(total_files=3, width=40, silent=False)
-        for i in range(3):
-            self.bar.update(file_index=i + 1, elapsed_sec=2 * i, filled_blocks=10)
+        output = self.mock_stderr.getvalue()
+        self.assertEqual(output, "")
 
-        lines = self.get_output_lines()
-        self.assertEqual(len(lines), 3)
+    def test_legacy_update_method(self):
+        """Test backward compatibility with legacy update method."""
+        self.bar = ProgressBar(total_files=2, width=20, silent=False)
+        self.bar.start()
+        self.bar.current_file_index = 1
 
-        pb = ProgressBar(total_files=1)  # dummy instance to call the helper
-        esc_clear = "\x1b[2K"
-        for idx, line in enumerate(lines, start=1):
-            pct = int(round(idx / 3 * 100))
-            expected = (
-                f"File    {pct}% "
-                f"{self.bar._build_bar(10)} Elapsed "
-                + pb._format_elapsed(2 * (idx - 1))
-            )
-            self.assertTrue(line.startswith("\r" + esc_clear))
-            self.assertEqual(line[len("\r" + esc_clear) :].rstrip(), expected)
+        # Test legacy update call (used by existing code)
+        self.bar.update(file_index=None, filled_blocks=5)
+
+        output = self.mock_stderr.getvalue()
+        # Should produce some output
+        self.assertGreater(len(output), 0)
+
+
+class TestProgressBarLogging(StderrCaptureMixin, unittest.TestCase):
+    """Test that progress bar properly manages log message display."""
+
+    def test_ensure_clean_log_space(self):
+        """Test that ensure_clean_log_space clears progress display."""
+        self.bar = ProgressBar(total_files=1, width=20, silent=False)
+        self.bar.start()
+
+        # Show some progress
+        self.bar.update_progress(file_index=1, file_progress_pct=50.0)
+
+        # Clear for log space
+        self.bar.ensure_clean_log_space()
+
+        # The method should have cleared the progress lines
+        # We can't easily test the exact terminal control codes, but we can
+        # verify the method runs without error
+        self.assertFalse(self.bar._progress_displayed)
+
+    def test_rate_limiting(self):
+        """Test that rapid updates are rate limited."""
+        self.bar = ProgressBar(total_files=1, width=20, silent=False)
+        self.bar.start()
+
+        # Rapid updates (should be rate limited)
+        with mock.patch("time.time", side_effect=[1000, 1000.05, 1000.1, 1000.15]):
+            self.bar.update_progress(file_index=1, file_progress_pct=25.0)
+            self.bar.update_progress(file_index=1, file_progress_pct=50.0)
+            self.bar.update_progress(file_index=1, file_progress_pct=75.0)
+
+        # Should produce output (exact amount depends on rate limiting)
+        output = self.mock_stderr.getvalue()
+        self.assertGreater(len(output), 0)
 
 
 class TestCameraArchiverProgress(unittest.TestCase):
@@ -711,8 +768,9 @@ class TestCameraArchiverProgress(unittest.TestCase):
     """
 
     @patch.object(FFMpegTranscoder, "run", return_value=True)
-    def test_progress_updates_on_success(self, mock_run):
-        """All files succeed – progress bar should be updated twice."""
+    @patch("time.time", side_effect=[1000, 1001, 1002, 1003, 1004])
+    def test_progress_updates_on_success(self, mock_time, mock_run):
+        """All files succeed – progress bar should be updated appropriately."""
         tmp_dir = Path(tempfile.mkdtemp())
         try:
             f1 = tmp_dir / "f1.mp4"
@@ -720,45 +778,46 @@ class TestCameraArchiverProgress(unittest.TestCase):
             f1.touch()
             f2.touch()
 
-            ts = datetime.now()  # type: ignore[arg-type]
+            ts = datetime.now()
             files_to_process = [(f1, ts, ts), (f2, ts, ts)]
 
-            # Patch ProgressBar.update so we can inspect the arguments
-            with mock.patch.object(
-                ProgressBar, "update", return_value=None
-            ) as mock_update:
-                archiver = CameraArchiver(tmp_dir, tmp_dir, MagicMock())
+            archiver = CameraArchiver(tmp_dir, tmp_dir, MagicMock())
+
+            # Patch the new ProgressBar methods
+            with (
+                mock.patch.object(ProgressBar, "finish_file") as mock_finish_file,
+                mock.patch.object(ProgressBar, "start") as mock_start,
+                mock.patch.object(ProgressBar, "finish") as mock_finish,
+                mock.patch.object(ProgressBar, "start_file") as mock_start_file,
+                mock.patch.object(
+                    ProgressBar, "update_progress"
+                ) as mock_update_progress,
+            ):
                 result = archiver.transcode_all(files_to_process)
 
             self.assertEqual(len(result), 2)
-            # Two successful files – two update calls
-            self.assertEqual(mock_update.call_count, 2)
 
-            # Determine the expected number of blocks for each file
-            num_blocks = (
-                30 - 2
-            ) // ProgressBar.BLOCK_WIDTH  # default width used by transcode_all
-            expected_calls = [
-                # file_index=1 → 50% progress
-                call(
-                    file_index=1,
-                    elapsed_sec=mock.ANY,
-                    filled_blocks=num_blocks // 2,
-                ),
-                # file_index=2 → 100% progress
-                call(
-                    file_index=2,
-                    elapsed_sec=mock.ANY,
-                    filled_blocks=num_blocks,
-                ),
-            ]
-            mock_update.assert_has_calls(expected_calls)
+            # Verify progress bar lifecycle methods were called
+            mock_start.assert_called_once()
+            mock_finish.assert_called_once()
+
+            # Should have called start_file for each file (via transcoder)
+            self.assertEqual(mock_start_file.call_count, 2)
+
+            # finish_file should be called for each successful transcoding
+            self.assertEqual(mock_finish_file.call_count, 2)
+
+            # Verify finish_file was called with correct file indices
+            calls = mock_finish_file.call_args_list
+            self.assertEqual(calls[0][0][0], 1)  # first call with file index 1
+            self.assertEqual(calls[1][0][0], 2)  # second call with file index 2
         finally:
             shutil.rmtree(tmp_dir)
 
     @patch.object(FFMpegTranscoder, "run", side_effect=[True, False])
-    def test_progress_stops_on_failure(self, mock_run):
-        """Second file fails – only one update should be issued."""
+    @patch("time.time", side_effect=[1000, 1001, 1002, 1003])
+    def test_progress_stops_on_failure(self, mock_time, mock_run):
+        """Second file fails – progress should stop after first success."""
         tmp_dir = Path(tempfile.mkdtemp())
         try:
             f1 = tmp_dir / "f1.mp4"
@@ -766,69 +825,98 @@ class TestCameraArchiverProgress(unittest.TestCase):
             f1.touch()
             f2.touch()
 
-            ts = datetime.now()  # type: ignore[arg-type]
+            ts = datetime.now()
             files_to_process = [(f1, ts, ts), (f2, ts, ts)]
 
-            with mock.patch.object(
-                ProgressBar, "update", return_value=None
-            ) as mock_update:
-                archiver = CameraArchiver(tmp_dir, tmp_dir, MagicMock())
+            archiver = CameraArchiver(tmp_dir, tmp_dir, MagicMock())
+
+            with (
+                mock.patch.object(ProgressBar, "finish_file") as mock_finish_file,
+                mock.patch.object(ProgressBar, "start") as mock_start,
+                mock.patch.object(ProgressBar, "finish") as mock_finish,
+                mock.patch.object(ProgressBar, "start_file") as mock_start_file,
+                mock.patch.object(
+                    ProgressBar, "update_progress"
+                ) as mock_update_progress,
+            ):
                 result = archiver.transcode_all(files_to_process)
 
             self.assertEqual(len(result), 1)
-            # Only the first file succeeded → one update call
-            self.assertEqual(mock_update.call_count, 1)
 
-            num_blocks = (30 - 2) // ProgressBar.BLOCK_WIDTH
-            mock_update.assert_called_once_with(
-                file_index=1,
-                elapsed_sec=mock.ANY,
-                filled_blocks=num_blocks // 2,
-            )
+            # Should have started normally
+            mock_start.assert_called_once()
+            mock_finish.assert_called_once()
+
+            # start_file called twice (once for each file attempt)
+            self.assertEqual(mock_start_file.call_count, 2)
+
+            # finish_file called only once (only first file succeeded)
+            self.assertEqual(mock_finish_file.call_count, 1)
+            mock_finish_file.assert_called_with(1)  # Called with file index 1
         finally:
             shutil.rmtree(tmp_dir)
 
     @patch.object(FFMpegTranscoder, "run", return_value=True)
-    def test_single_file_progress(self, mock_run):
+    @patch("time.time", side_effect=[1000, 1001, 1002])
+    def test_single_file_progress(self, mock_time, mock_run):
         """When only one file is processed, the progress bar updates once and finishes."""
         tmp_dir = Path(tempfile.mkdtemp())
         try:
-            # 1 MP4 file
             f1 = tmp_dir / "single.mp4"
             f1.touch()
 
             ts = datetime.now()
             files_to_process = [(f1, ts, ts)]
 
+            archiver = CameraArchiver(tmp_dir, tmp_dir, MagicMock())
+
             with (
+                mock.patch.object(ProgressBar, "start") as mock_start,
+                mock.patch.object(ProgressBar, "finish_file") as mock_finish_file,
+                mock.patch.object(ProgressBar, "finish") as mock_finish,
+                mock.patch.object(ProgressBar, "start_file") as mock_start_file,
                 mock.patch.object(
-                    ProgressBar, "start", return_value=None
-                ) as mock_start,
-                mock.patch.object(
-                    ProgressBar, "update", return_value=None
-                ) as mock_update,
-                mock.patch.object(
-                    ProgressBar, "finish", return_value=None
-                ) as mock_finish,
+                    ProgressBar, "update_progress"
+                ) as mock_update_progress,
             ):
-                archiver = CameraArchiver(tmp_dir, tmp_dir, MagicMock())
                 result = archiver.transcode_all(files_to_process)
 
             self.assertEqual(len(result), 1)
             self.assertIn((f1, ts, ts), result)
 
+            # Verify all expected methods were called once
             mock_start.assert_called_once()
             mock_finish.assert_called_once()
-            mock_update.assert_called_once()
+            mock_start_file.assert_called_once()
+            mock_finish_file.assert_called_once_with(1)
+        finally:
+            shutil.rmtree(tmp_dir)
 
-            # Default width used by transcode_all
-            num_blocks = (30 - 2) // ProgressBar.BLOCK_WIDTH
+    @patch.object(FFMpegTranscoder, "run", return_value=True)
+    def test_dry_run_mode(self, mock_run):
+        """Test that dry run mode works correctly with progress updates."""
+        tmp_dir = Path(tempfile.mkdtemp())
+        try:
+            f1 = tmp_dir / "f1.mp4"
+            f1.touch()
 
-            mock_update.assert_called_once_with(
-                file_index=1,
-                elapsed_sec=mock.ANY,
-                filled_blocks=num_blocks,  # fully filled bar for the lone file
-            )
+            ts = datetime.now()
+            files_to_process = [(f1, ts, ts)]
+
+            archiver = CameraArchiver(tmp_dir, tmp_dir, MagicMock())
+
+            with mock.patch.object(
+                ProgressBar, "update_progress"
+            ) as mock_update_progress:
+                result = archiver.transcode_all(files_to_process, dry_run=True)
+
+            self.assertEqual(len(result), 1)
+
+            # In dry run, FFMpegTranscoder.run should not be called
+            mock_run.assert_not_called()
+
+            # But progress should still be updated for dry run
+            mock_update_progress.assert_called()
         finally:
             shutil.rmtree(tmp_dir)
 

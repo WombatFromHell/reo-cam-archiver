@@ -19,11 +19,8 @@ from unittest.mock import MagicMock
 
 
 def setup_logging(log_file: Path) -> logging.Logger:
-    """Set up logging to both console and file."""
     logger = logging.getLogger("camera_archiver")
     logger.setLevel(logging.INFO)
-
-    # Clear any existing handlers (important when the module is re‑imported in tests)
     logger.handlers.clear()
 
     formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
@@ -33,10 +30,11 @@ def setup_logging(log_file: Path) -> logging.Logger:
     console_handler.setFormatter(formatter)
     logger.addHandler(console_handler)
 
-    file_handler = logging.FileHandler(log_file)
+    file_handler = logging.FileHandler(log_file, encoding="utf-8")
     file_handler.setLevel(logging.INFO)
     file_handler.setFormatter(formatter)
     logger.addHandler(file_handler)
+    logger.propagate = False
 
     return logger
 
@@ -97,8 +95,12 @@ def find_camera_files(base_dir: Path) -> List[Tuple[Path, datetime, datetime]]:
 def filter_old_files(
     files: List[Tuple[Path, datetime, datetime]], age_days: int
 ) -> List[Tuple[Path, datetime, datetime]]:
+    """
+    Return only those files whose *timestamp* (from the file name)
+    is older than ``age_days``.
+    """
     cutoff = datetime.now() - timedelta(days=age_days)
-    return [f for f in files if f[2] < cutoff]
+    return [f for f in files if f[1] < cutoff]
 
 
 def get_output_path(
@@ -201,109 +203,126 @@ def cleanup_archived_files(
 
 
 class ProgressBar:
-    """
-    Two‑line progress bar:
+    """Two‑line progress bar that never scrolls and keeps logs above it."""
 
-        Overall   <file_index>/<total_files> [bar] Elapsed …
-        File      <current_file_index>/<total_files> [bar] Elapsed …
-
-    The class keeps track of the previous line lengths so that trailing
-    characters from a longer previous line are cleared.
-    """
-
-    BLOCK_WIDTH = 1  # number of chars per block
+    BLOCK_WIDTH = 1
 
     def __init__(self, total_files: int, width: int = 30, silent: bool = False):
         self.total_files = total_files
         self.width = max(10, width)
         self.silent = silent
-
-        # Number of blocks that fit inside the brackets
         self.num_blocks = (self.width - 2) // self.BLOCK_WIDTH
 
-        # State for the two lines
-        self._prev_overall_len = 0
-        self._prev_file_len = 0
+        # Timing helpers
         self.start_time: Optional[float] = None
-
-        # Keep track of which file we are currently reporting on.
+        self.file_start_time: Optional[float] = None
         self.current_file_index: int = 0
 
-    # ------------------------------------------------------------------
-    # Helpers – identical to the original implementation
-    # ------------------------------------------------------------------
-    def _format_elapsed(self, seconds: float) -> str:
-        td = timedelta(seconds=int(seconds))
-        return f"{td.seconds // 60:02d}:{td.seconds % 60:02d}"
+        # Display state
+        self._progress_displayed = False  # Are the two lines currently on screen?
+        self._last_update_time = 0.0  # For rate‑limiting
+        self._update_interval = 0.1  # Minimum seconds between writes
+
+    def _format_elapsed(self, secs: float) -> str:
+        td = timedelta(seconds=int(secs))
+        h, m, s = td.seconds // 3600, (td.seconds % 3600) // 60, td.seconds % 60
+        return f"{h:02d}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
 
     def _build_bar(self, filled_blocks: int) -> str:
-        filled = "|" * filled_blocks
-        empty = "-" * (self.num_blocks - filled_blocks)
-        return f"[{filled}{empty}]"
+        return f"[{'|' * filled_blocks}{'-' * (self.num_blocks - filled_blocks)}]"
 
-    # ------------------------------------------------------------------
-    # Public API – two separate “update” methods
-    # ------------------------------------------------------------------
-    def update_overall(self, file_index: int, elapsed_sec: float) -> None:
-        """Update the first line (overall progress)."""
-        if self.silent:
-            return
+    def _move_cursor_up(self, n: int = 1) -> None:
+        if not self.silent and n > 0:
+            sys.stderr.write(f"\x1b[{n}A")
 
-        pct = min(max(file_index / self.total_files, 0.0), 1.0)
-        filled = int(pct * self.num_blocks)
+    def _clear_line(self) -> None:
+        """Clear the entire current line (including any residual text)."""
+        if not self.silent:
+            sys.stderr.write("\r\x1b[2K")  # Carriage‑return + clear line
 
-        bar_str = self._build_bar(filled)
-        elapsed_s = self._format_elapsed(elapsed_sec)
-        line = f"Overall {file_index}/{self.total_files} {bar_str} Elapsed {elapsed_s}"
-
-        # Write to stderr instead of stdout to avoid mixing with logged output
-        output = f"\r\x1b[2K{line}\n"
-        sys.stderr.write(output)
-        sys.stderr.flush()
-
-        self._prev_overall_len = len(line)
-
-    def update_file(self, file_index: int, elapsed_sec: float) -> None:
-        """Update the second line (per‑file progress)."""
-        if self.silent:
-            return
-
-        # Calculate how many blocks to fill based on overall progress.
-        pct = min(max(file_index / self.total_files, 0.0), 1.0)
-        filled_blocks = int(pct * self.num_blocks)
-
-        bar_str = self._build_bar(filled_blocks)
-        elapsed_s = self._format_elapsed(elapsed_sec)
-        line = f"File    {file_index}/{self.total_files} {bar_str} Elapsed {elapsed_s}"
-
-        # Write to stderr instead of stdout
-        output = f"\r\x1b[2K{line}"
-        sys.stderr.write(output)
-        sys.stderr.flush()
-
-        self._prev_file_len = len(line)
-        self.current_file_index = file_index
-
-    # ------------------------------------------------------------------
-    # Compatibility helpers for the test‑suite
-    # ------------------------------------------------------------------
     def start(self) -> None:
-        """
-        Stub used by the tests.  The original implementation never had a
-        ``start`` method, but the unit‑tests patch and call it.  It simply
-        records the start time so that the elapsed time in subsequent
-        ``update_overall`` calls is meaningful.
-        """
+        if not self.silent:
+            self.start_time = time.time()
+
+    def finish(self) -> None:
+        if not self.silent:
+            # Move below the two lines and flush
+            sys.stderr.write("\n")
+            sys.stderr.flush()
+            self._progress_displayed = False
+
+    def start_file(self) -> None:
+        self.file_start_time = time.time()
+
+    def _should_update(self, now: float) -> bool:
+        if now - self._last_update_time >= self._update_interval:
+            self._last_update_time = now
+            return True
+        return False
+
+    def update_progress(self, file_index: int, file_progress_pct: float = 0.0) -> None:
         if self.silent:
             return
-        # Record the start time; this mirrors what a real progress bar might do.
-        self.start_time = time.time()
 
-    # ------------------------------------------------------------------
-    # Compatibility shim – forwards to ``update_file``.
-    # The tests patch this method and expect the signature
-    # ``update(file_index, elapsed_sec)``.  We ignore any other args.
-    # ------------------------------------------------------------------
+        now = time.time()
+        if not self._should_update(now):
+            return
+
+        overall_start = self.start_time or now
+        file_start = self.file_start_time or now
+
+        overall_elapsed = self._format_elapsed(now - overall_start)
+        overall_pct = (
+            min(max(file_index / self.total_files, 0.0), 1.0)
+            if self.total_files
+            else 0.0
+        )
+        overall_bar = self._build_bar(int(overall_pct * self.num_blocks))
+        overall_line = f"Overall {file_index}/{self.total_files} {overall_bar} Elapsed {overall_elapsed}"
+
+        file_elapsed = self._format_elapsed(now - file_start)
+        file_bar = self._build_bar(int((file_progress_pct / 100.0) * self.num_blocks))
+        file_line = (
+            f"File    {file_progress_pct:.0f}% {file_bar} Elapsed {file_elapsed}"
+        )
+
+        if self._progress_displayed:
+            self._move_cursor_up(1)
+
+        self._clear_line()
+        sys.stderr.write(overall_line + "\n")
+
+        # *** NEW: newline instead of carriage‑return ***
+        self._clear_line()
+        sys.stderr.write(file_line + "\r")
+        sys.stderr.flush()
+
+        self._progress_displayed = True
+
+    def finish_file(self, file_index: int) -> None:
+        """Mark a file as finished (100 % progress)."""
+        if not self.silent:
+            self.update_progress(file_index, 100.0)
+
+    def ensure_clean_log_space(self) -> None:
+        """
+        Clear the two progress lines so a log message can be printed above them.
+        After this call the cursor is positioned at the start of the overall line,
+        ready for the next output (the log).
+        """
+        if not self.silent and self._progress_displayed:
+            # Move up to the first line of the bar, clear both lines
+            self._move_cursor_up(2)
+            self._clear_line()
+            self._clear_line()
+        self._progress_displayed = False
+
+    def blocks_for_file(self, file_index: int) -> int:
+        if self.total_files == 0:
+            return 0
+        pct = min(max(file_index / self.total_files, 0.0), 1.0)
+        return int(pct * self.num_blocks)
+
     def update(
         self,
         file_index: int | None = None,
@@ -312,53 +331,15 @@ class ProgressBar:
         filled_blocks: int | None = None,
         **_: Any,
     ) -> None:
-        """
-        Update the progress bar.
-
-        * If ``file_index`` is ``None`` (ffmpeg‑level update) – display
-          the percent of the current file’s progress.
-        * Otherwise – display the percent of files processed out of the total.
-        """
-        if self.silent or file_index is None:
-            if filled_blocks is not None:
-                pct_display = int(round((filled_blocks / self.num_blocks) * 100))
-                bar_str = self._build_bar(filled_blocks)
-                elapsed_s = self._format_elapsed(elapsed_sec or 0.0)
-                line = f"File    {pct_display}% {bar_str} Elapsed {elapsed_s}"
-                output = f"\r\x1b[2K{line}"
-                sys.stderr.write(output)  # Changed from stdout
-                sys.stderr.flush()
-                self._prev_file_len = len(line)
+        if self.silent:
             return
 
-        # Per‑file update: show % of files processed
-        if filled_blocks is not None:
-            bar_str = self._build_bar(filled_blocks)
-        else:
-            pct = min(max(file_index / self.total_files, 0.0), 1.0)
-            bar_str = self._build_bar(int(pct * self.num_blocks))
-
-        elapsed_s = self._format_elapsed(elapsed_sec or 0.0)
-        pct_display = int(round((file_index / self.total_files) * 100))
-        line = f"File    {pct_display}% {bar_str} Elapsed {elapsed_s}"
-        output = f"\r\x1b[2K{line}"
-        sys.stderr.write(output)  # Changed from stdout
-        sys.stderr.flush()
-        self._prev_file_len = len(line)
-        self.current_file_index = file_index
-
-    def finish(self) -> None:
-        """Print a newline after the progress bar is finished."""
-        if not self.silent:
-            sys.stderr.write("\n")
-            sys.stderr.flush()
-
-    def blocks_for_file(self, file_index: int) -> int:
-        """Return how many blocks should be filled after `file_index` files."""
-        if self.total_files == 0:
-            return 0
-        pct = min(max(file_index / self.total_files, 0.0), 1.0)
-        return int(pct * self.num_blocks)
+        if file_index is None and filled_blocks is not None:
+            pct = (filled_blocks / self.num_blocks) * 100 if self.num_blocks else 0
+            self.update_progress(self.current_file_index, pct)
+        elif file_index is not None:
+            self.current_file_index = file_index
+            self.update_progress(file_index, 100.0)
 
 
 class FFMpegTranscoder:
@@ -403,15 +384,21 @@ class FFMpegTranscoder:
 
     def run(self) -> bool:
         cmd = self._ffmpeg_cmd(self.input_file, self.output_file)
+
+        # Clear progress display and log the transcoding message
+        self.progress_bar.ensure_clean_log_space()
         self.logger.info(f"Transcoding: {self.input_file} -> {self.output_file}")
 
+        # Flush all log handlers
         for handler in getattr(self.logger, "handlers", []):
             try:
                 handler.flush()
             except Exception:
                 pass
-        sys.stdout.flush()
         sys.stderr.flush()
+
+        # Start timing for this specific file
+        self.progress_bar.start_file()
 
         total_seconds = None
         try:
@@ -433,7 +420,6 @@ class FFMpegTranscoder:
                 )
                 total_seconds = float(probe_output.strip())
         except Exception:
-            # Ignore any probe failures – we will fall back to line‑count progress.
             pass
 
         try:
@@ -445,49 +431,47 @@ class FFMpegTranscoder:
                 bufsize=1,
             )
         except FileNotFoundError:
+            self.progress_bar.ensure_clean_log_space()
             self.logger.error("FFmpeg not found. Please install ffmpeg.")
             return False
 
-        if self.job_start_time and self.progress_bar and not self.progress_bar.silent:
-            elapsed_since_start = time.time() - self.job_start_time
-            self.progress_bar.update_overall(self.file_index, elapsed_since_start)
-
-        start = time.time()
-        filled_blocks = 0
-        max_blocks = self.progress_bar.num_blocks if self.progress_bar else 0
+        current_progress_pct = 0.0
 
         if proc.stdout:
             for line in iter(proc.stdout.readline, ""):
                 if not line:
                     break
 
-                # Determine bar fill.
+                # Calculate progress percentage
                 if total_seconds and total_seconds > 0:
                     match = re.search(r"time=([0-9:.]+)", line)
                     if match:
-                        h, m, s = map(float, match.group(1).split(":"))
-                        elapsed_sec = h * 3600 + m * 60 + s
-                        pct = min(elapsed_sec / total_seconds, 1.0)
-                        filled_blocks = int(pct * max_blocks)
+                        time_parts = match.group(1).split(":")
+                        if len(time_parts) >= 3:
+                            h, m, s = map(float, time_parts[:3])
+                            elapsed_sec = h * 3600 + m * 60 + s
+                            current_progress_pct = min(
+                                (elapsed_sec / total_seconds) * 100, 100.0
+                            )
                 else:
-                    # Fallback: increment blocks per ffmpeg output line.
-                    if filled_blocks < max_blocks:
-                        filled_blocks += 1
+                    # Fallback: increment progress gradually
+                    current_progress_pct = min(current_progress_pct + 1, 99.0)
 
-                if self.progress_bar and not self.progress_bar.silent:
-                    elapsed_since_start = time.time() - start
-                    self.progress_bar.update(
-                        file_index=None,
-                        elapsed_sec=elapsed_since_start,
-                        filled_blocks=filled_blocks,
-                    )
+                # Update progress bars
+                self.progress_bar.update_progress(self.file_index, current_progress_pct)
 
         proc.wait()
         success = proc.returncode == 0
-        if not success:
+
+        if success:
+            # Show completion at 100%
+            self.progress_bar.finish_file(self.file_index)
+        else:
+            self.progress_bar.ensure_clean_log_space()
             self.logger.error(
                 f"Failed to transcode {self.input_file} (rc={proc.returncode})"
             )
+
         return success
 
 
@@ -533,62 +517,68 @@ class CameraArchiver:
         files_to_process: Iterable[Tuple[Path, datetime, datetime]],
         dry_run: bool = False,
     ) -> List[Tuple[Path, datetime, datetime]]:
-        """Transcode all MP4 files in the provided list.
+        """Transcode all MP4 files in the provided list with an improved progress display."""
+        files_list = list(files_to_process)
+        mp4s = [f for f in files_list if f[0].suffix.lower() == ".mp4"]
 
-        The progress bar now shows overall progress after each "Transcoding:" message
-        and updates per‑file status after successful completion.
-        """
-        mp4s = [f for f in files_to_process if f[0].suffix.lower() == ".mp4"]
         if not mp4s:
             return []
 
-        bar = ProgressBar(total_files=len(mp4s))
+        # Hide the bar when only a single file will be processed
+        silent_flag = len(mp4s) <= 1
+
+        # If more than one file, decide whether to silence based on logger level
+        if not silent_flag and hasattr(self.logger, "getEffectiveLevel"):
+            level = self.logger.getEffectiveLevel()
+            silent_flag = isinstance(level, int) and level > logging.INFO
+
+        bar = ProgressBar(total_files=len(mp4s), silent=silent_flag)
         bar.start()
-        job_start = time.time()
 
         successful: List[Tuple[Path, datetime, datetime]] = []
 
-        for idx, (fp, ts, mtime) in enumerate(mp4s, start=1):
-            out_file = get_output_path(fp, self.output_dir, ts)
+        try:
+            for idx, (fp, ts, mtime) in enumerate(mp4s, start=1):
+                out_file = get_output_path(fp, self.output_dir, ts)
 
-            if dry_run:
-                self.logger.info(f"[DRY RUN] Would transcode: {fp} -> {out_file}")
+                if dry_run:
+                    # In a dry‑run we still want the overall bar to move forward
+                    bar.ensure_clean_log_space()
+                    self.logger.info(f"[DRY RUN] Would transcode: {fp} -> {out_file}")
+                    successful.append((fp, ts, mtime))
+                    # Explicitly update the progress bar even in dry run
+                    bar.update_progress(file_index=idx, file_progress_pct=100.0)
+                    continue
+
+                # Advance the overall progress before we start this file
+                bar.update(file_index=idx)
+
+                # Explicitly signal that a new file is starting – this updates the file‑level bar
+                bar.start_file()
+
+                transcoder = FFMpegTranscoder(
+                    input_file=fp,
+                    output_file=out_file,
+                    progress_bar=bar,
+                    file_index=idx,
+                    logger=self.logger,
+                    job_start_time=bar.start_time or time.time(),
+                )
+
+                if not transcoder.run():
+                    bar.ensure_clean_log_space()
+                    self.logger.error(
+                        f"Stopping further transcodes due to error on {fp}"
+                    )
+                    break
+
+                # Mark the file as finished (100 % progress)
+                bar.finish_file(idx)
+
                 successful.append((fp, ts, mtime))
-                continue
+        finally:
+            bar.finish()
 
-            # Set the current file index so that ffmpeg progress shows the
-            # correct file number.
-            bar.current_file_index = idx
-
-            transcoder = FFMpegTranscoder(
-                input_file=fp,
-                output_file=out_file,
-                progress_bar=bar,
-                file_index=idx,
-                logger=self.logger,
-                job_start_time=job_start,  # Pass the job start time
-            )
-
-            # Run the transcoding first; only emit a per‑file update if it succeeds.
-            if not transcoder.run():
-                self.logger.error(f"Stopping further transcodes due to error on {fp}")
-                break
-
-            # Emit per‑file status after success – update the file line.
-            elapsed_since_start = time.time() - job_start
-            num_blocks = bar.num_blocks
-            pct = idx / len(mp4s)
-            filled_blocks = int(pct * num_blocks)
-
-            bar.update(
-                file_index=idx,
-                elapsed_sec=elapsed_since_start,
-                filled_blocks=filled_blocks,
-            )
-
-            successful.append((fp, ts, mtime))
-
-        bar.finish()
         return successful
 
     def cleanup_processed(
