@@ -3,6 +3,7 @@
 Test suite for archiver.py – rewritten to use only unittest.
 """
 
+import io
 import os
 import sys
 import tempfile
@@ -10,12 +11,9 @@ import shutil
 import unittest
 from datetime import datetime, timedelta
 from pathlib import Path
+from unittest import mock
 from unittest.mock import patch, MagicMock, call
 
-# ----------------------------------------------------------------------
-# Import the functions that we want to test
-# ----------------------------------------------------------------------
-sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
 from archiver import (
     parse_timestamp_from_filename,
     find_camera_files,
@@ -30,16 +28,9 @@ from archiver import (
     ProgressBar,
 )
 
-# ----------------------------------------------------------------------
-# Helper classes / fixtures
-# ----------------------------------------------------------------------
-
 
 class TempDirMixin:
-    """
-    A mix‑in that creates a temporary directory in setUp() and removes it in tearDown().
-    Sub‑classes can use self.test_dir (or any other name you prefer).
-    """
+    """Creates a temporary directory for tests."""
 
     def setUp(self):
         self.test_dir = Path(tempfile.mkdtemp())
@@ -48,9 +39,76 @@ class TempDirMixin:
         shutil.rmtree(self.test_dir, ignore_errors=True)
 
 
-# ----------------------------------------------------------------------
-# Individual test cases
-# ----------------------------------------------------------------------
+class StderrCaptureMixin(unittest.TestCase):
+    """
+    Patch sys.stderr with an in‑memory StringIO so we can inspect
+    what the ProgressBar writes (since it now writes to stderr).
+    """
+
+    def setUp(self):
+        super().setUp()
+        self._stderr_patch = patch("sys.stderr", new_callable=io.StringIO)
+        self.mock_stderr = self._stderr_patch.start()
+        self.addCleanup(self._stderr_patch.stop)
+
+    def get_output_lines(self) -> list[str]:
+        """
+        Return the lines that were written to stderr.
+        The ProgressBar writes \r\x1b[2K followed by content.
+        We need to reconstruct the lines with the \r prefix.
+        """
+        raw_output = self.mock_stderr.getvalue()
+        if not raw_output:
+            return []
+
+        # The output will be something like: "\r\x1b[2Kcontent1\r\x1b[2Kcontent2"
+        # We need to split but preserve the \r at the start of each segment
+        parts = raw_output.split("\r")
+
+        # The first part will be empty (before the first \r), so skip it
+        # Each subsequent part should be prefixed with \r
+        lines = []
+        for part in parts[1:]:  # Skip the first empty part
+            if part:  # Only include non‑empty parts
+                lines.append("\r" + part)
+
+        return lines
+
+
+class StdoutCaptureMixin(unittest.TestCase):
+    """
+    Patch sys.stdout with an in‑memory StringIO so we can inspect
+    what the ProgressBar writes.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self._stdout_patch = patch("sys.stdout", new_callable=io.StringIO)
+        self.mock_stdout = self._stdout_patch.start()
+        self.addCleanup(self._stdout_patch.stop)
+
+    def get_output_lines(self) -> list[str]:
+        """
+        Return the lines that were written to stdout.
+        The ProgressBar writes \r\x1b[2K followed by content.
+        We need to reconstruct the lines with the \r prefix.
+        """
+        raw_output = self.mock_stdout.getvalue()
+        if not raw_output:
+            return []
+
+        # The output will be something like: "\r\x1b[2Kcontent1\r\x1b[2Kcontent2"
+        # We need to split but preserve the \r at the start of each segment
+        parts = raw_output.split("\r")
+
+        # The first part will be empty (before the first \r), so skip it
+        # Each subsequent part should be prefixed with \r
+        lines = []
+        for part in parts[1:]:  # Skip the first empty part
+            if part:  # Only include non‑empty parts
+                lines.append("\r" + part)
+
+        return lines
 
 
 class TestTimestampParsing(unittest.TestCase):
@@ -58,10 +116,50 @@ class TestTimestampParsing(unittest.TestCase):
 
     def test_valid_mp4_filenames(self):
         test_cases = [
-            ("REO_DRIVEWAY_01_20250821211345.mp4", datetime(2025, 8, 21, 21, 13, 45)),
-            ("REO_BACKYARD_CAM2_20240101000000.mp4", datetime(2024, 1, 1, 0, 0, 0)),
-            ("REO_FRONT_20231231235959.mp4", datetime(2023, 12, 31, 23, 59, 59)),
-            ("REO_A_B_C_20220630120000.mp4", datetime(2022, 6, 30, 12, 0, 0)),
+            (
+                "REO_DRIVEWAY_01_20250821211345.mp4",
+                datetime(
+                    year=2025,
+                    month=8,
+                    day=21,
+                    hour=21,
+                    minute=13,
+                    second=45,
+                ),
+            ),
+            (
+                "REO_BACKYARD_CAM2_20240101000000.mp4",
+                datetime(
+                    year=2024,
+                    month=1,
+                    day=1,
+                    hour=0,
+                    minute=0,
+                    second=0,
+                ),
+            ),
+            (
+                "REO_FRONT_20231231235959.mp4",
+                datetime(
+                    year=2023,
+                    month=12,
+                    day=31,
+                    hour=23,
+                    minute=59,
+                    second=59,
+                ),
+            ),
+            (
+                "REO_A_B_C_20220630120000.mp4",
+                datetime(
+                    year=2022,
+                    month=6,
+                    day=30,
+                    hour=12,
+                    minute=0,
+                    second=0,
+                ),
+            ),
         ]
 
         for filename, expected in test_cases:
@@ -71,8 +169,28 @@ class TestTimestampParsing(unittest.TestCase):
 
     def test_valid_jpg_filenames(self):
         test_cases = [
-            ("REO_DRIVEWAY_01_20250821211345.jpg", datetime(2025, 8, 21, 21, 13, 45)),
-            ("REO_CAM_20240515143022.JPG", datetime(2024, 5, 15, 14, 30, 22)),
+            (
+                "REO_DRIVEWAY_01_20250821211345.jpg",
+                datetime(
+                    year=2025,
+                    month=8,
+                    day=21,
+                    hour=21,
+                    minute=13,
+                    second=45,
+                ),
+            ),
+            (
+                "REO_CAM_20240515143022.JPG",
+                datetime(
+                    year=2024,
+                    month=5,
+                    day=15,
+                    hour=14,
+                    minute=30,
+                    second=22,
+                ),
+            ),
         ]
 
         for filename, expected in test_cases:
@@ -129,7 +247,14 @@ class TestFileDiscovery(TempDirMixin, unittest.TestCase):
                 / "08"
                 / "21"
                 / "REO_DRIVEWAY_01_20240821123456.mp4",
-                datetime(2024, 8, 21, 12, 34, 56),
+                datetime(
+                    year=2024,
+                    month=8,
+                    day=21,
+                    hour=12,
+                    minute=34,
+                    second=56,
+                ),
             ),
             # Valid JPG – but seconds >59 → invalid timestamp
             (
@@ -143,17 +268,34 @@ class TestFileDiscovery(TempDirMixin, unittest.TestCase):
             # Valid MP4
             (
                 self.test_dir / "2024" / "08" / "22" / "REO_FRONT_20240822111111.mp4",
-                datetime(2024, 8, 22, 11, 11, 11),
+                datetime(
+                    year=2024,
+                    month=8,
+                    day=22,
+                    hour=11,
+                    minute=11,
+                    second=11,
+                ),
             ),
             # Valid JPG
             (
                 self.test_dir / "2023" / "12" / "31" / "REO_CAM1_20231231235959.jpg",
-                datetime(2023, 12, 31, 23, 59, 59),
+                datetime(
+                    year=2023,
+                    month=12,
+                    day=31,
+                    hour=23,
+                    minute=59,
+                    second=59,
+                ),
             ),
             # Non‑camera file – should be ignored
             (self.test_dir / "2024" / "08" / "21" / "not_a_camera_file.mp4", None),
             # Wrong extension – ignore
-            (self.test_dir / "2024" / "08" / "21" / "REO_CAM_invalid.txt", None),
+            (
+                self.test_dir / "2024" / "08" / "21" / "REO_CAM_invalid.txt",
+                None,
+            ),
         ]
 
         for path, _ in self.files:
@@ -215,14 +357,28 @@ class TestOutputPath(unittest.TestCase):
     def test_get_output_path(self):
         inp = Path("/base/2024/08/21/REO_CAM_20240821123456.mp4")
         base = Path("/archive")
-        ts = datetime(2024, 8, 21, 12, 34, 56)
+        ts = datetime(
+            year=2024,
+            month=8,
+            day=21,
+            hour=12,
+            minute=34,
+            second=56,
+        )
         expected = Path("/archive/2024/08/21/archived-20240821123456.mp4")
         self.assertEqual(get_output_path(inp, base, ts), expected)
 
     def test_get_output_path_diff_timestamp(self):
         inp = Path("/base/2024/01/15/REO_CAM_20240115000000.mp4")
         base = Path("/archive")
-        ts = datetime(2024, 1, 15, 10, 30, 45)
+        ts = datetime(
+            year=2024,
+            month=1,
+            day=15,
+            hour=10,
+            minute=30,
+            second=45,
+        )
         expected = Path("/archive/2024/01/15/archived-20240115103045.mp4")
         self.assertEqual(get_output_path(inp, base, ts), expected)
 
@@ -454,53 +610,227 @@ class TestArchiveCleanup(unittest.TestCase):
         )
 
 
-class TestIntegration(unittest.TestCase):
-    """Small integration tests that exercise the main workflow."""
+class TestProgressBarDisplay(StderrCaptureMixin, unittest.TestCase):
+    """Verify that the progress bar never leaves stale characters on screen."""
 
-    def setUp(self):
-        self.input_dir = Path(tempfile.mkdtemp())
-        self.output_dir = Path(tempfile.mkdtemp())
+    def test_long_to_short_transition(self):
+        """
+        The first update prints a longer string than the second one.
+        After the second call no trailing characters from the first should remain.
+        """
+        self.bar = ProgressBar(total_files=3, width=40, silent=False)
+        # 1st: long bar (filled=20 of 30)
+        self.bar.update(file_index=1, elapsed_sec=10, filled_blocks=20)
 
-        day_folder = self.input_dir / "2024" / "08" / "21"
-        day_folder.mkdir(parents=True, exist_ok=True)
+        # 2nd: short bar (filled=5 of 30)
+        self.bar.update(file_index=2, elapsed_sec=12, filled_blocks=5)
 
-        self.mp4 = day_folder / "REO_DRIVEWAY_01_20240821123456.mp4"
-        self.jpg = day_folder / "REO_DRIVEWAY_01_20240821123456.jpg"
+        lines = self.get_output_lines()
+        self.assertEqual(len(lines), 2)
 
-        self.mp4.write_bytes(b"fake mp4")
-        self.jpg.write_bytes(b"fake jpg")
-
-        old_ts = (datetime.now() - timedelta(days=35)).timestamp()
-        os.utime(self.mp4, (old_ts, old_ts))
-        os.utime(self.jpg, (old_ts, old_ts))
-
-    def tearDown(self):
-        shutil.rmtree(self.input_dir, ignore_errors=True)
-        shutil.rmtree(self.output_dir, ignore_errors=True)
-
-    def test_discovery_and_filtering(self):
-        archiver = CameraArchiver(self.input_dir, self.output_dir, MagicMock())
-        archiver.discover_files()
-        self.assertEqual(len(archiver.all_files), 2)
-
-        old = archiver.filter_old_files(30)
-        self.assertEqual(len(old), 2)
-
-        recent = archiver.filter_old_files(40)
-        self.assertEqual(len(recent), 0)
-
-    def test_output_path_generation(self):
-        ts = datetime(2024, 8, 21, 12, 34, 56)
-        out = get_output_path(self.mp4, self.output_dir, ts)
-        expected = (
-            self.output_dir / "2024" / "08" / "21" / "archived-20240821123456.mp4"
+        pb = ProgressBar(total_files=1)  # dummy instance to call the helper
+        expected1 = (
+            f"File    {int(round(1 / 3 * 100))}% "
+            f"{self.bar._build_bar(20)} Elapsed " + pb._format_elapsed(10)
         )
-        self.assertEqual(out, expected)
+        expected2 = (
+            f"File    {int(round(2 / 3 * 100))}% "
+            f"{self.bar._build_bar(5)} Elapsed " + pb._format_elapsed(12)
+        )
+
+        esc_clear = "\x1b[2K"
+        self.assertTrue(lines[0].startswith("\r" + esc_clear))
+        self.assertEqual(lines[0][len("\r" + esc_clear) :].rstrip(), expected1)
+
+        self.assertTrue(lines[1].startswith("\r" + esc_clear))
+        # For the second line, we expect it to be padded to clear the previous line
+        # but the meaningful content should match expected2
+        actual_content = lines[1][len("\r" + esc_clear) :].rstrip()
+        self.assertEqual(actual_content, expected2)
+
+    def test_short_to_long_transition(self):
+        """
+        The bar should also work when a shorter line is followed by a longer one.
+        No extra characters should appear after the second write.
+        """
+        self.bar = ProgressBar(total_files=3, width=40, silent=False)
+        # 1st: short bar
+        self.bar.update(file_index=1, elapsed_sec=5, filled_blocks=3)
+
+        # 2nd: long bar
+        self.bar.update(file_index=2, elapsed_sec=8, filled_blocks=25)
+
+        lines = self.get_output_lines()
+        self.assertEqual(len(lines), 2)
+
+        pb = ProgressBar(total_files=1)  # dummy instance to call the helper
+        expected1 = (
+            f"File    {int(round(1 / 3 * 100))}% "
+            f"{self.bar._build_bar(3)} Elapsed " + pb._format_elapsed(5)
+        )
+        expected2 = (
+            f"File    {int(round(2 / 3 * 100))}% "
+            f"{self.bar._build_bar(25)} Elapsed " + pb._format_elapsed(8)
+        )
+
+        esc_clear = "\x1b[2K"
+        self.assertTrue(lines[0].startswith("\r" + esc_clear))
+        self.assertEqual(lines[0][len("\r" + esc_clear) :].rstrip(), expected1)
+
+        self.assertTrue(lines[1].startswith("\r" + esc_clear))
+        self.assertEqual(lines[1][len("\r" + esc_clear) :].rstrip(), expected2)
+
+    def test_multiple_updates_same_length(self):
+        """
+        When successive updates have the same length, the output should still be clean.
+        """
+        self.bar = ProgressBar(total_files=3, width=40, silent=False)
+        for i in range(3):
+            self.bar.update(file_index=i + 1, elapsed_sec=2 * i, filled_blocks=10)
+
+        lines = self.get_output_lines()
+        self.assertEqual(len(lines), 3)
+
+        pb = ProgressBar(total_files=1)  # dummy instance to call the helper
+        esc_clear = "\x1b[2K"
+        for idx, line in enumerate(lines, start=1):
+            pct = int(round(idx / 3 * 100))
+            expected = (
+                f"File    {pct}% "
+                f"{self.bar._build_bar(10)} Elapsed "
+                + pb._format_elapsed(2 * (idx - 1))
+            )
+            self.assertTrue(line.startswith("\r" + esc_clear))
+            self.assertEqual(line[len("\r" + esc_clear) :].rstrip(), expected)
 
 
-# ----------------------------------------------------------------------
-# Test runner
-# ----------------------------------------------------------------------
+class TestCameraArchiverProgress(unittest.TestCase):
+    """
+    Verify that CameraArchiver.transcode_all() updates the ProgressBar correctly
+    after each successful file and stops updating when a failure occurs.
+    """
+
+    @patch.object(FFMpegTranscoder, "run", return_value=True)
+    def test_progress_updates_on_success(self, mock_run):
+        """All files succeed – progress bar should be updated twice."""
+        tmp_dir = Path(tempfile.mkdtemp())
+        try:
+            f1 = tmp_dir / "f1.mp4"
+            f2 = tmp_dir / "f2.mp4"
+            f1.touch()
+            f2.touch()
+
+            ts = datetime.now()  # type: ignore[arg-type]
+            files_to_process = [(f1, ts, ts), (f2, ts, ts)]
+
+            # Patch ProgressBar.update so we can inspect the arguments
+            with mock.patch.object(
+                ProgressBar, "update", return_value=None
+            ) as mock_update:
+                archiver = CameraArchiver(tmp_dir, tmp_dir, MagicMock())
+                result = archiver.transcode_all(files_to_process)
+
+            self.assertEqual(len(result), 2)
+            # Two successful files – two update calls
+            self.assertEqual(mock_update.call_count, 2)
+
+            # Determine the expected number of blocks for each file
+            num_blocks = (
+                30 - 2
+            ) // ProgressBar.BLOCK_WIDTH  # default width used by transcode_all
+            expected_calls = [
+                # file_index=1 → 50% progress
+                call(
+                    file_index=1,
+                    elapsed_sec=mock.ANY,
+                    filled_blocks=num_blocks // 2,
+                ),
+                # file_index=2 → 100% progress
+                call(
+                    file_index=2,
+                    elapsed_sec=mock.ANY,
+                    filled_blocks=num_blocks,
+                ),
+            ]
+            mock_update.assert_has_calls(expected_calls)
+        finally:
+            shutil.rmtree(tmp_dir)
+
+    @patch.object(FFMpegTranscoder, "run", side_effect=[True, False])
+    def test_progress_stops_on_failure(self, mock_run):
+        """Second file fails – only one update should be issued."""
+        tmp_dir = Path(tempfile.mkdtemp())
+        try:
+            f1 = tmp_dir / "f1.mp4"
+            f2 = tmp_dir / "f2.mp4"
+            f1.touch()
+            f2.touch()
+
+            ts = datetime.now()  # type: ignore[arg-type]
+            files_to_process = [(f1, ts, ts), (f2, ts, ts)]
+
+            with mock.patch.object(
+                ProgressBar, "update", return_value=None
+            ) as mock_update:
+                archiver = CameraArchiver(tmp_dir, tmp_dir, MagicMock())
+                result = archiver.transcode_all(files_to_process)
+
+            self.assertEqual(len(result), 1)
+            # Only the first file succeeded → one update call
+            self.assertEqual(mock_update.call_count, 1)
+
+            num_blocks = (30 - 2) // ProgressBar.BLOCK_WIDTH
+            mock_update.assert_called_once_with(
+                file_index=1,
+                elapsed_sec=mock.ANY,
+                filled_blocks=num_blocks // 2,
+            )
+        finally:
+            shutil.rmtree(tmp_dir)
+
+    @patch.object(FFMpegTranscoder, "run", return_value=True)
+    def test_single_file_progress(self, mock_run):
+        """When only one file is processed, the progress bar updates once and finishes."""
+        tmp_dir = Path(tempfile.mkdtemp())
+        try:
+            # 1 MP4 file
+            f1 = tmp_dir / "single.mp4"
+            f1.touch()
+
+            ts = datetime.now()
+            files_to_process = [(f1, ts, ts)]
+
+            with (
+                mock.patch.object(
+                    ProgressBar, "start", return_value=None
+                ) as mock_start,
+                mock.patch.object(
+                    ProgressBar, "update", return_value=None
+                ) as mock_update,
+                mock.patch.object(
+                    ProgressBar, "finish", return_value=None
+                ) as mock_finish,
+            ):
+                archiver = CameraArchiver(tmp_dir, tmp_dir, MagicMock())
+                result = archiver.transcode_all(files_to_process)
+
+            self.assertEqual(len(result), 1)
+            self.assertIn((f1, ts, ts), result)
+
+            mock_start.assert_called_once()
+            mock_finish.assert_called_once()
+            mock_update.assert_called_once()
+
+            # Default width used by transcode_all
+            num_blocks = (30 - 2) // ProgressBar.BLOCK_WIDTH
+
+            mock_update.assert_called_once_with(
+                file_index=1,
+                elapsed_sec=mock.ANY,
+                filled_blocks=num_blocks,  # fully filled bar for the lone file
+            )
+        finally:
+            shutil.rmtree(tmp_dir)
 
 
 def run_tests():
