@@ -391,11 +391,15 @@ class FFMpegTranscoder:
     def run(self) -> bool:
         cmd = self._ffmpeg_cmd(self.input_file, self.output_file)
 
-        # Clear progress display and log the transcoding message
+        transcode_log_path = Path(self.output_file.parent / "transcode.log")
+        try:
+            log_fh = open(transcode_log_path, "a", encoding="utf-8")
+        except Exception:  # fall back to no‑log if we cannot write
+            log_fh = None
+
         self.progress_bar.ensure_clean_log_space()
         self.logger.info(f"Transcoding: {self.input_file} -> {self.output_file}")
 
-        # Flush all log handlers
         for handler in getattr(self.logger, "handlers", []):
             try:
                 handler.flush()
@@ -403,9 +407,7 @@ class FFMpegTranscoder:
                 pass
         sys.stderr.flush()
 
-        # Start timing for this specific file
         self.progress_bar.start_file()
-
         total_seconds = None
         try:
             import shutil
@@ -442,41 +444,68 @@ class FFMpegTranscoder:
             return False
 
         current_progress_pct = 0.0
+        ffmpeg_output_lines: list[str] = []
 
         if proc.stdout:
             for line in iter(proc.stdout.readline, ""):
                 if not line:
                     break
 
-                # Calculate progress percentage
+                # Write raw ffmpeg line to persistent log file
+                if log_fh:
+                    try:
+                        log_fh.write(line)
+                        log_fh.flush()
+                    except Exception:
+                        pass
+
+                ffmpeg_output_lines.append(line)
+
+                # Progress parsing
                 if total_seconds and total_seconds > 0:
                     match = re.search(r"time=([0-9:.]+)", line)
                     if match:
-                        time_parts = match.group(1).split(":")
-                        if len(time_parts) >= 3:
-                            h, m, s = map(float, time_parts[:3])
-                            elapsed_sec = h * 3600 + m * 60 + s
-                            current_progress_pct = min(
-                                (elapsed_sec / total_seconds) * 100, 100.0
-                            )
+                        h, m, s = map(float, match.group(1).split(":")[:3])
+                        elapsed_sec = h * 3600 + m * 60 + s
+                        current_progress_pct = min(
+                            (elapsed_sec / total_seconds) * 100, 100.0
+                        )
                 else:
-                    # Fallback: increment progress gradually
                     current_progress_pct = min(current_progress_pct + 1, 99.0)
 
-                # Update progress bars
                 self.progress_bar.update_progress(self.file_index, current_progress_pct)
 
         proc.wait()
         success = proc.returncode == 0
 
+        if log_fh:
+            try:
+                log_fh.close()
+            except Exception:
+                pass
+
         if success:
-            # Show completion at 100%
             self.progress_bar.finish_file(self.file_index)
         else:
             self.progress_bar.ensure_clean_log_space()
             self.logger.error(
                 f"Failed to transcode {self.input_file} (rc={proc.returncode})"
             )
+
+            # Emit the ffmpeg output as a single INFO record
+            if ffmpeg_output_lines:
+                joined = "".join(ffmpeg_output_lines).strip()
+                if joined:
+                    try:
+                        with open(transcode_log_path, "r", encoding="utf-8") as fh:
+                            content = fh.read().strip()
+                    except Exception:
+                        content = joined  # fallback
+                    if content:
+                        self.logger.info(content)
+
+            # Note: the “Stopping further transcodes” message is logged by
+            # CameraArchiver.transcode_all() – do not duplicate it here.
 
         return success
 
@@ -598,7 +627,6 @@ class CameraArchiver:
         proc_list = list(processed)
         timestamps = set()
 
-        # ------------------------------------------------------------------
         # Remove the original MP4/JPG pair if the archived file exists
         for fp, ts, _ in proc_list:
             out_file = get_output_path(fp, self.output_dir, ts)
@@ -650,7 +678,6 @@ class CameraArchiver:
                         except Exception as e:
                             self.logger.error(f"Failed to remove {jpg}: {e}")
 
-        # ------------------------------------------------------------------
         # Remove orphaned JPGs that were not paired with a processed MP4
         orphaned = 0
         for jpg, ts, _ in proc_list:
@@ -669,7 +696,6 @@ class CameraArchiver:
                     except Exception as e:
                         self.logger.error(f"Failed to remove orphaned JPG {jpg}: {e}")
 
-        # ------------------------------------------------------------------
         # Empty‑directory cleanup (both input and archive trees)
         if dry_run:
             # Report what would be removed – do not touch the filesystem
@@ -725,7 +751,6 @@ class CameraArchiver:
             for d in sorted(cleaned_dirs, key=lambda p: len(p.parts), reverse=True):
                 self.logger.debug(f"Removed empty directory: {d}")
 
-        # ------------------------------------------------------------------
         if dry_run:
             self.logger.info(
                 f"[DRY RUN] Cleanup summary: Would process {len(proc_list)} MP4 files "
