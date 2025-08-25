@@ -25,7 +25,7 @@ def setup_logging(log_file: Path) -> logging.Logger:
 
     formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
 
-    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler = logging.StreamHandler(sys.stderr)
     console_handler.setLevel(logging.INFO)
     console_handler.setFormatter(formatter)
     logger.addHandler(console_handler)
@@ -383,7 +383,7 @@ class FFMpegTranscoder:
             "-global_quality",
             "26",
             "-c:v",
-            "hevc_qsv",
+            "h264_qsv",
             "-an",
             str(output_path),
         ]
