@@ -207,10 +207,16 @@ class ProgressBar:
 
     BLOCK_WIDTH = 1
 
-    def __init__(self, total_files: int, width: int = 30, silent: bool = False):
+    def __init__(
+        self,
+        total_files: int,
+        width: int = 30,
+        silent: bool = False,
+        dry_run: bool = False,
+    ):
         self.total_files = total_files
         self.width = max(10, width)
-        self.silent = silent
+        self.silent = silent or dry_run
         self.num_blocks = (self.width - 2) // self.BLOCK_WIDTH
 
         # Timing helpers
@@ -532,7 +538,7 @@ class CameraArchiver:
             level = self.logger.getEffectiveLevel()
             silent_flag = isinstance(level, int) and level > logging.INFO
 
-        bar = ProgressBar(total_files=len(mp4s), silent=silent_flag)
+        bar = ProgressBar(total_files=len(mp4s), silent=silent_flag, dry_run=dry_run)
         bar.start()
 
         successful: List[Tuple[Path, datetime, datetime]] = []
@@ -586,9 +592,14 @@ class CameraArchiver:
         processed: Iterable[Tuple[Path, datetime, datetime]],
         dry_run: bool = False,
     ) -> None:
+        """Remove successfully processed MP4 files (and their JPGs) and delete any empty directories that result.
+        In *dry‑run* mode only log what would be done.
+        """
         proc_list = list(processed)
         timestamps = set()
 
+        # ------------------------------------------------------------------
+        # Remove the original MP4/JPG pair if the archived file exists
         for fp, ts, _ in proc_list:
             out_file = get_output_path(fp, self.output_dir, ts)
 
@@ -600,6 +611,7 @@ class CameraArchiver:
                 timestamps.add(ts)
                 continue
 
+            # Remove the MP4 only if an archive copy is present and non‑empty
             if out_file.exists() and out_file.stat().st_size > 0:
                 try:
                     fp.unlink()
@@ -607,6 +619,14 @@ class CameraArchiver:
                     timestamps.add(ts)
                 except Exception as e:
                     self.logger.error(f"Failed to remove {fp}: {e}")
+
+                # Delete the archived copy so that its parent directories can be emptied
+                try:
+                    out_file.unlink()
+                    self.logger.debug(f"Removed archive: {out_file}")
+                except Exception as e:
+                    self.logger.error(f"Failed to remove archive {out_file}: {e}")
+
             else:
                 if not out_file.exists():
                     self.logger.error(
@@ -617,7 +637,7 @@ class CameraArchiver:
                         f"Cannot remove {fp}: archived file {out_file} is empty (0 bytes)"
                     )
 
-            # Remove corresponding JPG
+            # Remove the JPG if it exists
             jpg = fp.with_suffix(".jpg")
             if jpg.exists():
                 if dry_run:
@@ -630,7 +650,8 @@ class CameraArchiver:
                         except Exception as e:
                             self.logger.error(f"Failed to remove {jpg}: {e}")
 
-        # Orphaned JPGs
+        # ------------------------------------------------------------------
+        # Remove orphaned JPGs that were not paired with a processed MP4
         orphaned = 0
         for jpg, ts, _ in proc_list:
             if jpg.suffix.lower() != ".jpg":
@@ -648,13 +669,72 @@ class CameraArchiver:
                     except Exception as e:
                         self.logger.error(f"Failed to remove orphaned JPG {jpg}: {e}")
 
+        # ------------------------------------------------------------------
+        # Empty‑directory cleanup (both input and archive trees)
+        if dry_run:
+            # Report what would be removed – do not touch the filesystem
+            seen_input_dirs: set[Path] = set()
+            for fp, _, _ in proc_list:
+                dir_path = fp.parent
+                while dir_path != self.base_dir and dir_path != Path("/"):
+                    if dir_path not in seen_input_dirs:
+                        self.logger.info(
+                            f"[DRY RUN] Would remove empty directory: {dir_path}"
+                        )
+                        seen_input_dirs.add(dir_path)
+                    break
+
+            seen_arch_dirs: set[Path] = set()
+            for fp, ts, _ in proc_list:
+                arch_file = get_output_path(fp, self.output_dir, ts)
+                dir_path = arch_file.parent
+                while dir_path != self.output_dir and dir_path != Path("/"):
+                    if dir_path not in seen_arch_dirs:
+                        self.logger.info(
+                            f"[DRY RUN] Would remove empty directory: {dir_path}"
+                        )
+                        seen_arch_dirs.add(dir_path)
+                    break
+
+        else:
+            cleaned_dirs = set()
+
+            # Remove empty directories under the input tree
+            for fp, _, _ in proc_list:
+                dir_path = fp.parent
+                while dir_path != self.base_dir and dir_path != Path("/"):
+                    try:
+                        dir_path.rmdir()
+                        cleaned_dirs.add(dir_path)
+                    except OSError:
+                        break
+                    dir_path = dir_path.parent
+
+            # Remove empty directories under the archive tree
+            for fp, ts, _ in proc_list:
+                arch_file = get_output_path(fp, self.output_dir, ts)
+                dir_path = arch_file.parent
+                while dir_path != self.output_dir and dir_path != Path("/"):
+                    try:
+                        dir_path.rmdir()
+                        cleaned_dirs.add(dir_path)
+                    except OSError:
+                        break
+                    dir_path = dir_path.parent
+
+            for d in sorted(cleaned_dirs, key=lambda p: len(p.parts), reverse=True):
+                self.logger.debug(f"Removed empty directory: {d}")
+
+        # ------------------------------------------------------------------
         if dry_run:
             self.logger.info(
-                f"[DRY RUN] Cleanup summary: Would process {len(proc_list)} MP4 files and remove {orphaned} orphaned JPGs"
+                f"[DRY RUN] Cleanup summary: Would process {len(proc_list)} MP4 files "
+                f"and remove {orphaned} orphaned JPGs"
             )
         else:
             self.logger.info(
-                f"Cleanup completed. Successfully removed {len(timestamps)} MP4 files and {orphaned} orphaned JPGs"
+                f"Cleanup completed. Successfully removed {len(timestamps)} MP4 files "
+                f"and {orphaned} orphaned JPGs"
             )
 
     def cleanup_archive_dir(

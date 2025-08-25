@@ -604,6 +604,46 @@ class TestTranscoding(unittest.TestCase):
             shutil.rmtree(tmp_dir)
 
 
+class TestCleanupEmptyFolders(unittest.TestCase):
+    def setUp(self):
+        # Input tree /camera/YYYY/MM/DD
+        self.input_root = Path(tempfile.mkdtemp())
+        self.file_dir = self.input_root / "2024" / "08" / "21"
+        self.file_dir.mkdir(parents=True, exist_ok=True)
+        self.mp4 = self.file_dir / "REO_CAM_20240821123456.mp4"
+        self.jpg = self.file_dir / "REO_CAM_20240821123456.jpg"
+        self.mp4.touch()
+        self.jpg.touch()
+
+        # Archive tree /camera/archived/YYYY/MM/DD
+        self.arch_root = Path(tempfile.mkdtemp())
+        self.arch_file = get_output_path(self.mp4, self.arch_root, datetime.now())
+        self.arch_file.parent.mkdir(parents=True, exist_ok=True)
+        self.arch_file.write_bytes(b"A" * 1024)
+
+    def tearDown(self):
+        shutil.rmtree(self.input_root, ignore_errors=True)
+        shutil.rmtree(self.arch_root, ignore_errors=True)
+
+    def test_remove_empty_dirs_in_both_trees(self):
+        archiver = CameraArchiver(self.input_root, self.arch_root, MagicMock())
+        processed = [(self.mp4, datetime.now(), datetime.now())]
+        archiver.cleanup_processed(processed, dry_run=False)
+
+        # Files removed
+        self.assertFalse(self.mp4.exists())
+        self.assertFalse(self.jpg.exists())
+
+        # Input dirs cleaned up
+        self.assertFalse((self.input_root / "2024" / "08").exists())
+        self.assertFalse((self.input_root / "2024").exists())
+
+        # Archive dirs cleaned up
+        self.assertFalse(
+            self.arch_file.parent.parent.parent.exists()
+        )  # /archived/2024/08/21 removed
+
+
 class TestArchiveCleanup(unittest.TestCase):
     """Test cleanup_archived_files logic."""
 
