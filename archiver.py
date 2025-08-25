@@ -541,18 +541,22 @@ class CameraArchiver:
         self,
         files_to_process: Iterable[Tuple[Path, datetime, datetime]],
         dry_run: bool = False,
+        no_skip: bool = False,
     ) -> List[Tuple[Path, datetime, datetime]]:
-        """Transcode all MP4 files in the provided list with an improved progress display."""
+        """
+        Transcode all MP4 files in the provided list with an improved progress display.
+
+        * If ``no_skip`` is False (default), any file that already has an
+          archived copy larger than 1 MiB will be skipped.
+        * If ``no_skip`` is True, the archived copy will be overwritten.
+        """
         files_list = list(files_to_process)
         mp4s = [f for f in files_list if f[0].suffix.lower() == ".mp4"]
 
         if not mp4s:
             return []
 
-        # Hide the bar when only a single file will be processed
         silent_flag = len(mp4s) <= 1
-
-        # If more than one file, decide whether to silence based on logger level
         if not silent_flag and hasattr(self.logger, "getEffectiveLevel"):
             level = self.logger.getEffectiveLevel()
             silent_flag = isinstance(level, int) and level > logging.INFO
@@ -566,6 +570,18 @@ class CameraArchiver:
             for idx, (fp, ts, mtime) in enumerate(mp4s, start=1):
                 out_file = get_output_path(fp, self.output_dir, ts)
 
+                # --- NEW SKIP LOGIC ------------------------------------
+                if (
+                    not no_skip
+                    and out_file.exists()
+                    and out_file.stat().st_size > 1024 * 1024
+                ):
+                    self.logger.info(
+                        f"[SKIP] Archived file already present and large: {out_file}"
+                    )
+                    continue
+                # -------------------------------------------------------
+
                 try:
                     out_file.parent.mkdir(parents=True, exist_ok=True)
                 except Exception as e:
@@ -573,11 +589,9 @@ class CameraArchiver:
                     continue
 
                 if dry_run:
-                    # In a dry‑run we still want the overall bar to move forward
                     bar.ensure_clean_log_space()
                     self.logger.info(f"[DRY RUN] Would transcode: {fp} -> {out_file}")
                     successful.append((fp, ts, mtime))
-                    # Explicitly update the progress bar even in dry run
                     bar.update_progress(file_index=idx, file_progress_pct=100.0)
                     continue
 
@@ -811,6 +825,14 @@ Examples:
         default=500,
         help="Maximum size of archived folder in GB before cleaning oldest files (default: 500)",
     )
+    parser.add_argument(
+        "--no-skip",
+        action="store_true",
+        help=(
+            "Do not skip transcoding when an archived copy larger than 1 MiB already exists. "
+            "Overrides the default behaviour of skipping such files."
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -852,14 +874,17 @@ Examples:
 
     # 2. Transcode
     if not args.dry_run:
-        # Only MP4s are actually transcoded; log the count before starting
         mp4s_to_process = [f for f in old_files if f[0].suffix.lower() == ".mp4"]
         logger.info(f"Transcoding {len(mp4s_to_process)} MP4 file(s)")
-        processed = archiver.transcode_all(mp4s_to_process, dry_run=args.dry_run)
+        processed = archiver.transcode_all(
+            mp4s_to_process, dry_run=args.dry_run, no_skip=args.no_skip
+        )
     else:
         # In dry‑run mode we still call transcode_all() so that the
         # progress bar logic is exercised (it will just skip actual work).
-        processed = archiver.transcode_all(old_files, dry_run=True)
+        processed = archiver.transcode_all(
+            old_files, dry_run=True, no_skip=args.no_skip
+        )
 
     # 3. Cleanup originals if requested
     if args.cleanup:

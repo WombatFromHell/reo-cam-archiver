@@ -997,6 +997,95 @@ class TestCameraArchiverProgress(unittest.TestCase):
             shutil.rmtree(tmp_dir)
 
 
+class TestCameraArchiverSkip(unittest.TestCase):
+    """Verify that the default skip logic works and that --no-skip overrides it."""
+
+    def setUp(self) -> None:
+        # Temporary input tree  /camera/YYYY/MM/DD
+        self.base_dir = Path(tempfile.mkdtemp())
+        self.file_dir = self.base_dir / "2024" / "08" / "21"
+        self.file_dir.mkdir(parents=True, exist_ok=True)
+
+        # Input MP4 file
+        self.mp4_path = self.file_dir / "REO_CAM_20240821123456.mp4"
+        self.mp4_path.touch()
+
+        # Corresponding archived copy (will be >1 MiB)
+        self.arch_root = Path(tempfile.mkdtemp())
+        self.out_file = get_output_path(
+            self.mp4_path, self.arch_root, datetime(2024, 8, 21, 12, 34, 56)
+        )
+        self.out_file.parent.mkdir(parents=True, exist_ok=True)
+        # write 1 MiB + 1 kB
+        self.out_file.write_bytes(b"A" * (1024 * 1024 + 1024))
+
+        self.logger = mock.MagicMock()
+        self.archiver = CameraArchiver(self.base_dir, self.arch_root, self.logger)
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.base_dir)
+        shutil.rmtree(self.arch_root)
+
+    def test_skip_when_large_archive_exists(self):
+        """With no --no-skip flag, an existing large archive causes the file to be skipped."""
+        files_to_process = [
+            (self.mp4_path, datetime(2024, 8, 21, 12, 34, 56), datetime.now())
+        ]
+
+        # Use dry‑run so that we never touch the filesystem or run ffmpeg
+        result = self.archiver.transcode_all(
+            files_to_process, dry_run=True, no_skip=False
+        )
+
+        # No file should be processed
+        self.assertEqual(result, [])
+
+    def test_no_skip_overwrites_large_archive(self):
+        """With --no-skip, the file is still queued for transcoding."""
+        files_to_process = [
+            (self.mp4_path, datetime(2024, 8, 21, 12, 34, 56), datetime.now())
+        ]
+
+        # Dry‑run mode: the run() method is never executed but we
+        # should still see the file in the returned list.
+        result = self.archiver.transcode_all(
+            files_to_process, dry_run=True, no_skip=True
+        )
+
+        self.assertEqual(result, [files_to_process[0]])
+
+    @patch.object(FFMpegTranscoder, "run", return_value=True)
+    def test_real_transcode_with_no_skip(self, mock_run):
+        """When no‑skip is true and we run normally, the transcoder is invoked."""
+        files_to_process = [
+            (self.mp4_path, datetime(2024, 8, 21, 12, 34, 56), datetime.now())
+        ]
+
+        result = self.archiver.transcode_all(
+            files_to_process, dry_run=False, no_skip=True
+        )
+
+        # The transcoder should have been called once
+        mock_run.assert_called_once()
+        self.assertEqual(result, [files_to_process[0]])
+
+    def test_no_skip_for_small_archive(self):
+        """If the archive is smaller than 1 MiB, the file is processed even without --no-skip."""
+        # Reduce the size of the existing archive
+        self.out_file.write_bytes(b"A" * (1024 * 512))  # 512 kB
+
+        files_to_process = [
+            (self.mp4_path, datetime(2024, 8, 21, 12, 34, 56), datetime.now())
+        ]
+
+        result = self.archiver.transcode_all(
+            files_to_process, dry_run=True, no_skip=False
+        )
+
+        # The file should be queued for transcoding
+        self.assertEqual(result, [files_to_process[0]])
+
+
 def run_tests():
     """Convenience wrapper to run all tests."""
     loader = unittest.TestLoader()
