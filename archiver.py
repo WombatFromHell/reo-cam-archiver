@@ -388,14 +388,40 @@ class FFMpegTranscoder:
             str(output_path),
         ]
 
+    def _get_video_duration(self, input_path: Path) -> Optional[float]:
+        """
+        Return the duration (in seconds) of *input_path* using ffprobe.
+        Returns ``None`` if ffprobe is unavailable or fails.
+        """
+        try:
+            import shutil
+
+            if isinstance(subprocess.Popen, MagicMock):
+                return None
+            if not shutil.which("ffprobe"):
+                return None
+
+            probe_output = subprocess.check_output(
+                [
+                    "ffprobe",
+                    "-v",
+                    "error",
+                    "-show_entries",
+                    "format=duration",
+                    "-of",
+                    "default=noprint_wrappers=1:nokey=1",
+                    str(input_path),
+                ],
+                text=True,
+            )
+            return float(probe_output.strip())
+        except Exception:
+            return None
+
     def run(self) -> bool:
         cmd = self._ffmpeg_cmd(self.input_file, self.output_file)
 
         transcode_log_path = Path(self.output_file.parent / "transcode.log")
-        try:
-            log_fh = open(transcode_log_path, "a", encoding="utf-8")
-        except Exception:  # fall back to no‑log if we cannot write
-            log_fh = None
 
         self.progress_bar.ensure_clean_log_space()
         self.logger.info(f"Transcoding: {self.input_file} -> {self.output_file}")
@@ -408,27 +434,7 @@ class FFMpegTranscoder:
         sys.stderr.flush()
 
         self.progress_bar.start_file()
-        total_seconds = None
-        try:
-            import shutil
-
-            if not isinstance(subprocess.Popen, MagicMock) and shutil.which("ffprobe"):
-                probe_output = subprocess.check_output(
-                    [
-                        "ffprobe",
-                        "-v",
-                        "error",
-                        "-show_entries",
-                        "format=duration",
-                        "-of",
-                        "default=noprint_wrappers=1:nokey=1",
-                        str(self.input_file),
-                    ],
-                    text=True,
-                )
-                total_seconds = float(probe_output.strip())
-        except Exception:
-            pass
+        total_seconds = self._get_video_duration(self.input_file)
 
         try:
             proc = subprocess.Popen(
@@ -451,17 +457,8 @@ class FFMpegTranscoder:
                 if not line:
                     break
 
-                # Write raw ffmpeg line to persistent log file
-                if log_fh:
-                    try:
-                        log_fh.write(line)
-                        log_fh.flush()
-                    except Exception:
-                        pass
-
                 ffmpeg_output_lines.append(line)
 
-                # Progress parsing
                 if total_seconds and total_seconds > 0:
                     match = re.search(r"time=([0-9:.]+)", line)
                     if match:
@@ -478,9 +475,10 @@ class FFMpegTranscoder:
         proc.wait()
         success = proc.returncode == 0
 
-        if log_fh:
+        if not success:
             try:
-                log_fh.close()
+                with open(transcode_log_path, "a", encoding="utf-8") as fh:
+                    fh.writelines(ffmpeg_output_lines)
             except Exception:
                 pass
 
@@ -491,21 +489,9 @@ class FFMpegTranscoder:
             self.logger.error(
                 f"Failed to transcode {self.input_file} (rc={proc.returncode})"
             )
-
-            # Emit the ffmpeg output as a single INFO record
-            if ffmpeg_output_lines:
-                joined = "".join(ffmpeg_output_lines).strip()
-                if joined:
-                    try:
-                        with open(transcode_log_path, "r", encoding="utf-8") as fh:
-                            content = fh.read().strip()
-                    except Exception:
-                        content = joined  # fallback
-                    if content:
-                        self.logger.info(content)
-
-            # Note: the “Stopping further transcodes” message is logged by
-            # CameraArchiver.transcode_all() – do not duplicate it here.
+            joined = "".join(ffmpeg_output_lines).strip()
+            if joined:
+                self.logger.info(joined)
 
         return success
 
@@ -518,7 +504,11 @@ def transcode_with_progress(
     It simply creates an FFMpegTranscoder instance and calls its run() method.
     """
     # Ensure destination directory exists
-    output_file.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        output_file.parent.mkdir(parents=True, exist_ok=True)
+    except Exception as e:
+        logger.error(f"Could not create {output_file.parent}: {e}")
+        return False
 
     # Dummy bar – silent so tests don't see any output
     dummy_bar = ProgressBar(total_files=1, silent=True)
@@ -575,6 +565,12 @@ class CameraArchiver:
         try:
             for idx, (fp, ts, mtime) in enumerate(mp4s, start=1):
                 out_file = get_output_path(fp, self.output_dir, ts)
+
+                try:
+                    out_file.parent.mkdir(parents=True, exist_ok=True)
+                except Exception as e:
+                    logging.error(f"Could not create {out_file.parent}: {e}")
+                    continue
 
                 if dry_run:
                     # In a dry‑run we still want the overall bar to move forward

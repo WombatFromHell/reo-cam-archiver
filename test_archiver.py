@@ -603,6 +603,42 @@ class TestTranscoding(unittest.TestCase):
         finally:
             shutil.rmtree(tmp_dir)
 
+    def test_create_missing_output_dir(self):
+        """transcode_with_progress should create missing output directories."""
+        tmp = Path(tempfile.mkdtemp())
+        try:
+            inp = tmp / "in.mp4"
+            inp.touch()
+
+            # Input file timestamp – any value works
+            ts = datetime.now()
+
+            @patch("archiver.subprocess.Popen")
+            def _run(mock_popen):
+                proc = MagicMock()
+                proc.returncode = 0
+                proc.stdout.readline.side_effect = ["", ""]
+                mock_popen.return_value = proc
+
+                logger = MagicMock()
+
+                archiver = CameraArchiver(tmp, tmp, logger)
+                # discover the file so that transcode_all() sees it
+                archiver.discover_files()
+                result = archiver.transcode_all([(inp, ts, ts)])
+
+                self.assertTrue(result)  # succeeded
+
+                # The output path used by the archiver:
+                out_file = get_output_path(inp, tmp, ts)
+                self.assertTrue(
+                    out_file.parent.exists(), msg=f"Expected {out_file.parent} to exist"
+                )
+
+            _run()
+        finally:
+            shutil.rmtree(tmp)
+
 
 class TestCleanupEmptyFolders(unittest.TestCase):
     def setUp(self):
