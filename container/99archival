@@ -1,0 +1,2 @@
+# run FFMPEG archival and organization every day @ midnight
+0 0 * * * /camera/archive-task.sh >> /var/log/cron.log 2>&1

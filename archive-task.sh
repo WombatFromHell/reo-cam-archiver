@@ -1,3 +1,3 @@
 #!/bin/sh
-PYTHON=/usr/bin/python3
-$PYTHON "/camera/archiver.py" --age 3 --no-skip
+PYTHON=$(command -v python3)
+exec "$PYTHON" /camera/archiver.py --age 3 --no-skip

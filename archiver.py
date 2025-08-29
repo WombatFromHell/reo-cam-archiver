@@ -5,6 +5,7 @@ import re
 import subprocess
 import sys
 import time
+import shlex
 from datetime import datetime, timedelta
 from pathlib import Path
 import threading
@@ -175,53 +176,45 @@ def get_video_duration(inp):
     if not shutil.which("ffprobe"):
         return None
     try:
-        out = subprocess.check_output(
-            [
-                "ffprobe",
-                "-v",
-                "error",
-                "-show_entries",
-                "format=duration",
-                "-of",
-                "default=noprint_wrappers=1:nokey=1",
-                str(inp),
-            ],
-            text=True,
+        cmd_str = (
+            "ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "
+            f"{shlex.quote(str(inp))}"
         )
+        cmd = shlex.split(cmd_str)
+        out = subprocess.check_output(cmd, text=True)
         return float(out.strip())
     except Exception:
         return None
 
 
 def transcode_file(inp, outp, logger, progress_cb=None):
-    cmd = [
-        "ffmpeg",
-        "-y",
-        "-hwaccel",
-        "vaapi",
-        "-hwaccel_output_format",
-        "vaapi",
-        "-i",
-        str(inp),
-        "-vf",
-        "scale_vaapi=1024:768,hwmap=derive_device=qsv,format=qsv",
-        "-global_quality",
-        "26",
-        "-c:v",
-        "h264_qsv",
-        "-an",
-        str(outp),
-    ]
-    total = get_video_duration(inp)
-    proc = subprocess.Popen(
-        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1
+    cmd_str = (
+        f"ffmpeg -hide_banner -hwaccel qsv -hwaccel_output_format qsv -y "
+        f"-i {shlex.quote(str(inp))} "
+        f"-vf scale_qsv=w=1024:h=768:mode=hq "
+        f"-global_quality 26 -c:v h264_qsv -an "
+        f"{shlex.quote(str(outp))}"
     )
+    cmd = shlex.split(cmd_str)
+    # logger.info(f"Using the following transcode command: {cmd_str}")
+    total = get_video_duration(inp)
+
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
+
+    log_lines = []
     prev_pct = -1.0
     cur_pct = 0.0
     if proc.stdout:
         for line in iter(proc.stdout.readline, ""):
             if not line:
                 break
+            log_lines.append(line)
             if total and total > 0:
                 m = re.search(r"time=([0-9:.]+)", line)
                 if m:
@@ -232,8 +225,13 @@ def transcode_file(inp, outp, logger, progress_cb=None):
             if progress_cb and cur_pct != prev_pct:
                 progress_cb(cur_pct)
                 prev_pct = cur_pct
-    proc.wait()
-    return proc.returncode == 0
+
+    rc = proc.wait()
+    # Log ffmpeg output on failure
+    if rc != 0:
+        msg = f"FFmpeg failed (code {rc}) for {inp} -> {outp}\n" + "".join(log_lines)
+        logger.error(msg)
+    return rc == 0
 
 
 def scan_files(base_dir):
