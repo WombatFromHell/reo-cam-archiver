@@ -14,7 +14,7 @@ TIMESTAMP_RE = re.compile(r"REO_.*_(\d{14})\.(mp4|jpg)$", re.IGNORECASE)
 
 
 class ConsoleOrchestrator:
-    """Thread‑safe lock for console output."""
+    """Thread-safe lock for console output."""
 
     def __init__(self):
         self._lock = threading.RLock()
@@ -61,6 +61,11 @@ class ProgressBar:
     def _is_tty(self):
         return hasattr(self.out, "isatty") and self.out.isatty()
 
+    def start_processing(self):
+        """Initialize the total processing start time."""
+        if self.start_time is None:
+            self.start_time = time.time()
+
     def finish(self):
         if not self.silent:
             self.out.write("\x1b[999B\x1b[2K\r\n")
@@ -68,6 +73,9 @@ class ProgressBar:
 
     def start_file(self):
         self.file_start = time.time()
+        # Ensure start_time is set when first file starts
+        if self.start_time is None:
+            self.start_time = time.time()
 
     def update_progress(self, idx, pct=0.0):
         if self.silent:
@@ -95,16 +103,14 @@ class ProgressBar:
 
     def _clear_area(self):
         if not self._is_tty():
-            return ""
-        with self.orchestrator.guard():
-            self.out.write("\x1b[s")
-            for _ in range(1):
-                self.out.write("\x1b[2K\r\x1b[1B")
-            self.out.write("\x1b[u")
-        return ""
+            return
+        # Move cursor down one line, clear it, then move back up
+        self.out.write("\x1b[1E\x1b[2K\x1b[1A")
+        self.out.flush()
 
     def redraw(self):
-        if not self.silent or not self._progress_line:
+        # Fixed logic: redraw when NOT silent and we have a progress line
+        if self.silent or not self._progress_line:
             return
         with self.orchestrator.guard():
             self._display(self._progress_line)
@@ -113,11 +119,12 @@ class ProgressBar:
         if not self._is_tty():
             now = time.time()
             if getattr(self, "_last_print_time", 0) < now - 5:
-                self.out.write(f"\r{line}")
+                self.out.write(f"\r{line}\n")
                 self.out.flush()
                 self._last_print_time = now
             return
-        self.out.write("\x1b[s\x1b[2K\r" + line + "\x1b[u")
+        # For TTY: save cursor, clear line, write progress, restore cursor
+        self.out.write(f"\x1b[s\x1b[2K\r{line}\x1b[u")
         self.out.flush()
 
 
@@ -137,8 +144,10 @@ def setup_logging(log_file, progress_bar=None):
     fh.setFormatter(logging.Formatter(fmt))
     logger.addHandler(fh)
 
-    stream = sys.stderr if progress_bar else sys.stdout
-    orch = ConsoleOrchestrator()
+    # Use the same stream as the progress bar to avoid conflicts
+    stream = progress_bar.out if progress_bar else sys.stdout
+    # Use the progress bar's orchestrator for proper coordination
+    orch = progress_bar.orchestrator if progress_bar else ConsoleOrchestrator()
     sh = GuardedStreamHandler(orch, stream=stream, progress_bar=progress_bar)
     sh.setFormatter(logging.Formatter(fmt))
     sh.setLevel(logging.INFO)
@@ -270,6 +279,10 @@ def process_files(old_list, out_dir, logger, dry_run, no_skip, mapping, bar):
     if not old_list:
         logger.info("No files to process")
         return set()
+
+    # Initialize the progress bar's total timer
+    bar.start_processing()
+
     processed = set()
     for idx, (fp, ts) in enumerate(old_list, 1):
         outp = output_path(fp, ts, out_dir)
@@ -311,7 +324,7 @@ def remove_orphaned_jpgs(base_dir, mapping, processed, logger, dry_run):
     count = 0
     for key, files in mapping.items():
         jpg = files.get(".jpg")
-        mp4 = files.get("mp4")
+        mp4 = files.get(".mp4")
         if not jpg or jpg in processed:
             continue
         if not mp4:
@@ -346,7 +359,7 @@ def main():
         "-m",
         type=int,
         default=500,
-        help="Maximum archive size in GB (used only when not dry‑run)",
+        help="Maximum archive size in GB (used only when not dry-run)",
     )
     parser.add_argument(
         "--no-skip",
@@ -372,7 +385,7 @@ def main():
     mp4s, mapping = scan_files(base_dir)
     cutoff = datetime.now() - timedelta(days=args.age)
     old_list = [(p, t) for p, t in mp4s if t < cutoff]
-    bar = ProgressBar(total_files=len(old_list), silent=args.dry_run, out=sys.stdout)
+    bar = ProgressBar(total_files=len(old_list), silent=args.dry_run, out=sys.stderr)
     logger = setup_logging(base_dir / "transcoding.log", progress_bar=bar)
 
     for msg in [
