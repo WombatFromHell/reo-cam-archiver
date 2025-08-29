@@ -44,6 +44,9 @@ class DummyProgressBar:
     def update_progress(self, idx, pct):  # pragma: no cover
         pass
 
+    def start_processing(self):  # pragma: no cover
+        pass
+
 
 class TestTimestampParsing(unittest.TestCase):
     def test_parse_timestamp_from_filename_valid(self):
