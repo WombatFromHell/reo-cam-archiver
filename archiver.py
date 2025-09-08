@@ -166,25 +166,34 @@ def parse_timestamp_from_filename(name):
         return None
 
 
-def safe_remove(p: Path, logger, dry_run, *, use_trash=False, trash_root=None):
+def safe_remove(
+    p: Path, logger, dry_run, use_trash=False, trash_root=None, is_output=False
+):
     """
     Remove a file or directory.  When *use_trash* is True and a valid
     *trash_root* is supplied the item is moved to that folder instead of being
     deleted permanently.
+
+    The moved item is placed under either an ``input`` or ``output``
+    sub‑folder inside the trash root, depending on the *is_output*
+    flag.  If *is_output* is True the file is considered an archived
+    output; otherwise it is treated as an input.
     """
     if dry_run:
         logger.info(f"[DRY RUN] Would remove {p}")
     else:
         try:
             if use_trash and trash_root:
-                # Build a destination path inside the trash directory
-                dest = trash_root / p.name
+                # Decide which subfolder to place the item in
+                dest_sub = "output" if is_output else "input"
+                dest = trash_root / dest_sub / p.name
                 counter = 0
                 new_dest = dest
                 while new_dest.exists():
                     counter += 1
                     suffix = f"_{int(time.time())}_{counter}"
-                    new_dest = trash_root / (p.stem + suffix + p.suffix)
+                    new_dest = trash_root / dest_sub / (p.stem + suffix + p.suffix)
+                # Ensure the destination directory exists
                 new_dest.parent.mkdir(parents=True, exist_ok=True)
                 shutil.move(str(p), str(new_dest))
                 logger.info(f"Moved to trash: {p} -> {new_dest}")
@@ -390,7 +399,7 @@ def remove_orphaned_jpgs(
         logger.info(f"Removed {count} orphaned JPG files")
 
 
-def clean_empty_directories(root_dir, logger=None, *, use_trash=False, trash_root=None):
+def clean_empty_directories(root_dir, logger=None, use_trash=False, trash_root=None):
     """
     Walk *root_dir* bottom‑up and delete any empty directory that matches
     the <YYYY>/<MM>/<DD> pattern.  When *use_trash* is True and a valid
@@ -447,11 +456,17 @@ def clean_empty_directories(root_dir, logger=None, *, use_trash=False, trash_roo
                     logger.error(f"Failed to remove empty directory {p}: {e}")
 
 
-def cleanup_archive_size_limit(out_dir, logger, max_size_gb, dry_run):
+def cleanup_archive_size_limit(
+    out_dir, logger, max_size_gb, dry_run, use_trash=False, trash_root=None
+):
     """
     Remove the oldest archived files when the total size of all
     ``archived-*.mp4`` files in *out_dir* exceeds *max_size_gb*.
     When *dry_run* is True only a log message is emitted.
+
+    If *use_trash* and a valid *trash_root* are supplied, removed
+    archive files are moved to that folder under an ``output`` sub‑directory
+    instead of being permanently deleted.
     """
     archive_files = list(out_dir.rglob("archived-*.mp4"))
     if not archive_files:
@@ -473,11 +488,20 @@ def cleanup_archive_size_limit(out_dir, logger, max_size_gb, dry_run):
         )
         for f in sorted(archive_files, key=lambda p: p.stat().st_mtime):
             sz = f.stat().st_size
-            f.unlink()
+            # Move to trash or delete permanently depending on flags
+            if use_trash and trash_root:
+                safe_remove(
+                    f,
+                    logger,
+                    dry_run=False,
+                    use_trash=True,
+                    trash_root=trash_root,
+                    is_output=True,
+                )
+            else:
+                f.unlink()
             cur_size -= sz
             logger.info(f"Removed old archive: {f}")
-            if cur_size <= limit:
-                break
         logger.info(f"Final archive size: {cur_size / (1024**3):.1f} GB")
 
 
@@ -580,12 +604,19 @@ def main():
         trash_root,
     )
 
-    # Clean up any empty directories left under camera and archived paths
+    # Clean up any empty directories left under input and output paths
     clean_empty_directories(base_dir, logger)
     clean_empty_directories(out_dir, logger)
 
     # Enforce the archive size limit (moved into a helper function)
-    cleanup_archive_size_limit(out_dir, logger, args.max_size, args.dry_run)
+    cleanup_archive_size_limit(
+        out_dir,
+        logger,
+        args.max_size,
+        args.dry_run,
+        use_trash=args.use_trash,
+        trash_root=trash_root,
+    )
 
     if args.dry_run:
         logger.info("[DRY RUN] Done - no files were actually modified")

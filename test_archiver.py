@@ -538,7 +538,7 @@ class TestTrashBehavior(unittest.TestCase):
         )
 
         self.assertFalse(p.exists())
-        dest = self.trash_root / p.name
+        dest = self.trash_root / "input" / p.name  # <trash_root>/input/<file>
         self.assertTrue(dest.exists())
         logs = log_capture.getvalue()
         self.assertIn("Moved to trash", logs)
