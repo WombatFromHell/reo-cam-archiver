@@ -268,7 +268,7 @@ class TestProcessFiles(unittest.TestCase):
         mapping = {key: {".mp4": mp4_path, ".jpg": jpg_path}}
 
         mock_safe_remove.side_effect = (
-            lambda p, logger, dry_run: p.unlink() if not dry_run else None
+            lambda p, logger, dry_run, **kw: p.unlink() if not dry_run else None
         )
 
         archiver.process_files(
@@ -305,7 +305,7 @@ class TestProcessFiles(unittest.TestCase):
         mapping = {key: {".mp4": mp4_path, ".jpg": jpg_path}}
 
         mock_safe_remove.side_effect = (
-            lambda p, logger, dry_run: p.unlink() if not dry_run else None
+            lambda p, logger, dry_run, **kw: p.unlink() if not dry_run else None
         )
 
         archiver.process_files(
@@ -355,6 +355,132 @@ class TestProcessFiles(unittest.TestCase):
         self.assertIn("[DRY RUN] Would transcode", logs)
 
 
+class TestCleanupEmptyDirectories(unittest.TestCase):
+    """Verify that only YYYY/MM/DD directories are removed."""
+
+    def setUp(self):
+        self.base_dir = Path(tempfile.mkdtemp())
+
+        # Empty day directory – should be removed
+        (self.base_dir / "2023" / "12" / "01").mkdir(parents=True)
+
+        # Day with a nested empty sub‑directory – should *not* be removed
+        (self.base_dir / "2023" / "12" / "02").mkdir(parents=True)
+        (self.base_dir / "2023" / "12" / "02" / "sub").mkdir()
+
+        # Random directory that does not match the pattern – should stay
+        (self.base_dir / "random").mkdir()
+
+    def tearDown(self):
+        shutil.rmtree(self.base_dir, ignore_errors=True)
+
+    def test_remove_empty_day_dirs_only(self):
+        archiver.clean_empty_directories(self.base_dir)
+        self.assertFalse((self.base_dir / "2023" / "12" / "01").exists())
+
+    def test_preserve_day_with_subdirs_and_files(self):
+        archiver.clean_empty_directories(self.base_dir)
+        # The day that had a sub‑directory should still exist
+        self.assertTrue((self.base_dir / "2023" / "12" / "02").exists())
+        self.assertTrue((self.base_dir / "2023" / "12" / "02" / "sub").exists())
+
+    def test_preserve_random_directory(self):
+        archiver.clean_empty_directories(self.base_dir)
+        self.assertTrue((self.base_dir / "random").exists())
+
+
+class TestCleanupEmptyDirectoriesOut(unittest.TestCase):
+    """Same checks but for the archived output tree."""
+
+    def setUp(self):
+        self.out_dir = Path(tempfile.mkdtemp())
+
+        # Empty day directory – should be removed
+        (self.out_dir / "2023" / "12" / "01").mkdir(parents=True)
+
+        # Day with a nested sub‑directory and a file – should stay
+        day = self.out_dir / "2023" / "12" / "02"
+        day.mkdir(parents=True)
+        (day / "sub").mkdir()
+        (day / "file.mp4").write_text("data")
+
+    def tearDown(self):
+        shutil.rmtree(self.out_dir, ignore_errors=True)
+
+    def test_remove_empty_day_dirs_only(self):
+        archiver.clean_empty_directories(self.out_dir)
+        self.assertFalse((self.out_dir / "2023" / "12" / "01").exists())
+
+    def test_preserve_nonempty_day(self):
+        archiver.clean_empty_directories(self.out_dir)
+        day = self.out_dir / "2023" / "12" / "02"
+        self.assertTrue(day.exists())
+        self.assertTrue((day / "sub").exists())
+        self.assertTrue((day / "file.mp4").exists())
+
+
+class TestMainCleanupRandomDirectories(unittest.TestCase):
+    """Confirm that main() never deletes directories that do not match the pattern."""
+
+    def setUp(self):
+        self.input_dir = Path(tempfile.mkdtemp())
+        self.output_dir = Path(tempfile.mkdtemp())
+
+        # Random directory in the input tree
+        (self.input_dir / "random").mkdir()
+        (self.input_dir / "random" / "file.txt").write_text("data")
+
+        # Random directory in the output tree
+        (self.output_dir / "randombak").mkdir()
+        (self.output_dir / "randombak" / "archive.mp4").write_text("data")
+
+    def tearDown(self):
+        shutil.rmtree(self.input_dir, ignore_errors=True)
+        shutil.rmtree(self.output_dir, ignore_errors=True)
+
+    @patch("archiver.scan_files", return_value=([], {}))
+    @patch("archiver.process_files", return_value=set())
+    @patch("archiver.remove_orphaned_jpgs")
+    @patch("archiver.setup_logging")
+    def test_cleanup_random_dirs_not_removed(
+        self,
+        mock_setup_logging,
+        mock_remove_orphaned,
+        mock_process_files,
+        mock_scan_files,
+    ):
+        # Dummy logger that simply records messages
+        class DummyLogger:
+            def __init__(self):
+                self.messages = []
+
+            def info(self, msg):
+                self.messages.append(msg)
+
+        dummy_logger = DummyLogger()
+        mock_setup_logging.return_value = dummy_logger
+
+        original_argv = sys.argv
+        try:
+            sys.argv = [
+                "archiver.py",
+                "--directory",
+                str(self.input_dir),
+                "--output",
+                str(self.output_dir),
+            ]
+            archiver.main()
+        finally:
+            sys.argv = original_argv
+
+        # Random directories should still exist after main()
+        self.assertTrue((self.input_dir / "random").exists())
+        self.assertTrue((self.input_dir / "random" / "file.txt").exists())
+
+        self.assertTrue((self.output_dir / "randombak").exists())
+        self.assertTrue((self.output_dir / "randombak" / "archive.mp4").exists())
+
+
 class TestRemoveOrphanedJPGs(unittest.TestCase):
     def setUp(self):
         self.temp_dir = Path(tempfile.mkdtemp())
@@ -376,13 +502,77 @@ class TestRemoveOrphanedJPGs(unittest.TestCase):
         mapping = {"20231201000000": {".jpg": orphan_path}}
         processed = set()
 
-        archiver.remove_orphaned_jpgs(
-            self.temp_dir, mapping, processed, self.logger, dry_run=False
+        archiver.remove_orphaned_jpgs(mapping, processed, self.logger, dry_run=False)
+        mock_safe_remove.assert_called_once_with(
+            orphan_path, self.logger, False, use_trash=False, trash_root=None
         )
-        mock_safe_remove.assert_called_once_with(orphan_path, self.logger, False)
 
         logs = self.logger_capture.getvalue()
         self.assertIn("Found orphaned JPG", logs)
+
+
+class TestTrashBehavior(unittest.TestCase):
+    """Verify that files and empty directories are moved to the trash directory."""
+
+    def setUp(self):
+        self.temp_dir = Path(tempfile.mkdtemp())
+        # Trash root inside the temporary directory for isolation
+        self.trash_root = self.temp_dir / ".Deleted"
+        self.trash_root.mkdir(parents=True, exist_ok=True)
+
+    def tearDown(self):
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def test_safe_remove_moves_file_to_trash(self):
+        p = self.temp_dir / "file.txt"
+        p.write_text("data")
+        log_capture = io.StringIO()
+        handler = logging.StreamHandler(log_capture)
+        logger = logging.getLogger(f"trash_test_{self._testMethodName}")
+        logger.setLevel(logging.INFO)
+        logger.handlers.clear()
+        logger.addHandler(handler)
+
+        archiver.safe_remove(
+            p, logger, dry_run=False, use_trash=True, trash_root=self.trash_root
+        )
+
+        self.assertFalse(p.exists())
+        dest = self.trash_root / p.name
+        self.assertTrue(dest.exists())
+        logs = log_capture.getvalue()
+        self.assertIn("Moved to trash", logs)
+
+    def test_cleanup_empty_directories_moves_dir_to_trash(self):
+        empty_day = self.temp_dir / "2023" / "12" / "01"
+        empty_day.mkdir(parents=True)
+        archiver.clean_empty_directories(
+            self.temp_dir, None, use_trash=True, trash_root=self.trash_root
+        )
+        # original day directory should be gone
+        self.assertFalse(empty_day.exists())
+        dest = self.trash_root / "01"
+        self.assertTrue(dest.is_dir())
+
+    def test_safe_remove_dry_run_when_use_trash(self):
+        p = self.temp_dir / "file.txt"
+        p.write_text("data")
+        log_capture = io.StringIO()
+        handler = logging.StreamHandler(log_capture)
+        logger = logging.getLogger(f"dryrun_test_{self._testMethodName}")
+        logger.setLevel(logging.INFO)
+        logger.handlers.clear()
+        logger.addHandler(handler)
+
+        archiver.safe_remove(
+            p, logger, dry_run=True, use_trash=True, trash_root=self.trash_root
+        )
+
+        self.assertTrue(p.exists())
+        dest = self.trash_root / p.name
+        self.assertFalse(dest.exists())
+        logs = log_capture.getvalue()
+        self.assertIn("[DRY RUN] Would remove", logs)
 
 
 class TestMainFunction(unittest.TestCase):
