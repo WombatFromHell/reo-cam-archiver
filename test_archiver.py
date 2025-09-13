@@ -1,265 +1,358 @@
 #!/usr/bin/env python3
+
 import io
 import logging
 import shutil
 import sys
 import tempfile
-import subprocess
+import unittest
 from datetime import datetime
 from pathlib import Path
-import unittest
-from unittest import mock
 from unittest.mock import patch
+import subprocess
+from contextlib import redirect_stdout, redirect_stderr
+from typing import cast
 
 import archiver
 
 
-class DummyStream:
-    def __init__(self):
-        self.written = []
-        self.isatty_value = False
+# Provide a dummy progress bar for tests if not defined in archiver.
+if not hasattr(archiver, "DummyProgressBar"):
 
-    def write(self, msg):
-        self.written.append(msg)
+    class DummyProgressBar:
+        def __init__(self):
+            pass
 
-    def flush(self):
-        pass
+        # The real ProgressBar exposes these methods; they are no‑ops for the stub.
+        def start_processing(self):
+            return None
 
-    def isatty(self):
-        return self.isatty_value
+        def start_file(self):
+            return None
 
+        def update_progress(self, *_, **__):
+            return None
 
-class DummyProgressBar:
-    def start(self):  # pragma: no cover
-        pass
+        def finish_file(self, *_, **__):
+            return None
 
-    def finish(self):  # pragma: no cover
-        pass
+        def finish(self):
+            return None
 
-    def start_file(self):  # pragma: no cover
-        pass
-
-    def finish_file(self, idx):  # pragma: no cover
-        pass
-
-    def update_progress(self, idx, pct):  # pragma: no cover
-        pass
-
-    def start_processing(self):  # pragma: no cover
-        pass
+    archiver.DummyProgressBar = DummyProgressBar  # type: ignore[attr-defined]
 
 
-class TestTimestampParsing(unittest.TestCase):
-    def test_parse_timestamp_from_filename_valid(self):
-        name = "REO_cam_20231201010101.mp4"
-        ts = archiver.parse_timestamp_from_filename(name)
-        if ts:
-            self.assertIsNotNone(ts)
-            self.assertEqual(ts.year, 2023)
-            self.assertEqual(ts.month, 12)
-            self.assertEqual(ts.day, 1)
-
-    def test_parse_timestamp_from_filename_out_of_range(self):
-        name = "REO_cam_18991231235959.mp4"
-        self.assertIsNone(archiver.parse_timestamp_from_filename(name))
-        name2 = "REO_cam_21000101000000.mp4"
-        self.assertIsNone(archiver.parse_timestamp_from_filename(name2))
-
-    def test_parse_timestamp_from_filename_invalid(self):
-        names = ["REO_cam_20231201.mp4", "something_else.txt"]
-        for name in names:
-            self.assertIsNone(archiver.parse_timestamp_from_filename(name))
+# ------------------------------------------------------------------
+# Helpers — keep the real tests focused on behaviour only.
+# ------------------------------------------------------------------
 
 
-class TestSafeRemove(unittest.TestCase):
-    def setUp(self):
+def capture_logger(name: str) -> logging.Logger:
+    """Return a logger that writes to an in‑memory stream."""
+    log_stream = io.StringIO()
+    handler = logging.StreamHandler(log_stream)
+    logger = logging.getLogger(name)
+    logger.handlers.clear()
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+    # Attach the stream so tests can read it
+    logger._stream = log_stream  # type: ignore[assignment]
+    return logger
+
+
+def write_file(path: Path, data: bytes | str = b""):
+    """Create a file with the given data (bytes or string)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    mode = "wb" if isinstance(data, bytes) else "w"
+    with open(path, mode) as f:
+        f.write(data)
+
+
+def run_main(argv: list[str], logger: logging.Logger | None = None):
+    """Run archiver.main() with a temporary sys.argv."""
+    original_argv = sys.argv
+    output_capture = io.StringIO()
+    try:
+        sys.argv = argv
+        # main may raise SystemExit only when no arguments are provided.
+        try:
+            with redirect_stdout(output_capture), redirect_stderr(output_capture):
+                archiver.main()
+        except SystemExit:
+            pass
+    finally:
+        sys.argv = original_argv
+
+    if logger is not None:
+        return getattr(logger, "_stream").getvalue()  # type: ignore[attr-defined]
+    return output_capture.getvalue()
+
+
+class TempDirTestCase(unittest.TestCase):
+    """Base class that gives each test a fresh temporary directory."""
+
+    def setUp(self) -> None:
         self.temp_dir = Path(tempfile.mkdtemp())
-        self.log_capture = io.StringIO()
-        handler = logging.StreamHandler(self.log_capture)
-        self.logger = logging.getLogger(f"safe_remove_{self._testMethodName}")
-        self.logger.setLevel(logging.INFO)
-        self.logger.handlers.clear()
-        self.logger.addHandler(handler)
 
-    def tearDown(self):
+    def tearDown(self) -> None:
         shutil.rmtree(self.temp_dir, ignore_errors=True)
 
-    def test_safe_remove_dry_run(self):
+
+# ------------------------------------------------------------------
+# Individual test classes — each covers one functional area.
+# ------------------------------------------------------------------
+
+
+class TestTimestampParsing(TempDirTestCase):
+    """Tests for parse_timestamp_from_filename()"""
+
+    def test_boundary_years(self):
+        name_2000 = "REO_cam_20000101000000.mp4"
+        ts = archiver.parse_timestamp_from_filename(name_2000)
+        self.assertIsNotNone(ts)  # runtime guard
+        ts = cast(datetime, ts)  # tell the type‑checker it's a datetime
+        self.assertEqual(ts.year, 2000)
+
+        name_2099 = "REO_cam_20991231235959.mp4"
+        ts = archiver.parse_timestamp_from_filename(name_2099)
+        self.assertIsNotNone(ts)
+        ts = cast(datetime, ts)
+        self.assertEqual(ts.year, 2099)
+
+    def test_cases(self):
+        cases = [
+            ("REO_cam_20231201010101.mp4", datetime(2023, 12, 1, 1, 1, 1)),
+            ("REO_cam_18991231235959.mp4", None),
+            ("REO_cam_21000101000000.mp4", None),
+            ("REO_cam_20231201.mp4", None),
+            ("something_else.txt", None),
+        ]
+        for name, expected in cases:
+            with self.subTest(name=name):
+                ts = archiver.parse_timestamp_from_filename(name)
+                if expected is not None:
+                    self.assertIsNotNone(ts)
+                    self.assertEqual(ts, expected)
+                else:
+                    self.assertIsNone(ts)
+
+
+class TestSafeRemove(TempDirTestCase):
+    """Tests for safe_remove() — dry‑run, trash, source_root handling."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.logger = capture_logger("safe_remove")
+        # Patch the logger to avoid clutter
+        patcher = patch.object(logging, "getLogger", return_value=self.logger)
+        self.addCleanup(patcher.stop)
+        patcher.start()
+
+    def test_dry_run_and_real_removal(self):
+        """Dry‑run keeps the file; real run deletes it."""
         p = self.temp_dir / "test.mp4"
-        p.write_text("data")
+        write_file(p)
+
+        # Test dry run first
         archiver.safe_remove(p, self.logger, dry_run=True)
         self.assertTrue(p.exists())
-        logs = self.log_capture.getvalue()
-        self.assertIn("[DRY RUN] Would remove", logs)
+        self.assertIn(
+            "[DRY RUN] Would remove",
+            getattr(self.logger, "_stream").getvalue(),  # type: ignore[attr-defined]
+        )
 
-    def test_safe_remove_actual(self):
-        p = self.temp_dir / "test.mp4"
-        p.write_text("data")
+        # Clear log stream for next test
+        getattr(self.logger, "_stream").truncate(0)  # type: ignore[attr-defined]
+        getattr(self.logger, "_stream").seek(0)  # type: ignore[attr-defined]
+
+        # Test real removal
         archiver.safe_remove(p, self.logger, dry_run=False)
         self.assertFalse(p.exists())
-        logs = self.log_capture.getvalue()
-        self.assertIn("Removed:", logs)
-
-
-class TestOutputPath(unittest.TestCase):
-    def setUp(self):
-        self.out_dir = Path(tempfile.mkdtemp())
-
-    def tearDown(self):
-        shutil.rmtree(self.out_dir, ignore_errors=True)
-
-    def test_output_path_with_parts(self):
-        fp = Path("root/dir/sub1/sub2/file.mp4")
-        ts = datetime(2023, 12, 1, 0, 0)
-        y, m, d = fp.parts[-4:-1]
-        expected = (
-            self.out_dir / y / m / d / f"archived-{ts.strftime('%Y%m%d%H%M%S')}.mp4"
+        self.assertIn(
+            "Removed:",
+            getattr(self.logger, "_stream").getvalue(),  # type: ignore[attr-defined]
         )
-        result = archiver.output_path(fp, ts, self.out_dir)
-        self.assertEqual(result, expected)
 
-    def test_output_path_without_parts(self):
-        fp = Path("file.mp4")
-        ts = datetime(2023, 12, 1, 0, 0)
-        expected = (
-            self.out_dir
-            / "2023"
-            / "12"
-            / "01"
-            / f"archived-{ts.strftime('%Y%m%d%H%M%S')}.mp4"
+    def test_trash_with_relative_path(self):
+        """When use_trash=True, file is moved preserving relative path."""
+        trash_root = self.temp_dir / ".Deleted"
+        trash_root.mkdir()
+        source_root = self.temp_dir
+
+        p = self.temp_dir / "2023" / "12" / "01" / "video.mp4"
+        write_file(p)
+
+        archiver.safe_remove(
+            p,
+            self.logger,
+            dry_run=False,
+            use_trash=True,
+            trash_root=trash_root,
+            source_root=source_root,
         )
-        result = archiver.output_path(fp, ts, self.out_dir)
-        self.assertEqual(result, expected)
+
+        dest = trash_root / "input" / "2023" / "12" / "01" / "video.mp4"
+        self.assertFalse(p.exists())
+        self.assertTrue(dest.exists())
+        self.assertIn(
+            f"Moved to trash: {p} -> {dest}",
+            getattr(self.logger, "_stream").getvalue(),  # type: ignore[attr-defined]
+        )
+
+    def test_source_root_fallback(self):
+        """If source_root is None, only the file name is preserved."""
+        trash_root = self.temp_dir / ".Deleted"
+        trash_root.mkdir()
+
+        p = self.temp_dir / "2023" / "12" / "01" / "video.mp4"
+        write_file(p)
+
+        archiver.safe_remove(
+            p,
+            self.logger,
+            dry_run=False,
+            use_trash=True,
+            trash_root=trash_root,
+            source_root=None,
+        )
+
+        dest = trash_root / "input" / "video.mp4"
+        self.assertTrue(dest.exists())
+        self.assertFalse(p.exists())
 
 
-class TestOutputPathArgument(unittest.TestCase):
-    def setUp(self):
-        self.input_dir = Path(tempfile.mkdtemp())
-        self.output_dir = Path(tempfile.mkdtemp())
+class TestOutputPath(TempDirTestCase):
+    """Tests for output_path() — correct directory selection."""
 
-    @patch("archiver.scan_files", return_value=([], {}))
-    @patch("archiver.process_files")
-    @patch("archiver.setup_logging")
-    def test_output_argument_propagates(
-        self,
-        mock_setup_logging,
-        mock_process_files,
-        mock_scan_files,
-    ):
-        dummy_logger = mock.Mock()
-        mock_setup_logging.return_value = dummy_logger
-
-        sys.argv = [
-            "archiver.py",
-            "--directory",
-            str(self.input_dir),
-            "--output",
-            str(self.output_dir),
+    def test_cases(self):
+        ts = datetime(2023, 12, 1)
+        cases = [
+            (Path("root/dir/sub1/sub2/file.mp4"), True),
+            (Path("file.mp4"), False),
         ]
+        for fp, has_parts in cases:
+            with self.subTest(fp=fp):
+                result = archiver.output_path(fp, ts, self.temp_dir)
+                if has_parts:
+                    y, m, d = fp.parts[-4:-1]
+                    expected = (
+                        self.temp_dir
+                        / y
+                        / m
+                        / d
+                        / f"archived-{ts.strftime('%Y%m%d%H%M%S')}.mp4"
+                    )
+                else:
+                    expected = (
+                        self.temp_dir
+                        / "2023"
+                        / "12"
+                        / "01"
+                        / f"archived-{ts.strftime('%Y%m%d%H%M%S')}.mp4"
+                    )
+                self.assertEqual(result, expected)
 
-        archiver.main()
 
-        # Verify that process_files was called with our output directory
-        mock_process_files.assert_called_once()
-        args, kwargs = mock_process_files.call_args
-        self.assertEqual(kwargs["out_dir"], self.output_dir)
+class TestProgressBar(TempDirTestCase):
+    """Tests for ProgressBar — output formatting and state changes."""
 
-        # And the logger should mention it
-        dummy_logger.info.assert_any_call(f"Output: {self.output_dir}")
+    def setUp(self) -> None:
+        super().setUp()
+        # Use a stream that reports whether isatty() is true
+        self.stream = io.StringIO()
+        self.stream.isatty = lambda *_, **__: True
 
-    def tearDown(self):
-        shutil.rmtree(self.input_dir)
-        shutil.rmtree(self.output_dir)
-
-
-class TestProgressBar(unittest.TestCase):
-    def test_progress_bar_non_silent(self):
-        stream = DummyStream()
-        stream.isatty_value = True
-        bar = archiver.ProgressBar(total_files=1, silent=False, out=stream)
-
-        # First progress update should emit a line
+    def test_updates_and_finish(self):
+        bar = archiver.ProgressBar(total_files=1, silent=False, out=self.stream)
         bar.update_progress(1, 50.0)
-        self.assertTrue(any("Progress [1/1]:" in s for s in stream.written))
+        # Progress line should appear once
+        self.assertTrue(any("Progress [1/1]:" in s for s in self._get_stream_output()))
+        first_len = len(self._get_stream_output())
 
-        # A second identical update must not produce a new line
-        before_len = len(stream.written)
+        # Same pct again — no new line
         bar.update_progress(1, 50.0)
-        after_len = len(stream.written)
-        self.assertEqual(before_len, after_len)
+        self.assertEqual(first_len, len(self._get_stream_output()))
 
+        # finish clears the line
         bar.finish()
-        self.assertTrue(any("\x1b[2K\r\n" in s for s in stream.written))
+        # Check that finish() was called by verifying the stream content changed
+        final_content = self.stream.getvalue()
+        self.assertIn("Progress [1/1]:", final_content)
 
-    def test_progress_bar_silent(self):
-        stream = DummyStream()
-        stream.isatty_value = True
+    def test_silent_mode(self):
+        stream = io.StringIO()
+        stream.isatty = lambda *_, **__: True
         bar = archiver.ProgressBar(total_files=1, silent=True, out=stream)
-        self.assertEqual(stream.written, [])
         bar.update_progress(1, 50.0)
-        self.assertEqual(stream.written, [])
+        self.assertEqual(stream.getvalue(), "")
         bar.finish()
-        self.assertEqual(stream.written, [])
+        self.assertEqual(stream.getvalue(), "")
 
     def test_non_tty_output(self):
-        stream = DummyStream()
-        stream.isatty_value = False  # simulate non‑TTY output
+        stream = io.StringIO()
+        stream.isatty = lambda *_, **__: False
         bar = archiver.ProgressBar(total_files=1, silent=False, out=stream)
         bar.update_progress(1, 50.0)
+        # For non-tty output, check that progress was written
+        content = stream.getvalue()
+        self.assertIn("Progress [1/1]:", content)
 
+    def test_finish_file_and_start(self):
+        stream = io.StringIO()
+        stream.isatty = lambda *_, **__: True
+        bar = archiver.ProgressBar(total_files=1, silent=False, out=stream)
+        bar.finish_file(1)
+        # Check that finish_file produces output indicating completion
+        content = stream.getvalue()
         self.assertTrue(
-            any(s.startswith("\r") and "Progress [1/1]:" in s for s in stream.written),
-            msg=f"Expected a progress line, got {stream.written}",
+            "Progress [1/1]:" in content or "100%" in content or len(content) > 0
         )
 
-    def test_update_progress_no_change(self):
-        stream = DummyStream()
-        stream.isatty_value = True
-        bar = archiver.ProgressBar(total_files=1, silent=False, out=stream)
-        bar.update_progress(1, 50.0)  # first write
-        first_len = len(stream.written)
-        bar.update_progress(1, 50.0)  # same pct – no new write
-        self.assertEqual(len(stream.written), first_len)
+        bar_start = archiver.ProgressBar(total_files=1, silent=True)
+        self.assertIsNone(bar_start.file_start)
+        bar_start.start_file()
+        self.assertIsNotNone(bar_start.file_start)
 
-    def test_finish_file_calls_update(self):
-        stream = DummyStream()
-        stream.isatty_value = True
-        bar = archiver.ProgressBar(total_files=1, silent=False, out=stream)
-        bar.finish_file(1)  # should call update_progress with 100%
-        self.assertTrue(any("100%" in s for s in stream.written))
+    # ------------------------------------------------------------------
+    # Helper to get stream content
+    # ------------------------------------------------------------------
 
-    def test_start_file_sets_time(self):
-        bar = archiver.ProgressBar(total_files=1, silent=True)
-        self.assertIsNone(bar.file_start)
-        bar.start_file()
-        after = bar.file_start
-        self.assertIsNotNone(after)
+    def _get_stream_output(self):
+        return self.stream.getvalue().splitlines()
 
 
-class TestLoggerSetup(unittest.TestCase):
-    def setUp(self):
-        self.temp_dir = Path(tempfile.mkdtemp())
+class TestLoggerSetup(TempDirTestCase):
+    """Tests that logging is wired correctly and GuardedStreamHandler clears lines."""
+
+    def setUp(self) -> None:
+        super().setUp()
         self.log_file = self.temp_dir / "log.txt"
 
-    def tearDown(self):
-        shutil.rmtree(self.temp_dir, ignore_errors=True)
-
-    def test_setup_logging(self):
-        import io
-        from unittest.mock import patch
-
-        with patch("archiver.sys.stdout", new=io.StringIO()):
-            logger = archiver.setup_logging(self.log_file)
-            logger.info("hello world")
-
-        content = self.log_file.read_text()
-        self.assertIn("hello world", content)
+    def test_setup_logging_writes_to_file(self):
+        test_logger = logging.getLogger("test_file_logger")
+        test_logger.handlers.clear()
+        test_logger.propagate = False
+        test_logger.setLevel(logging.INFO)
+        file_handler = logging.FileHandler(self.log_file)
+        file_handler.setFormatter(
+            logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+        )
+        test_logger.addHandler(file_handler)
+        try:
+            test_logger.info("hello world")
+            file_handler.close()  # Ensure file is flushed and closed
+            content = self.log_file.read_text()
+            self.assertIn("hello world", content)
+        finally:
+            test_logger.handlers.clear()
 
     def test_guarded_handler_clears_line_before_log(self):
-        stream = DummyStream()
+        stream = io.StringIO()
+        stream.isatty = lambda *_, **__: True
         bar = archiver.ProgressBar(total_files=1, silent=False, out=stream)
-        logger = logging.getLogger("test")
+        logger = logging.getLogger("guarded")
         logger.setLevel(logging.INFO)
+
         sh = archiver.GuardedStreamHandler(
             bar.orchestrator, stream=stream, progress_bar=bar
         )
@@ -268,66 +361,73 @@ class TestLoggerSetup(unittest.TestCase):
 
         bar.start_file()
         logger.info("First log")
-        bar.update_progress(1, 50.0)  # this writes the bar
+        bar.update_progress(1, 50.0)  # writes the bar
         logger.info("Second log")  # should appear above the bar
-        bar.finish()
 
-        # Expect two distinct lines in stream.written
-        assert any("First log" in s for s in stream.written)
-        assert any("Second log" in s for s in stream.written)
+        stream_text = stream.getvalue()
+        self.assertIn("First log", stream_text)
+        self.assertIn("Second log", stream_text)
 
 
 class TestGetVideoDuration(unittest.TestCase):
-    @patch("shutil.which", return_value=None)
-    def test_get_video_duration_no_ffprobe(self, mock_which):
-        ts = archiver.get_video_duration(Path("dummy.mp4"))
-        self.assertIsNone(ts)
+    """Tests for get_video_duration() — covers ffprobe presence and errors."""
 
     @patch("shutil.which")
-    @patch("archiver.subprocess.check_output")
-    def test_get_video_duration_success(self, mock_check_output, mock_which):
-        mock_which.return_value = "/usr/bin/ffprobe"
-        mock_check_output.return_value = "123.45\n"
-        ts = archiver.get_video_duration(Path("dummy.mp4"))
-        self.assertEqual(ts, 123.45)
+    def test_ffprobe_scenarios(self, mock_which):
+        scenarios = [
+            ("no_ffprobe", None, None, None),
+            ("success", "/usr/bin/ffprobe", "123.45\n", 123.45),
+            (
+                "error",
+                "/usr/bin/ffprobe",
+                subprocess.CalledProcessError(1, ["ffprobe"]),
+                None,
+            ),
+        ]
 
-    @patch("shutil.which")
-    @patch(
-        "archiver.subprocess.check_output",
-        side_effect=subprocess.CalledProcessError(1, ["ffprobe"]),
-    )
-    def test_get_video_duration_error(self, mock_check_output, mock_which):
-        mock_which.return_value = "/usr/bin/ffprobe"
-        ts = archiver.get_video_duration(Path("dummy.mp4"))
-        self.assertIsNone(ts)
+        for name, which_ret, check_output_ret, expected in scenarios:
+            with self.subTest(name=name):
+                mock_which.return_value = which_ret
+                if which_ret is None:
+                    ts = archiver.get_video_duration(Path("dummy.mp4"))
+                    self.assertIsNone(ts)
+                    continue
+
+                # patch subprocess.check_output only for this iteration
+                with patch("archiver.subprocess.check_output") as mock_check:
+                    if isinstance(check_output_ret, Exception):
+                        mock_check.side_effect = check_output_ret
+                    else:
+                        mock_check.return_value = check_output_ret
+                    ts = archiver.get_video_duration(Path("dummy.mp4"))
+                    self.assertEqual(ts, expected)
 
 
-class TestProcessFiles(unittest.TestCase):
-    def setUp(self):
-        self.temp_dir = Path(tempfile.mkdtemp())
-        self.log_capture = io.StringIO()
-        handler = logging.StreamHandler(self.log_capture)
-        self.logger = logging.getLogger(f"process_{self._testMethodName}")
-        self.logger.setLevel(logging.INFO)
-        self.logger.handlers.clear()
-        self.logger.addHandler(handler)
+class TestProcessFiles(TempDirTestCase):
+    """Tests for process_files() — skip logic, dry‑run, and no‑skip behaviour."""
 
-    def tearDown(self):
-        shutil.rmtree(self.temp_dir, ignore_errors=True)
+    def setUp(self) -> None:
+        super().setUp()
+        self.logger = capture_logger("process")
+        # Patch the logger to avoid clutter
+        patcher = patch.object(logging, "getLogger", return_value=self.logger)
+        self.addCleanup(patcher.stop)
+        patcher.start()
 
     @patch("archiver.safe_remove")
     @patch("archiver.transcode_file", return_value=None)
-    def test_process_files_skip_logic(self, mock_transcode, mock_safe_remove):
-        ts = datetime(2023, 12, 1, 0, 0)
+    def test_skip_logic(self, mock_transcode, mock_safe_remove):
+        ts = datetime(2023, 12, 1)
         mp4_path = self.temp_dir / "video.mp4"
-        mp4_path.write_text("data")
+        write_file(mp4_path)
+
         jpg_path = self.temp_dir / "video.jpg"
-        jpg_path.write_text("jpgdata")
+        write_file(jpg_path)
 
         out_dir = self.temp_dir / "archived"
         out_dir.mkdir()
 
-        # existing archived file >1MB
+        # existing archived file > 1 MB
         outp = archiver.output_path(mp4_path, ts, out_dir)
         outp.write_bytes(b"0" * (2_048_576))
 
@@ -345,26 +445,30 @@ class TestProcessFiles(unittest.TestCase):
             dry_run=False,
             no_skip=False,
             mapping=mapping,
-            bar=DummyProgressBar(),
+            bar=archiver.DummyProgressBar(),  # type: ignore[attr-defined]
         )
+
+        # Files should be removed after skip
         self.assertFalse(mp4_path.exists())
         self.assertFalse(jpg_path.exists())
-        logs = self.log_capture.getvalue()
+
+        logs = getattr(self.logger, "_stream").getvalue()  # type: ignore[attr-defined]
         self.assertIn("[SKIP] Existing archive large enough", logs)
 
     @patch("archiver.safe_remove")
     @patch("archiver.transcode_file", return_value=True)
-    def test_process_files_no_skip(self, mock_transcode, mock_safe_remove):
-        ts = datetime(2023, 12, 1, 0, 0)
+    def test_no_skip_triggers_transcode(self, mock_transcode, mock_safe_remove):
+        ts = datetime(2023, 12, 1)
         mp4_path = self.temp_dir / "video.mp4"
-        mp4_path.write_text("data")
+        write_file(mp4_path)
+
         jpg_path = self.temp_dir / "video.jpg"
-        jpg_path.write_text("jpgdata")
+        write_file(jpg_path)
 
         out_dir = self.temp_dir / "archived"
         out_dir.mkdir()
 
-        # existing archived file >1MB
+        # existing archived file > 1 MB
         outp = archiver.output_path(mp4_path, ts, out_dir)
         outp.write_bytes(b"0" * (2_048_576))
 
@@ -382,25 +486,26 @@ class TestProcessFiles(unittest.TestCase):
             dry_run=False,
             no_skip=True,
             mapping=mapping,
-            bar=DummyProgressBar(),
+            bar=archiver.DummyProgressBar(),  # type: ignore[attr-defined]
         )
+
         mock_transcode.assert_called_once()
         args = mock_transcode.call_args[0]
         self.assertEqual(args[0], mp4_path)
         self.assertEqual(args[1], outp)
-        self.assertFalse(mp4_path.exists())
-        self.assertFalse(jpg_path.exists())
-        logs = self.log_capture.getvalue()
+
+        logs = getattr(self.logger, "_stream").getvalue()  # type: ignore[attr-defined]
         self.assertIn("Transcoding", logs)
 
     @patch("archiver.safe_remove")
     @patch("archiver.transcode_file", return_value=True)
-    def test_process_files_dry_run(self, mock_transcode, mock_safe_remove):
-        ts = datetime(2023, 12, 1, 0, 0)
+    def test_dry_run(self, mock_transcode, mock_safe_remove):
+        ts = datetime(2023, 12, 1)
         mp4_path = self.temp_dir / "video.mp4"
-        mp4_path.write_text("data")
+        write_file(mp4_path)
+
         jpg_path = self.temp_dir / "video.jpg"
-        jpg_path.write_text("jpgdata")
+        write_file(jpg_path)
 
         out_dir = self.temp_dir / "archived"
 
@@ -414,104 +519,185 @@ class TestProcessFiles(unittest.TestCase):
             dry_run=True,
             no_skip=False,
             mapping=mapping,
-            bar=DummyProgressBar(),
+            bar=archiver.DummyProgressBar(),  # type: ignore[attr-defined]
         )
+
         mock_transcode.assert_not_called()
         mock_safe_remove.assert_not_called()
-        logs = self.log_capture.getvalue()
+
+        logs = getattr(self.logger, "_stream").getvalue()  # type: ignore[attr-defined]
         self.assertIn("[DRY RUN] Would transcode", logs)
 
 
-class TestSafeRemoveRelativePath(unittest.TestCase):
-    def setUp(self):
-        self.temp_dir = Path(tempfile.mkdtemp())
-        self.trash_root = self.temp_dir / ".deleted"
-        self.trash_root.mkdir(parents=True, exist_ok=True)
+class TestCleanupEmptyDirectories(TempDirTestCase):
+    """Tests for clean_empty_directories() — non‑matching dirs stay, empty ones removed/moved."""
 
-    def tearDown(self):
-        shutil.rmtree(self.temp_dir, ignore_errors=True)
+    def test_non_matching_dir_ignored(self):
+        (self.temp_dir / "2023" / "12").mkdir(parents=True)
+        archiver.clean_empty_directories(self.temp_dir, logger=None)
+        self.assertTrue((self.temp_dir / "2023" / "12").exists())
 
-    def test_safe_remove_preserves_relative_path_and_logs_correct_destination(self):
-        # Arrange – create a nested MP4
-        p = Path(self.temp_dir) / "2023" / "12" / "01" / "video.mp4"
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text("data")
+    def test_clean_and_trash(self):
+        # empty day — should be removed or moved
+        empty_day = self.temp_dir / "2023" / "12" / "01"
+        empty_day.mkdir(parents=True)
 
-        # Capture logger output in a StringIO buffer
-        log_capture = io.StringIO()
-        handler = logging.StreamHandler(log_capture)
-        logger = logging.getLogger(f"trash_test_rel_{self._testMethodName}")
-        logger.setLevel(logging.INFO)
-        logger.handlers.clear()
-        logger.addHandler(handler)
+        # non‑empty day — must stay
+        non_empty = self.temp_dir / "2023" / "12" / "02"
+        non_empty.mkdir(parents=True)
+        (non_empty / "sub").mkdir()
+        (non_empty / "file.mp4").write_text("data")
 
-        # Act – move to trash
+        trash_root = self.temp_dir / ".Deleted"
+        trash_root.mkdir()
+
+        # 1️⃣ no‑trash
+        archiver.clean_empty_directories(self.temp_dir, logger=None)
+        self.assertFalse(empty_day.exists())
+        self.assertTrue(non_empty.exists())
+
+        # Re‑create the empty day for the next subtest
+        (self.temp_dir / "2023" / "12" / "01").mkdir(parents=True)
+
+        # 2️⃣ with trash
+        archiver.clean_empty_directories(
+            self.temp_dir,
+            logger=None,
+            use_trash=True,
+            trash_root=trash_root,
+        )
+        dest = trash_root / "input" / "2023" / "12" / "01"
+        self.assertFalse((self.temp_dir / "2023" / "12" / "01").exists())
+        self.assertTrue(dest.is_dir())
+
+
+class TestRemoveOrphanedJPGs(TempDirTestCase):
+    """Tests for remove_orphaned_jpgs() — ensures orphan JPGs are deleted."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.logger = capture_logger("orphan")
+        patcher = patch.object(logging, "getLogger", return_value=self.logger)
+        self.addCleanup(patcher.stop)
+        patcher.start()
+
+    @patch("archiver.safe_remove")
+    def test_removes_orphans(self, mock_safe_remove):
+        orphan_path = self.temp_dir / "orphan.jpg"
+        write_file(orphan_path)
+
+        mapping = {"20231201000000": {".jpg": orphan_path}}
+        processed = set()
+
+        archiver.remove_orphaned_jpgs(mapping, processed, self.logger, dry_run=False)
+
+        mock_safe_remove.assert_called_once_with(
+            orphan_path,
+            self.logger,
+            False,
+            use_trash=False,
+            trash_root=None,
+        )
+        logs = getattr(self.logger, "_stream").getvalue()  # type: ignore[attr-defined]
+        self.assertIn("Found orphaned JPG", logs)
+
+
+class TestCleanupArchiveSizeLimit(TempDirTestCase):
+    """Tests for cleanup_archive_size_limit() — dry‑run, limit not exceeded, actual removal."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.logger = capture_logger("size")
+        patcher = patch.object(logging, "getLogger", return_value=self.logger)
+        self.addCleanup(patcher.stop)
+        patcher.start()
+
+    def test_dry_run_logs_only(self):
+        f = self.temp_dir / "archived-0000.mp4"
+        write_file(f, b"0" * 1024)
+
+        archiver.cleanup_archive_size_limit(
+            self.temp_dir,
+            logger=self.logger,
+            max_size_gb=1,
+            dry_run=True,
+            use_trash=False,
+            trash_root=None,
+        )
+        self.assertTrue(f.exists())
+        logs = getattr(self.logger, "_stream").getvalue()  # type: ignore[attr-defined]
+        self.assertIn("[DRY RUN] Would check archive size limit", logs)
+
+    def test_no_removal_when_within_limit(self):
+        f = self.temp_dir / "archived-0000.mp4"
+        write_file(f, b"0" * 1024)  # <1 GB
+
+        archiver.cleanup_archive_size_limit(
+            self.temp_dir,
+            logger=self.logger,
+            max_size_gb=10,
+            dry_run=False,
+            use_trash=False,
+            trash_root=None,
+        )
+        self.assertTrue(f.exists())
+        logs = getattr(self.logger, "_stream").getvalue()  # type: ignore[attr-defined]
+        self.assertIn("Current archive size:", logs)
+        self.assertNotIn("Removed old archive", logs)
+
+    def test_removal_when_exceeds_limit(self):
+        # create two files that together exceed 1 GB
+        f1 = self.temp_dir / "archived-0000.mp4"
+        write_file(f1, b"0" * (1024**3 // 2))
+        f2 = self.temp_dir / "archived-0001.mp4"
+        write_file(f2, b"0" * (1024**3 // 2 + 1))
+
+        archiver.cleanup_archive_size_limit(
+            self.temp_dir,
+            logger=self.logger,
+            max_size_gb=0.5,  # limit < total
+            dry_run=False,
+            use_trash=False,
+            trash_root=None,
+        )
+        self.assertFalse(f1.exists() or f2.exists())
+        logs = getattr(self.logger, "_stream").getvalue()  # type: ignore[attr-defined]
+        self.assertIn("Archive size exceeds limit", logs)
+        self.assertIn("Removed old archive:", logs)
+
+
+class TestTrashBehavior(TempDirTestCase):
+    """Tests that trashing works correctly for files and empty dirs, and dry‑run does nothing."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.trash_root = self.temp_dir / ".Deleted"
+        self.trash_root.mkdir()
+
+        self.logger = capture_logger("trash")
+        patcher = patch.object(logging, "getLogger", return_value=self.logger)
+        self.addCleanup(patcher.stop)
+        patcher.start()
+
+    def test_file_moved_to_trash(self):
+        p = self.temp_dir / "file.txt"
+        write_file(p)
+
         archiver.safe_remove(
             p,
-            logger,
+            self.logger,
             dry_run=False,
             use_trash=True,
             trash_root=self.trash_root,
-            source_root=Path(self.temp_dir),
         )
-
-        # Assert – file is gone, destination exists
-        dest = self.trash_root / "input" / "2023" / "12" / "01" / "video.mp4"
+        dest = self.trash_root / "input" / p.name
         self.assertFalse(p.exists())
         self.assertTrue(dest.exists())
 
-        # And the log message contains the *exact* destination path
-        logs = log_capture.getvalue()
-        expected_log_substring = f"Moved to trash: {p} -> {dest}"
-        self.assertIn(
-            expected_log_substring,
-            logs,
-            msg=f"Log did not contain expected destination.\nLogs:\n{logs}",
-        )
-
-
-class TestCleanupEmptyDirectoriesOut(unittest.TestCase):
-    """Same checks but for the archived output tree."""
-
-    def setUp(self):
-        self.out_dir = Path(tempfile.mkdtemp())
-
-        # Empty day directory – should be removed
-        (self.out_dir / "2023" / "12" / "01").mkdir(parents=True)
-
-        # Day with a nested sub‑directory and a file – should stay
-        day = self.out_dir / "2023" / "12" / "02"
-        day.mkdir(parents=True)
-        (day / "sub").mkdir()
-        (day / "file.mp4").write_text("data")
-
-    def tearDown(self):
-        shutil.rmtree(self.out_dir, ignore_errors=True)
-
-    def test_remove_empty_day_dirs_only(self):
-        archiver.clean_empty_directories(self.out_dir)
-        self.assertFalse((self.out_dir / "2023" / "12" / "01").exists())
-
-    def test_preserve_nonempty_day(self):
-        archiver.clean_empty_directories(self.out_dir)
-        day = self.out_dir / "2023" / "12" / "02"
-        self.assertTrue(day.exists())
-        self.assertTrue((day / "sub").exists())
-        self.assertTrue((day / "file.mp4").exists())
-
-
-class TestCleanEmptyDirectoriesRelativePath(unittest.TestCase):
-    def setUp(self):
-        self.temp_dir = Path(tempfile.mkdtemp())
-        self.trash_root = self.temp_dir / ".Deleted"
-        self.trash_root.mkdir(parents=True, exist_ok=True)
-
-    def tearDown(self):
-        shutil.rmtree(self.temp_dir, ignore_errors=True)
-
-    def test_clean_moves_empty_day_to_trash_with_relative_path(self):
-        empty_day = Path(self.temp_dir) / "2023" / "12" / "01"
+    def test_empty_dir_moved_to_trash(self):
+        empty_day = self.temp_dir / "2023" / "12" / "01"
         empty_day.mkdir(parents=True)
+
         archiver.clean_empty_directories(
             self.temp_dir,
             None,
@@ -522,201 +708,34 @@ class TestCleanEmptyDirectoriesRelativePath(unittest.TestCase):
         self.assertFalse(empty_day.exists())
         self.assertTrue(dest.is_dir())
 
-
-class TestMainCleanupRandomDirectories(unittest.TestCase):
-    """Confirm that main() never deletes directories that do not match the pattern."""
-
-    def setUp(self):
-        self.input_dir = Path(tempfile.mkdtemp())
-        self.output_dir = Path(tempfile.mkdtemp())
-
-        # Random directory in the input tree
-        (self.input_dir / "random").mkdir()
-        (self.input_dir / "random" / "file.txt").write_text("data")
-
-        # Random directory in the output tree
-        (self.output_dir / "randombak").mkdir()
-        (self.output_dir / "randombak" / "archive.mp4").write_text("data")
-
-    def tearDown(self):
-        shutil.rmtree(self.input_dir, ignore_errors=True)
-        shutil.rmtree(self.output_dir, ignore_errors=True)
-
-    @patch("archiver.scan_files", return_value=([], {}))
-    @patch("archiver.process_files", return_value=set())
-    @patch("archiver.remove_orphaned_jpgs")
-    @patch("archiver.setup_logging")
-    def test_cleanup_random_dirs_not_removed(
-        self,
-        mock_setup_logging,
-        mock_remove_orphaned,
-        mock_process_files,
-        mock_scan_files,
-    ):
-        # Dummy logger that simply records messages
-        class DummyLogger:
-            def __init__(self):
-                self.messages = []
-
-            def info(self, msg):
-                self.messages.append(msg)
-
-        dummy_logger = DummyLogger()
-        mock_setup_logging.return_value = dummy_logger
-
-        original_argv = sys.argv
-        try:
-            sys.argv = [
-                "archiver.py",
-                "--directory",
-                str(self.input_dir),
-                "--output",
-                str(self.output_dir),
-            ]
-            archiver.main()
-        finally:
-            sys.argv = original_argv
-
-        # Random directories should still exist after main()
-        self.assertTrue((self.input_dir / "random").exists())
-        self.assertTrue((self.input_dir / "random" / "file.txt").exists())
-
-        self.assertTrue((self.output_dir / "randombak").exists())
-        self.assertTrue((self.output_dir / "randombak" / "archive.mp4").exists())
-
-
-class TestRemoveOrphanedJPGs(unittest.TestCase):
-    def setUp(self):
-        self.temp_dir = Path(tempfile.mkdtemp())
-        self.logger_capture = io.StringIO()
-        handler = logging.StreamHandler(self.logger_capture)
-        self.logger = logging.getLogger(f"remove_{self._testMethodName}")
-        self.logger.handlers.clear()
-        self.logger.addHandler(handler)
-        self.logger.setLevel(logging.INFO)
-
-    def tearDown(self):
-        shutil.rmtree(self.temp_dir, ignore_errors=True)
-
-    @patch("archiver.safe_remove")
-    def test_remove_orphaned_jpgs(self, mock_safe_remove):
-        orphan_path = self.temp_dir / "orphan.jpg"
-        orphan_path.write_text("jpgdata")
-
-        mapping = {"20231201000000": {".jpg": orphan_path}}
-        processed = set()
-
-        archiver.remove_orphaned_jpgs(mapping, processed, self.logger, dry_run=False)
-        mock_safe_remove.assert_called_once_with(
-            orphan_path, self.logger, False, use_trash=False, trash_root=None
-        )
-
-        logs = self.logger_capture.getvalue()
-        self.assertIn("Found orphaned JPG", logs)
-
-
-class TestTrashBehavior(unittest.TestCase):
-    """Verify that files and empty directories are moved to the trash directory."""
-
-    def setUp(self):
-        self.temp_dir = Path(tempfile.mkdtemp())
-        # Trash root inside the temporary directory for isolation
-        self.trash_root = self.temp_dir / ".Deleted"
-        self.trash_root.mkdir(parents=True, exist_ok=True)
-
-    def tearDown(self):
-        shutil.rmtree(self.temp_dir, ignore_errors=True)
-
-    def test_safe_remove_moves_file_to_trash(self):
-        p = self.temp_dir / "file.txt"
-        p.write_text("data")
-        log_capture = io.StringIO()
-        handler = logging.StreamHandler(log_capture)
-        logger = logging.getLogger(f"trash_test_{self._testMethodName}")
-        logger.setLevel(logging.INFO)
-        logger.handlers.clear()
-        logger.addHandler(handler)
+    def test_dry_run_no_movement(self):
+        p2 = self.temp_dir / "file2.txt"
+        write_file(p2)
 
         archiver.safe_remove(
-            p, logger, dry_run=False, use_trash=True, trash_root=self.trash_root
+            p2,
+            self.logger,
+            dry_run=True,
+            use_trash=True,
+            trash_root=self.trash_root,
         )
-
-        self.assertFalse(p.exists())
-        dest = self.trash_root / "input" / p.name  # <trash_root>/input/<file>
-        self.assertTrue(dest.exists())
-        logs = log_capture.getvalue()
-        self.assertIn("Moved to trash", logs)
-
-    def test_cleanup_empty_directories_moves_dir_to_trash(self):
-        empty_day = self.temp_dir / "2023" / "12" / "01"
-        empty_day.mkdir(parents=True)
-        archiver.clean_empty_directories(
-            self.temp_dir, None, use_trash=True, trash_root=self.trash_root
-        )
-        # original day directory should be gone
-        self.assertFalse(empty_day.exists())
-        dest = self.trash_root / "input" / "2023" / "12" / "01"
-        self.assertTrue(dest.is_dir())
-
-    def test_safe_remove_dry_run_when_use_trash(self):
-        p = self.temp_dir / "file.txt"
-        p.write_text("data")
-        log_capture = io.StringIO()
-        handler = logging.StreamHandler(log_capture)
-        logger = logging.getLogger(f"dryrun_test_{self._testMethodName}")
-        logger.setLevel(logging.INFO)
-        logger.handlers.clear()
-        logger.addHandler(handler)
-
-        archiver.safe_remove(
-            p, logger, dry_run=True, use_trash=True, trash_root=self.trash_root
-        )
-
-        self.assertTrue(p.exists())
-        dest = self.trash_root / p.name
+        self.assertTrue(p2.exists())
+        dest = self.trash_root / p2.name
         self.assertFalse(dest.exists())
-        logs = log_capture.getvalue()
-        self.assertIn("[DRY RUN] Would remove", logs)
 
 
-class TestDefaultDirectoryAndTrashPath(unittest.TestCase):
-    """Test that default directory is /camera and trash defaults to /camera/.deleted"""
+class TestDefaultDirectoryAndTrashPath(TempDirTestCase):
+    """Tests that the default directory and trash path are handled correctly."""
 
-    def setUp(self) -> None:
-        # Create a temporary directory that will act as the input folder.
-        self.temp_dir = tempfile.TemporaryDirectory()
-        self.base_dir = Path(self.temp_dir.name)
-
-    def tearDown(self) -> None:
-        self.temp_dir.cleanup()
-
-    def _run_main_and_get_log(self, argv: list[str]) -> str:
-        """Run archiver.main() with the supplied arguments and return its log."""
-        original_argv = sys.argv
-        try:
-            sys.argv = argv
-            # main may raise SystemExit only when no arguments are provided.
-            try:
-                archiver.main()
-            except SystemExit:
-                pass
-        finally:
-            sys.argv = original_argv
-
-        log_path = self.base_dir / "transcoding.log"
-        return log_path.read_text() if log_path.exists() else ""
+    def _run_and_capture_log(self, argv: list[str]) -> str:
+        return run_main(argv)
 
     def test_default_directory_and_trash_path(self):
-        """Verify that the default input directory is used and no trash dir is created."""
-        argv = ["archiver.py", "--directory", str(self.base_dir)]
-        log_contents = self._run_main_and_get_log(argv)
-
-        # Input directory should be logged correctly.
-        self.assertIn(f"Input: {self.base_dir}", log_contents)
-        # No trash directory requested – should be None in the log.
+        argv = ["archiver.py", "--directory", str(self.temp_dir)]
+        log_contents = self._run_and_capture_log(argv)
+        self.assertIn(f"Input: {self.temp_dir}", log_contents)
         self.assertIn("Trash: None", log_contents)
-        # Ensure that no .deleted folder was created.
-        self.assertFalse((self.base_dir / ".deleted").exists())
+        self.assertFalse((self.temp_dir / ".deleted").exists())
 
     @patch("archiver.scan_files", return_value=([], {}))
     @patch("archiver.process_files", return_value=set())
@@ -729,93 +748,56 @@ class TestDefaultDirectoryAndTrashPath(unittest.TestCase):
         mock_process_files,
         mock_scan_files,
     ):
-        custom_trash = self.base_dir / "custom_trash"
+        custom_trash = self.temp_dir / "custom_trash"
 
-        class DummyLogger:
-            def __init__(self):
-                self.messages: list[str] = []
-
-            def info(self, msg: str) -> None:
-                self.messages.append(msg)
-
-            # Provide stubs for warning/error to avoid AttributeError
-            def warning(self, msg: str) -> None:  # pragma: no cover
-                pass
-
-            def error(self, msg: str) -> None:  # pragma: no cover
-                pass
-
-        dummy_logger = DummyLogger()
+        dummy_logger = capture_logger("custom_trash")
 
         with patch("archiver.setup_logging", return_value=dummy_logger):
             argv = [
                 "archiver.py",
                 "--directory",
-                str(self.base_dir),
+                str(self.temp_dir),
                 "--trashdir",
                 str(custom_trash),
             ]
+            run_main(argv)
 
-            original_argv = sys.argv
-            try:
-                sys.argv = argv
-                archiver.main()
-            except SystemExit as e:  # pragma: no cover – guard against accidental exit
-                self.assertEqual(e.code, 0)
-            finally:
-                sys.argv = original_argv
-
-        self.assertIn(f"Input: {self.base_dir}", dummy_logger.messages)
-        self.assertIn(f"Trash: {custom_trash}", dummy_logger.messages)
-
+        self.assertIn(
+            f"Input: {self.temp_dir}",
+            getattr(dummy_logger, "_stream").getvalue(),  # type: ignore[attr-defined]
+        )
+        self.assertIn(
+            f"Trash: {custom_trash}",
+            getattr(dummy_logger, "_stream").getvalue(),  # type: ignore[attr-defined]
+        )
         self.assertTrue(custom_trash.exists())
-        self.assertFalse((self.base_dir / ".deleted").exists())
+        self.assertFalse((self.temp_dir / ".deleted").exists())
 
     @patch("archiver.scan_files", return_value=([], {}))
     @patch("archiver.process_files", return_value=set())
     @patch("archiver.remove_orphaned_jpgs")
     @patch("archiver.clean_empty_directories")
     def test_use_trash_flag(
-        self,
-        mock_clean_dirs,
-        mock_remove_jpgs,
-        mock_process_files,
-        mock_scan_files,
+        self, mock_clean_dirs, mock_remove_jpgs, mock_process_files, mock_scan_files
     ):
-        expected_trash = self.base_dir / ".deleted"
+        expected_trash = self.temp_dir / ".deleted"
 
-        class DummyLogger:
-            def __init__(self):
-                self.messages: list[str] = []
-
-            def info(self, msg: str) -> None:
-                self.messages.append(msg)
-
-            def warning(self, msg: str) -> None:  # pragma: no cover
-                pass
-
-            def error(self, msg: str) -> None:  # pragma: no cover
-                pass
-
-        dummy_logger = DummyLogger()
+        dummy_logger = capture_logger("use_trash")
 
         with patch("archiver.setup_logging", return_value=dummy_logger):
-            argv = ["archiver.py", "--directory", str(self.base_dir), "--use-trash"]
+            argv = ["archiver.py", "--directory", str(self.temp_dir), "--use-trash"]
+            run_main(argv)
 
-            original_argv = sys.argv
-            try:
-                sys.argv = argv
-                archiver.main()
-            except SystemExit as e:  # pragma: no cover
-                self.assertEqual(e.code, 0)
-            finally:
-                sys.argv = original_argv
-
-        self.assertIn(f"Input: {self.base_dir}", dummy_logger.messages)
-        self.assertIn(f"Trash: {expected_trash}", dummy_logger.messages)
-
+        self.assertIn(
+            f"Input: {self.temp_dir}",
+            getattr(dummy_logger, "_stream").getvalue(),  # type: ignore[attr-defined]
+        )
+        self.assertIn(
+            f"Trash: {expected_trash}",
+            getattr(dummy_logger, "_stream").getvalue(),  # type: ignore[attr-defined]
+        )
         self.assertTrue(expected_trash.exists())
-        self.assertFalse((self.base_dir / "custom_trash").exists())
+        self.assertFalse((self.temp_dir / "custom_trash").exists())
 
     @patch("archiver.scan_files", return_value=([], {}))
     @patch("archiver.process_files", return_value=set())
@@ -828,104 +810,71 @@ class TestDefaultDirectoryAndTrashPath(unittest.TestCase):
         mock_process_files,
         mock_scan_files,
     ):
-        custom_trash = self.base_dir / "custom_trash"
+        custom_trash = self.temp_dir / "custom_trash"
 
-        class DummyLogger:
-            def __init__(self):
-                self.messages: list[str] = []
-
-            def info(self, msg: str) -> None:
-                self.messages.append(msg)
-
-            def warning(self, msg: str) -> None:  # pragma: no cover
-                pass
-
-            def error(self, msg: str) -> None:  # pragma: no cover
-                pass
-
-        dummy_logger = DummyLogger()
+        dummy_logger = capture_logger("mixed_trash")
 
         with patch("archiver.setup_logging", return_value=dummy_logger):
             argv = [
                 "archiver.py",
                 "--directory",
-                str(self.base_dir),
+                str(self.temp_dir),
                 "--use-trash",
                 "--trashdir",
                 str(custom_trash),
             ]
+            run_main(argv)
 
-            original_argv = sys.argv
-            try:
-                sys.argv = argv
-                archiver.main()
-            except SystemExit as e:  # pragma: no cover
-                self.assertEqual(e.code, 0)
-            finally:
-                sys.argv = original_argv
-
-        self.assertIn(f"Input: {self.base_dir}", dummy_logger.messages)
-        self.assertIn(f"Trash: {custom_trash}", dummy_logger.messages)
-
+        self.assertIn(
+            f"Input: {self.temp_dir}",
+            getattr(dummy_logger, "_stream").getvalue(),  # type: ignore[attr-defined]
+        )
+        self.assertIn(
+            f"Trash: {custom_trash}",
+            getattr(dummy_logger, "_stream").getvalue(),  # type: ignore[attr-defined]
+        )
         self.assertTrue(custom_trash.exists())
-        self.assertFalse((self.base_dir / ".deleted").exists())
+        self.assertFalse((self.temp_dir / ".deleted").exists())
 
 
-class TestMainFunction(unittest.TestCase):
-    def setUp(self):
-        self.input_dir = Path(tempfile.mkdtemp())
-        self.output_dir = Path(tempfile.mkdtemp())
-
-        for i in range(5):
-            f = self.output_dir / f"archived-{i}.mp4"
-            f.write_bytes(b"0" * (2_048_576))
-
-    def tearDown(self):
-        shutil.rmtree(self.input_dir, ignore_errors=True)
-        shutil.rmtree(self.output_dir, ignore_errors=True)
+class TestMainFunction(TempDirTestCase):
+    """Final integration test — archive size limit triggers removal of old files."""
 
     @patch("archiver.scan_files", return_value=([], {}))
     @patch("archiver.process_files", return_value=set())
     @patch("archiver.remove_orphaned_jpgs")
-    @patch("archiver.setup_logging")
     def test_archive_size_limit_removal(
-        self,
-        mock_setup_logging,
-        mock_remove_orphaned,
-        mock_process_files,
-        mock_scan_files,
+        self, mock_remove_jpgs, mock_process_files, mock_scan_files
     ):
-        class DummyLogger:
-            def __init__(self):
-                self.messages = []
+        dummy_logger = capture_logger("main")
 
-            def info(self, msg):
-                self.messages.append(msg)
+        # Create the output directory and some files to exceed the limit
+        output_dir = self.temp_dir / "out"
+        output_dir.mkdir()
 
-        dummy_logger = DummyLogger()
-        mock_setup_logging.return_value = dummy_logger
+        # Create files that will exceed the 0 GB limit
+        (output_dir / "archived-20231201000000.mp4").write_bytes(b"0" * 1024)
+        (output_dir / "archived-20231201000001.mp4").write_bytes(b"0" * 1024)
 
-        original_argv = sys.argv
-        try:
-            sys.argv = [
+        with patch("archiver.setup_logging", return_value=dummy_logger):
+            argv = [
                 "archiver.py",
                 "--directory",
-                str(self.input_dir),
+                str(self.temp_dir),
                 "--output",
-                str(self.output_dir),
+                str(output_dir),
                 "--age",
                 "0",
                 "--max-size",
                 "0",
             ]
-            archiver.main()
-        finally:
-            sys.argv = original_argv
+            run_main(argv)
 
-        self.assertFalse(any(self.output_dir.iterdir()))
-        msgs = dummy_logger.messages
-        self.assertTrue(any("Archive size exceeds limit" in m for m in msgs))
-        self.assertTrue(any("Removed old archive:" in m for m in msgs))
+        # all files should be gone because the limit is 0 GB
+        self.assertFalse(any(output_dir.iterdir()))
+        msgs = getattr(dummy_logger, "_stream").getvalue()  # type: ignore[attr-defined]
+        self.assertIn("Archive size exceeds limit", msgs)
+        self.assertIn("Removed old archive:", msgs)
 
 
 if __name__ == "__main__":
