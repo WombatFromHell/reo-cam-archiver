@@ -70,7 +70,13 @@ class ProgressBar:
 
     def finish(self):
         if not self.silent:
-            self.out.write("\x1b[999B\x1b[2K\r\n")
+            # Clear the current progress line
+            if self._is_tty():
+                # ANSI: clear line, carriage‑return, newline
+                self.out.write("\x1b[2K\r\n")
+            else:
+                # Non‑TTY terminals – just output a newline
+                self.out.write("\n")
             self.out.flush()
 
     def start_file(self):
@@ -98,9 +104,14 @@ class ProgressBar:
         elapsed_file = datetime.fromtimestamp(now - (self.file_start or now)).strftime(
             "%M:%S"
         )
-        elapsed_total = datetime.fromtimestamp(now - (self.start_time or now)).strftime(
-            "%M:%S"
-        )
+
+        # Total elapsed – treat as a duration, not an epoch
+        total_sec = int(now - (self.start_time or now))
+        # Manual formatting gives HH:MM:SS even for >24 h
+        hours, remainder = divmod(total_sec, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        elapsed_total = f"{int(hours):02}:{int(minutes):02}:{int(seconds):02}"
+
         return f"Progress [{idx}/{self.total}]: {pct:.0f}% {bar} {elapsed_file} ({elapsed_total})"
 
     def _clear_area(self):
@@ -167,17 +178,23 @@ def parse_timestamp_from_filename(name):
 
 
 def safe_remove(
-    p: Path, logger, dry_run, use_trash=False, trash_root=None, is_output=False
+    p: Path,
+    logger,
+    dry_run,
+    use_trash=False,
+    trash_root=None,
+    is_output=False,
+    source_root: Path | None = None,
 ):
     """
     Remove a file or directory.  When *use_trash* is True and a valid
     *trash_root* is supplied the item is moved to that folder instead of being
-    deleted permanently.
+    permanently deleted.
 
     The moved item is placed under either an ``input`` or ``output``
-    sub‑folder inside the trash root, depending on the *is_output*
-    flag.  If *is_output* is True the file is considered an archived
-    output; otherwise it is treated as an input.
+    sub‑folder inside the trash root, preserving the relative path from
+    *source_root* (if given).  If *is_output* is True the file is
+    considered an archived output; otherwise it is treated as an input.
     """
     if dry_run:
         logger.info(f"[DRY RUN] Would remove {p}")
@@ -186,13 +203,20 @@ def safe_remove(
             if use_trash and trash_root:
                 # Decide which subfolder to place the item in
                 dest_sub = "output" if is_output else "input"
-                dest = trash_root / dest_sub / p.name
+
+                # Compute relative path inside the trash sub‑folder
+                rel_path = p.relative_to(source_root) if source_root else Path(p.name)
+                base_dest = trash_root / dest_sub / rel_path
+
+                # Build destination file name and avoid collisions
                 counter = 0
-                new_dest = dest
+                new_dest = base_dest
                 while new_dest.exists():
                     counter += 1
                     suffix = f"_{int(time.time())}_{counter}"
-                    new_dest = trash_root / dest_sub / (p.stem + suffix + p.suffix)
+                    stem = new_dest.stem + suffix
+                    new_dest = new_dest.parent / (stem + new_dest.suffix)
+
                 # Ensure the destination directory exists
                 new_dest.parent.mkdir(parents=True, exist_ok=True)
                 shutil.move(str(p), str(new_dest))
@@ -434,23 +458,20 @@ def clean_empty_directories(root_dir, logger=None, use_trash=False, trash_root=N
         if not files and not dirs:
             try:
                 if use_trash and trash_root:
-                    dest = trash_root / p.name
+                    dest_sub = "input"
+                    rel_path = p.relative_to(root)
+                    base_dest = trash_root / dest_sub / rel_path
                     counter = 0
-                    new_dest = dest
+                    new_dest = base_dest
                     while new_dest.exists():
                         counter += 1
                         suffix = f"_{int(time.time())}_{counter}"
-                        new_dest = trash_root / (p.stem + suffix + p.suffix)
+                        stem = new_dest.stem + suffix
+                        new_dest = new_dest.parent / (stem + new_dest.suffix)
                     new_dest.parent.mkdir(parents=True, exist_ok=True)
                     shutil.move(str(p), str(new_dest))
-                    if logger:
-                        logger.info(
-                            f"Moved empty directory to trash: {p} -> {new_dest}"
-                        )
                 else:
                     p.rmdir()
-                    if logger:
-                        logger.info(f"Removed empty directory {p}")
             except Exception as e:
                 if logger:
                     logger.error(f"Failed to remove empty directory {p}: {e}")
@@ -510,10 +531,14 @@ def main():
         description="Archive and transcode camera files based on timestamp parsing"
     )
     parser.add_argument(
-        "--directory", "-d", type=Path, default=Path.cwd(), help="Input directory"
+        "--directory", "-d", type=Path, default="/camera", help="Input directory"
     )
     parser.add_argument(
-        "--output", "-o", type=Path, help="Destination for archived MP4s"
+        "--output",
+        "-o",
+        type=Path,
+        default="/camera/archived",
+        help="Destination for archived MP4s",
     )
     parser.add_argument("--age", "-a", type=int, default=30, help="Age in days")
     parser.add_argument(
@@ -539,9 +564,9 @@ def main():
         help="Move deleted items to a trash directory instead of permanently deleting them",
     )
     parser.add_argument(
-        "--trash",
+        "--trashdir",
         type=Path,
-        help="Specify custom trash directory (default: /camera/.Deleted)",
+        help="Specify custom trash directory (default: /camera/.deleted)",
     )
     args = parser.parse_args()
     if len(sys.argv) == 1:
@@ -554,17 +579,17 @@ def main():
             f"Error: Directory {args.directory} does not exist and /camera is missing"
         )
         sys.exit(1)
-    out_dir = args.output or (base_dir / "archived")
-    if base_dir == Path("/camera"):
-        out_dir = Path("/camera/archived")
 
-    trash_root = None
-    if args.use_trash:
-        if args.trash:
-            trash_root = args.trash
-        else:
-            trash_root = base_dir / ".Deleted"
-        # Ensure it exists so that safe_remove can move files into it.
+    out_dir = args.output or (base_dir / "archived")
+    trash_root: Path | None = None
+    if args.trashdir:
+        # A custom trash directory was supplied – use it regardless of --use-trash
+        trash_root = args.trashdir
+    elif args.use_trash:
+        # Default trash location when only --use‑trash is given
+        trash_root = base_dir / ".deleted"
+
+    if trash_root is not None:
         trash_root.mkdir(parents=True, exist_ok=True)
 
     mp4s, mapping = scan_files(base_dir)
@@ -585,13 +610,13 @@ def main():
         logger.info(msg)
 
     processed = process_files(
-        old_list,
-        out_dir,
-        logger,
-        args.dry_run,
-        args.no_skip,
-        mapping,
-        bar,
+        old_list=old_list,
+        out_dir=out_dir,
+        logger=logger,
+        dry_run=args.dry_run,
+        no_skip=args.no_skip,
+        mapping=mapping,
+        bar=bar,
         use_trash=args.use_trash,
         trash_root=trash_root,
     )
