@@ -255,6 +255,27 @@ class TestLoggerSetup(unittest.TestCase):
         content = self.log_file.read_text()
         self.assertIn("hello world", content)
 
+    def test_guarded_handler_clears_line_before_log(self):
+        stream = DummyStream()
+        bar = archiver.ProgressBar(total_files=1, silent=False, out=stream)
+        logger = logging.getLogger("test")
+        logger.setLevel(logging.INFO)
+        sh = archiver.GuardedStreamHandler(
+            bar.orchestrator, stream=stream, progress_bar=bar
+        )
+        sh.setFormatter(logging.Formatter("%(message)s"))
+        logger.addHandler(sh)
+
+        bar.start_file()
+        logger.info("First log")
+        bar.update_progress(1, 50.0)  # this writes the bar
+        logger.info("Second log")  # should appear above the bar
+        bar.finish()
+
+        # Expect two distinct lines in stream.written
+        assert any("First log" in s for s in stream.written)
+        assert any("Second log" in s for s in stream.written)
+
 
 class TestGetVideoDuration(unittest.TestCase):
     @patch("shutil.which", return_value=None)
@@ -404,17 +425,19 @@ class TestProcessFiles(unittest.TestCase):
 class TestSafeRemoveRelativePath(unittest.TestCase):
     def setUp(self):
         self.temp_dir = Path(tempfile.mkdtemp())
-        self.trash_root = self.temp_dir / ".Deleted"
+        self.trash_root = self.temp_dir / ".deleted"
         self.trash_root.mkdir(parents=True, exist_ok=True)
 
     def tearDown(self):
         shutil.rmtree(self.temp_dir, ignore_errors=True)
 
-    def test_safe_remove_preserves_relative_path(self):
-        # Setup nested file
+    def test_safe_remove_preserves_relative_path_and_logs_correct_destination(self):
+        # Arrange – create a nested MP4
         p = Path(self.temp_dir) / "2023" / "12" / "01" / "video.mp4"
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text("data")
+
+        # Capture logger output in a StringIO buffer
         log_capture = io.StringIO()
         handler = logging.StreamHandler(log_capture)
         logger = logging.getLogger(f"trash_test_rel_{self._testMethodName}")
@@ -422,6 +445,7 @@ class TestSafeRemoveRelativePath(unittest.TestCase):
         logger.handlers.clear()
         logger.addHandler(handler)
 
+        # Act – move to trash
         archiver.safe_remove(
             p,
             logger,
@@ -431,9 +455,19 @@ class TestSafeRemoveRelativePath(unittest.TestCase):
             source_root=Path(self.temp_dir),
         )
 
+        # Assert – file is gone, destination exists
         dest = self.trash_root / "input" / "2023" / "12" / "01" / "video.mp4"
         self.assertFalse(p.exists())
         self.assertTrue(dest.exists())
+
+        # And the log message contains the *exact* destination path
+        logs = log_capture.getvalue()
+        expected_log_substring = f"Moved to trash: {p} -> {dest}"
+        self.assertIn(
+            expected_log_substring,
+            logs,
+            msg=f"Log did not contain expected destination.\nLogs:\n{logs}",
+        )
 
 
 class TestCleanupEmptyDirectoriesOut(unittest.TestCase):

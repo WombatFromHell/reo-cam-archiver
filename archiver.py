@@ -34,13 +34,25 @@ class GuardedStreamHandler(logging.StreamHandler):
         self.progress_bar = progress_bar
 
     def emit(self, record):
+        """
+        Write a log record to the stream while keeping the progress bar intact.
+        The previous implementation cleared the wrong line and then redrew the
+        progress bar on top of the freshly‑written message.  That caused logs
+        to be truncated or overwritten.
+        """
         msg = self.format(record) + self.terminator
         with self.orchestrator.guard():
             if self.progress_bar and self.progress_bar.has_progress:
-                self.progress_bar._clear_area()
+                # Only perform special handling on TTY terminals
+                if hasattr(self.stream, "isatty") and self.stream.isatty():
+                    # Clear the line where the progress bar currently lives.
+                    # This ensures that the log message is written on a fresh line.
+                    self.stream.write("\x1b[2K\r")
+            # Write the log record (it ends with a newline)
             self.stream.write(msg)
             self.flush()
             if self.progress_bar and self.progress_bar.has_progress:
+                # Redraw the progress bar on its own line after writing the log
                 self.progress_bar.redraw()
 
 
@@ -200,6 +212,14 @@ def safe_remove(
         logger.info(f"[DRY RUN] Would remove {p}")
     else:
         try:
+            if source_root is None:
+                # Fallback to the top‑level of the path that contains p.
+                # This keeps the deepest part of the hierarchy (e.g. 2025/09/08)
+                try:
+                    source_root = p.parent
+                except Exception:
+                    source_root = Path(p.name)
+
             if use_trash and trash_root:
                 # Decide which subfolder to place the item in
                 dest_sub = "output" if is_output else "input"
@@ -299,9 +319,17 @@ def transcode_file(inp, outp, logger, progress_cb=None):
 
 
 def scan_files(base_dir):
+    """
+    Scan *base_dir* for MP4/JPG pairs while **ignoring** anything inside a
+    sub‑directory named ``.deleted``.
+    """
     mp4s = []
     mapping = {}
     for p in base_dir.rglob("*.*"):
+        # Skip any file that resides under a folder called ".deleted"
+        if ".deleted" in p.parts:
+            continue
+
         if not p.is_file():
             continue
         ts = parse_timestamp_from_filename(p.name)
@@ -339,11 +367,12 @@ def process_files(
     bar,
     use_trash=False,
     trash_root=None,
+    source_root: Path | None = None,
 ):
     """
-    Process the list of (path, timestamp) tuples.  The *use_trash* and
-    *trash_root* arguments are forwarded to :func:`safe_remove` so that callers
-    can decide whether deleted items should be moved to a trash folder.
+    Process the list of (path, timestamp) tuples.  Any input file that
+    lives under *trash_root* is skipped outright – it will never be
+    transcoded or otherwise touched.
     """
     logger.info(f"Found {len(old_list)} files to process")
     if not old_list:
@@ -355,6 +384,11 @@ def process_files(
 
     processed = set()
     for idx, (fp, ts) in enumerate(old_list, 1):
+        # Skip trashed items – they are exempt from transcoding
+        if trash_root and fp.is_relative_to(trash_root):
+            logger.info(f"[SKIP] Trashed file {fp} – not transcoded")
+            continue
+
         outp = output_path(fp, ts, out_dir)
         outp.parent.mkdir(parents=True, exist_ok=True)
         jpg = mapping.get(ts.strftime("%Y%m%d%H%M%S"), {}).get(".jpg")
@@ -370,7 +404,12 @@ def process_files(
             safe_remove(fp, logger, dry_run, use_trash=use_trash, trash_root=trash_root)
             if jpg and jpg.exists():
                 safe_remove(
-                    jpg, logger, dry_run, use_trash=use_trash, trash_root=trash_root
+                    jpg,
+                    logger,
+                    dry_run,
+                    use_trash=use_trash,
+                    trash_root=trash_root,
+                    source_root=source_root,
                 )
                 processed.add(jpg)
             continue
@@ -379,10 +418,22 @@ def process_files(
         ok = transcode_file(fp, outp, logger, lambda pct: bar.update_progress(idx, pct))
         if ok:
             bar.finish_file(idx)
-            safe_remove(fp, logger, dry_run, use_trash=use_trash, trash_root=trash_root)
+            safe_remove(
+                fp,
+                logger,
+                dry_run,
+                use_trash=use_trash,
+                trash_root=trash_root,
+                source_root=source_root,
+            )
             if jpg and jpg.exists():
                 safe_remove(
-                    jpg, logger, dry_run, use_trash=use_trash, trash_root=trash_root
+                    jpg,
+                    logger,
+                    dry_run,
+                    use_trash=use_trash,
+                    trash_root=trash_root,
+                    source_root=source_root,
                 )
                 processed.add(jpg)
         else:
@@ -619,6 +670,7 @@ def main():
         bar=bar,
         use_trash=args.use_trash,
         trash_root=trash_root,
+        source_root=base_dir,
     )
     remove_orphaned_jpgs(
         mapping,
