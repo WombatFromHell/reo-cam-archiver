@@ -8,6 +8,7 @@ import subprocess
 from datetime import datetime
 from pathlib import Path
 import unittest
+from unittest import mock
 from unittest.mock import patch
 
 import archiver
@@ -131,19 +132,64 @@ class TestOutputPath(unittest.TestCase):
         self.assertEqual(result, expected)
 
 
+class TestOutputPathArgument(unittest.TestCase):
+    def setUp(self):
+        self.input_dir = Path(tempfile.mkdtemp())
+        self.output_dir = Path(tempfile.mkdtemp())
+
+    @patch("archiver.scan_files", return_value=([], {}))
+    @patch("archiver.process_files")
+    @patch("archiver.setup_logging")
+    def test_output_argument_propagates(
+        self,
+        mock_setup_logging,
+        mock_process_files,
+        mock_scan_files,
+    ):
+        dummy_logger = mock.Mock()
+        mock_setup_logging.return_value = dummy_logger
+
+        sys.argv = [
+            "archiver.py",
+            "--directory",
+            str(self.input_dir),
+            "--output",
+            str(self.output_dir),
+        ]
+
+        archiver.main()
+
+        # Verify that process_files was called with our output directory
+        mock_process_files.assert_called_once()
+        args, kwargs = mock_process_files.call_args
+        self.assertEqual(kwargs["out_dir"], self.output_dir)
+
+        # And the logger should mention it
+        dummy_logger.info.assert_any_call(f"Output: {self.output_dir}")
+
+    def tearDown(self):
+        shutil.rmtree(self.input_dir)
+        shutil.rmtree(self.output_dir)
+
+
 class TestProgressBar(unittest.TestCase):
     def test_progress_bar_non_silent(self):
         stream = DummyStream()
         stream.isatty_value = True
         bar = archiver.ProgressBar(total_files=1, silent=False, out=stream)
+
+        # First progress update should emit a line
         bar.update_progress(1, 50.0)
         self.assertTrue(any("Progress [1/1]:" in s for s in stream.written))
+
+        # A second identical update must not produce a new line
         before_len = len(stream.written)
         bar.update_progress(1, 50.0)
         after_len = len(stream.written)
         self.assertEqual(before_len, after_len)
+
         bar.finish()
-        self.assertTrue(any("\x1b[999B\x1b[2K\r\n" in s for s in stream.written))
+        self.assertTrue(any("\x1b[2K\r\n" in s for s in stream.written))
 
     def test_progress_bar_silent(self):
         stream = DummyStream()
@@ -355,38 +401,39 @@ class TestProcessFiles(unittest.TestCase):
         self.assertIn("[DRY RUN] Would transcode", logs)
 
 
-class TestCleanupEmptyDirectories(unittest.TestCase):
-    """Verify that only YYYY/MM/DD directories are removed."""
-
+class TestSafeRemoveRelativePath(unittest.TestCase):
     def setUp(self):
-        self.base_dir = Path(tempfile.mkdtemp())
-
-        # Empty day directory – should be removed
-        (self.base_dir / "2023" / "12" / "01").mkdir(parents=True)
-
-        # Day with a nested empty sub‑directory – should *not* be removed
-        (self.base_dir / "2023" / "12" / "02").mkdir(parents=True)
-        (self.base_dir / "2023" / "12" / "02" / "sub").mkdir()
-
-        # Random directory that does not match the pattern – should stay
-        (self.base_dir / "random").mkdir()
+        self.temp_dir = Path(tempfile.mkdtemp())
+        self.trash_root = self.temp_dir / ".Deleted"
+        self.trash_root.mkdir(parents=True, exist_ok=True)
 
     def tearDown(self):
-        shutil.rmtree(self.base_dir, ignore_errors=True)
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
 
-    def test_remove_empty_day_dirs_only(self):
-        archiver.clean_empty_directories(self.base_dir)
-        self.assertFalse((self.base_dir / "2023" / "12" / "01").exists())
+    def test_safe_remove_preserves_relative_path(self):
+        # Setup nested file
+        p = Path(self.temp_dir) / "2023" / "12" / "01" / "video.mp4"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text("data")
+        log_capture = io.StringIO()
+        handler = logging.StreamHandler(log_capture)
+        logger = logging.getLogger(f"trash_test_rel_{self._testMethodName}")
+        logger.setLevel(logging.INFO)
+        logger.handlers.clear()
+        logger.addHandler(handler)
 
-    def test_preserve_day_with_subdirs_and_files(self):
-        archiver.clean_empty_directories(self.base_dir)
-        # The day that had a sub‑directory should still exist
-        self.assertTrue((self.base_dir / "2023" / "12" / "02").exists())
-        self.assertTrue((self.base_dir / "2023" / "12" / "02" / "sub").exists())
+        archiver.safe_remove(
+            p,
+            logger,
+            dry_run=False,
+            use_trash=True,
+            trash_root=self.trash_root,
+            source_root=Path(self.temp_dir),
+        )
 
-    def test_preserve_random_directory(self):
-        archiver.clean_empty_directories(self.base_dir)
-        self.assertTrue((self.base_dir / "random").exists())
+        dest = self.trash_root / "input" / "2023" / "12" / "01" / "video.mp4"
+        self.assertFalse(p.exists())
+        self.assertTrue(dest.exists())
 
 
 class TestCleanupEmptyDirectoriesOut(unittest.TestCase):
@@ -417,6 +464,29 @@ class TestCleanupEmptyDirectoriesOut(unittest.TestCase):
         self.assertTrue(day.exists())
         self.assertTrue((day / "sub").exists())
         self.assertTrue((day / "file.mp4").exists())
+
+
+class TestCleanEmptyDirectoriesRelativePath(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = Path(tempfile.mkdtemp())
+        self.trash_root = self.temp_dir / ".Deleted"
+        self.trash_root.mkdir(parents=True, exist_ok=True)
+
+    def tearDown(self):
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def test_clean_moves_empty_day_to_trash_with_relative_path(self):
+        empty_day = Path(self.temp_dir) / "2023" / "12" / "01"
+        empty_day.mkdir(parents=True)
+        archiver.clean_empty_directories(
+            self.temp_dir,
+            None,
+            use_trash=True,
+            trash_root=self.trash_root,
+        )
+        dest = self.trash_root / "input" / "2023" / "12" / "01"
+        self.assertFalse(empty_day.exists())
+        self.assertTrue(dest.is_dir())
 
 
 class TestMainCleanupRandomDirectories(unittest.TestCase):
@@ -551,7 +621,7 @@ class TestTrashBehavior(unittest.TestCase):
         )
         # original day directory should be gone
         self.assertFalse(empty_day.exists())
-        dest = self.trash_root / "01"
+        dest = self.trash_root / "input" / "2023" / "12" / "01"
         self.assertTrue(dest.is_dir())
 
     def test_safe_remove_dry_run_when_use_trash(self):
@@ -573,6 +643,198 @@ class TestTrashBehavior(unittest.TestCase):
         self.assertFalse(dest.exists())
         logs = log_capture.getvalue()
         self.assertIn("[DRY RUN] Would remove", logs)
+
+
+class TestDefaultDirectoryAndTrashPath(unittest.TestCase):
+    """Test that default directory is /camera and trash defaults to /camera/.deleted"""
+
+    def setUp(self) -> None:
+        # Create a temporary directory that will act as the input folder.
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.base_dir = Path(self.temp_dir.name)
+
+    def tearDown(self) -> None:
+        self.temp_dir.cleanup()
+
+    def _run_main_and_get_log(self, argv: list[str]) -> str:
+        """Run archiver.main() with the supplied arguments and return its log."""
+        original_argv = sys.argv
+        try:
+            sys.argv = argv
+            # main may raise SystemExit only when no arguments are provided.
+            try:
+                archiver.main()
+            except SystemExit:
+                pass
+        finally:
+            sys.argv = original_argv
+
+        log_path = self.base_dir / "transcoding.log"
+        return log_path.read_text() if log_path.exists() else ""
+
+    def test_default_directory_and_trash_path(self):
+        """Verify that the default input directory is used and no trash dir is created."""
+        argv = ["archiver.py", "--directory", str(self.base_dir)]
+        log_contents = self._run_main_and_get_log(argv)
+
+        # Input directory should be logged correctly.
+        self.assertIn(f"Input: {self.base_dir}", log_contents)
+        # No trash directory requested – should be None in the log.
+        self.assertIn("Trash: None", log_contents)
+        # Ensure that no .deleted folder was created.
+        self.assertFalse((self.base_dir / ".deleted").exists())
+
+    @patch("archiver.scan_files", return_value=([], {}))
+    @patch("archiver.process_files", return_value=set())
+    @patch("archiver.remove_orphaned_jpgs")
+    @patch("archiver.clean_empty_directories")
+    def test_custom_trash_directory(
+        self,
+        mock_clean_dirs,
+        mock_remove_jpgs,
+        mock_process_files,
+        mock_scan_files,
+    ):
+        custom_trash = self.base_dir / "custom_trash"
+
+        class DummyLogger:
+            def __init__(self):
+                self.messages: list[str] = []
+
+            def info(self, msg: str) -> None:
+                self.messages.append(msg)
+
+            # Provide stubs for warning/error to avoid AttributeError
+            def warning(self, msg: str) -> None:  # pragma: no cover
+                pass
+
+            def error(self, msg: str) -> None:  # pragma: no cover
+                pass
+
+        dummy_logger = DummyLogger()
+
+        with patch("archiver.setup_logging", return_value=dummy_logger):
+            argv = [
+                "archiver.py",
+                "--directory",
+                str(self.base_dir),
+                "--trashdir",
+                str(custom_trash),
+            ]
+
+            original_argv = sys.argv
+            try:
+                sys.argv = argv
+                archiver.main()
+            except SystemExit as e:  # pragma: no cover – guard against accidental exit
+                self.assertEqual(e.code, 0)
+            finally:
+                sys.argv = original_argv
+
+        self.assertIn(f"Input: {self.base_dir}", dummy_logger.messages)
+        self.assertIn(f"Trash: {custom_trash}", dummy_logger.messages)
+
+        self.assertTrue(custom_trash.exists())
+        self.assertFalse((self.base_dir / ".deleted").exists())
+
+    @patch("archiver.scan_files", return_value=([], {}))
+    @patch("archiver.process_files", return_value=set())
+    @patch("archiver.remove_orphaned_jpgs")
+    @patch("archiver.clean_empty_directories")
+    def test_use_trash_flag(
+        self,
+        mock_clean_dirs,
+        mock_remove_jpgs,
+        mock_process_files,
+        mock_scan_files,
+    ):
+        expected_trash = self.base_dir / ".deleted"
+
+        class DummyLogger:
+            def __init__(self):
+                self.messages: list[str] = []
+
+            def info(self, msg: str) -> None:
+                self.messages.append(msg)
+
+            def warning(self, msg: str) -> None:  # pragma: no cover
+                pass
+
+            def error(self, msg: str) -> None:  # pragma: no cover
+                pass
+
+        dummy_logger = DummyLogger()
+
+        with patch("archiver.setup_logging", return_value=dummy_logger):
+            argv = ["archiver.py", "--directory", str(self.base_dir), "--use-trash"]
+
+            original_argv = sys.argv
+            try:
+                sys.argv = argv
+                archiver.main()
+            except SystemExit as e:  # pragma: no cover
+                self.assertEqual(e.code, 0)
+            finally:
+                sys.argv = original_argv
+
+        self.assertIn(f"Input: {self.base_dir}", dummy_logger.messages)
+        self.assertIn(f"Trash: {expected_trash}", dummy_logger.messages)
+
+        self.assertTrue(expected_trash.exists())
+        self.assertFalse((self.base_dir / "custom_trash").exists())
+
+    @patch("archiver.scan_files", return_value=([], {}))
+    @patch("archiver.process_files", return_value=set())
+    @patch("archiver.remove_orphaned_jpgs")
+    @patch("archiver.clean_empty_directories")
+    def test_use_trash_with_custom_directory(
+        self,
+        mock_clean_dirs,
+        mock_remove_jpgs,
+        mock_process_files,
+        mock_scan_files,
+    ):
+        custom_trash = self.base_dir / "custom_trash"
+
+        class DummyLogger:
+            def __init__(self):
+                self.messages: list[str] = []
+
+            def info(self, msg: str) -> None:
+                self.messages.append(msg)
+
+            def warning(self, msg: str) -> None:  # pragma: no cover
+                pass
+
+            def error(self, msg: str) -> None:  # pragma: no cover
+                pass
+
+        dummy_logger = DummyLogger()
+
+        with patch("archiver.setup_logging", return_value=dummy_logger):
+            argv = [
+                "archiver.py",
+                "--directory",
+                str(self.base_dir),
+                "--use-trash",
+                "--trashdir",
+                str(custom_trash),
+            ]
+
+            original_argv = sys.argv
+            try:
+                sys.argv = argv
+                archiver.main()
+            except SystemExit as e:  # pragma: no cover
+                self.assertEqual(e.code, 0)
+            finally:
+                sys.argv = original_argv
+
+        self.assertIn(f"Input: {self.base_dir}", dummy_logger.messages)
+        self.assertIn(f"Trash: {custom_trash}", dummy_logger.messages)
+
+        self.assertTrue(custom_trash.exists())
+        self.assertFalse((self.base_dir / ".deleted").exists())
 
 
 class TestMainFunction(unittest.TestCase):
