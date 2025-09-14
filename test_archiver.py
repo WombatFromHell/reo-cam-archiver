@@ -667,61 +667,164 @@ class TestCleanupArchiveSizeLimit(TempDirTestCase):
 
 
 class TestTrashBehavior(TempDirTestCase):
-    """Tests that trashing works correctly for files and empty dirs, and dry‑run does nothing."""
+    """Tests that trashing works correctly for files and empty dirs, and dry-run does nothing."""
 
     def setUp(self) -> None:
         super().setUp()
         self.trash_root = self.temp_dir / ".Deleted"
         self.trash_root.mkdir()
-
         self.logger = capture_logger("trash")
         patcher = patch.object(logging, "getLogger", return_value=self.logger)
         self.addCleanup(patcher.stop)
         patcher.start()
 
-    def test_file_moved_to_trash(self):
-        p = self.temp_dir / "file.txt"
-        write_file(p)
+        # Create test directory structures
+        self.input_root = self.temp_dir / "camera"
+        self.output_root = self.temp_dir / "camera" / "archived"
+        self.input_root.mkdir(parents=True)
+        self.output_root.mkdir(parents=True)
 
+    def test_file_moved_to_trash(self):
+        p = self.input_root / "file.txt"
+        write_file(p)
         archiver.safe_remove(
             p,
             self.logger,
             dry_run=False,
             use_trash=True,
             trash_root=self.trash_root,
+            source_root=self.input_root,  # Add explicit source_root
         )
         dest = self.trash_root / "input" / p.name
         self.assertFalse(p.exists())
         self.assertTrue(dest.exists())
 
     def test_empty_dir_moved_to_trash(self):
-        empty_day = self.temp_dir / "2023" / "12" / "01"
+        empty_day = self.input_root / "2023" / "12" / "01"
         empty_day.mkdir(parents=True)
-
         archiver.clean_empty_directories(
-            self.temp_dir,
+            self.input_root,
             None,
             use_trash=True,
             trash_root=self.trash_root,
+            is_output=False,  # Explicitly mark as input
         )
         dest = self.trash_root / "input" / "2023" / "12" / "01"
         self.assertFalse(empty_day.exists())
         self.assertTrue(dest.is_dir())
 
     def test_dry_run_no_movement(self):
-        p2 = self.temp_dir / "file2.txt"
+        p2 = self.input_root / "file2.txt"
         write_file(p2)
-
         archiver.safe_remove(
             p2,
             self.logger,
             dry_run=True,
             use_trash=True,
             trash_root=self.trash_root,
+            source_root=self.input_root,  # Add explicit source_root
         )
         self.assertTrue(p2.exists())
-        dest = self.trash_root / p2.name
+        dest = self.trash_root / "input" / p2.name
         self.assertFalse(dest.exists())
+
+    # NEW TESTS TO COVER THE FIXED BEHAVIOR
+
+    def test_output_file_moved_to_trash(self):
+        """Test output files go to the 'output' subdirectory in trash"""
+        p = self.output_root / "archived-20230101000000.mp4"
+        write_file(p)
+        archiver.safe_remove(
+            p,
+            self.logger,
+            dry_run=False,
+            use_trash=True,
+            trash_root=self.trash_root,
+            source_root=self.output_root,  # Explicit source_root for output
+            is_output=True,  # Mark as output
+        )
+        dest = self.trash_root / "output" / p.name
+        self.assertFalse(p.exists())
+        self.assertTrue(dest.exists())
+
+        # Verify it's NOT in the input subdirectory
+        wrong_dest = self.trash_root / "input" / p.name
+        self.assertFalse(wrong_dest.exists())
+
+    def test_output_empty_dir_moved_to_trash(self):
+        """Test output directories go to the 'output' subdirectory in trash"""
+        empty_day = self.output_root / "2023" / "12" / "01"
+        empty_day.mkdir(parents=True)
+        archiver.clean_empty_directories(
+            self.output_root,
+            None,
+            use_trash=True,
+            trash_root=self.trash_root,
+            is_output=True,  # Explicitly mark as output
+        )
+        dest = self.trash_root / "output" / "2023" / "12" / "01"
+        self.assertFalse(empty_day.exists())
+        self.assertTrue(dest.is_dir())
+
+        # Verify it's NOT in the input subdirectory
+        wrong_dest = self.trash_root / "input" / "2023" / "12" / "01"
+        self.assertFalse(wrong_dest.exists())
+
+    def test_source_root_path_preservation(self):
+        """Test that relative paths are preserved correctly when source_root is provided"""
+        # Create a nested file structure
+        nested_file = self.output_root / "2023" / "01" / "01" / "file.mp4"
+        nested_file.parent.mkdir(parents=True)
+        write_file(nested_file)
+
+        archiver.safe_remove(
+            nested_file,
+            self.logger,
+            dry_run=False,
+            use_trash=True,
+            trash_root=self.trash_root,
+            source_root=self.output_root,  # Explicit source_root
+            is_output=True,
+        )
+
+        # Verify the file is in the correct location with preserved structure
+        dest = self.trash_root / "output" / "2023" / "01" / "01" / "file.mp4"
+        self.assertFalse(nested_file.exists())
+        self.assertTrue(dest.exists())
+
+        # Verify it's NOT in the wrong location
+        wrong_dest = self.trash_root / "output" / "file.mp4"
+        self.assertFalse(wrong_dest.exists())
+
+    def test_cleanup_archive_size_limit(self):
+        """Test that cleanup_archive_size_limit moves files to the correct trash location"""
+        # Create test files in output directory
+        test_file = self.output_root / "archived-20230101000000.mp4"
+        write_file(test_file)
+
+        # Set a specific size to the file (to ensure it's counted in the size calculation)
+        test_file.write_text("x" * 1024)  # 1KB file
+
+        # Call the actual function (not mocked)
+        archiver.cleanup_archive_size_limit(
+            self.output_root,
+            self.logger,
+            max_size_gb=0,  # Set to 0 to trigger cleanup
+            dry_run=False,
+            use_trash=True,
+            trash_root=self.trash_root,
+        )
+
+        # Verify the file was moved to the correct trash location
+        dest = self.trash_root / "output" / test_file.name
+        self.assertFalse(test_file.exists(), "Original file should be removed")
+        self.assertTrue(dest.exists(), "File should exist in trash output directory")
+
+        # Verify it's NOT in the input subdirectory
+        wrong_dest = self.trash_root / "input" / test_file.name
+        self.assertFalse(
+            wrong_dest.exists(), "File should not be in trash input directory"
+        )
 
 
 class TestDefaultDirectoryAndTrashPath(TempDirTestCase):

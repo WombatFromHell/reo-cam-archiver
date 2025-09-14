@@ -474,7 +474,9 @@ def remove_orphaned_jpgs(
         logger.info(f"Removed {count} orphaned JPG files")
 
 
-def clean_empty_directories(root_dir, logger=None, use_trash=False, trash_root=None):
+def clean_empty_directories(
+    root_dir, logger=None, use_trash=False, trash_root=None, is_output=False
+):
     """
     Walk *root_dir* bottom‑up and delete any empty directory that matches
     the <YYYY>/<MM>/<DD> pattern.  When *use_trash* is True and a valid
@@ -509,7 +511,7 @@ def clean_empty_directories(root_dir, logger=None, use_trash=False, trash_root=N
         if not files and not dirs:
             try:
                 if use_trash and trash_root:
-                    dest_sub = "input"
+                    dest_sub = "output" if is_output else "input"
                     rel_path = p.relative_to(root)
                     base_dest = trash_root / dest_sub / rel_path
                     counter = 0
@@ -569,6 +571,7 @@ def cleanup_archive_size_limit(
                     use_trash=True,
                     trash_root=trash_root,
                     is_output=True,
+                    source_root=out_dir,
                 )
             else:
                 f.unlink()
@@ -682,8 +685,8 @@ def main():
     )
 
     # Clean up any empty directories left under input and output paths
-    clean_empty_directories(base_dir, logger)
-    clean_empty_directories(out_dir, logger)
+    clean_empty_directories(base_dir, logger, is_output=False)
+    clean_empty_directories(out_dir, logger, is_output=True)
 
     # Enforce the archive size limit (moved into a helper function)
     cleanup_archive_size_limit(
