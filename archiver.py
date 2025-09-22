@@ -15,6 +15,23 @@ import atexit
 import signal
 
 
+class GracefulExit:
+    """Global flag for graceful exit handling"""
+
+    exit_requested = False
+    _lock = threading.Lock()
+
+    @classmethod
+    def request_exit(cls):
+        with cls._lock:
+            cls.exit_requested = True
+
+    @classmethod
+    def should_exit(cls):
+        with cls._lock:
+            return cls.exit_requested
+
+
 class ConsoleOrchestrator:
     """Thread‑safe lock for console output."""
 
@@ -26,7 +43,7 @@ class ConsoleOrchestrator:
 
 
 class GuardedStreamHandler(logging.StreamHandler):
-    """Log handler that preserves the progress bar line."""
+    """Log handler that coordinates with progress bar"""
 
     def __init__(self, orchestrator, stream=None, progress_bar=None):
         super().__init__(stream)
@@ -34,23 +51,13 @@ class GuardedStreamHandler(logging.StreamHandler):
         self.progress_bar = progress_bar
 
     def emit(self, record):
-        """
-        Write a log record to the stream while keeping the progress bar intact.
-        """
         msg = self.format(record) + self.terminator
+
         with self.orchestrator.guard():
-            if self.progress_bar and self.progress_bar.has_progress:
-                # Only perform special handling on TTY terminals
-                if hasattr(self.stream, "isatty") and self.stream.isatty():
-                    # Temporarily hide progress bar, write message, then redraw
-                    self.progress_bar._hide_progress()
-                    self.stream.write(msg)
-                    self.progress_bar.redraw()
-                else:
-                    # Non-TTY: just write the message
-                    self.stream.write(msg)
+            if self.progress_bar and self.progress_bar._progress_line:
+                self.stream.write(f"\r\x1b[2K{msg}")
+                self.progress_bar.redraw()
             else:
-                # No progress bar active, normal writing
                 self.stream.write(msg)
             self.stream.flush()
 
@@ -66,198 +73,93 @@ class ProgressBar:
         self.start_time = None
         self.file_start = None
         self._progress_line = ""
-        self._active = False
-        self._thread = None
-        self._stop_event = threading.Event()
-        self._terminal_modified = False
+        self._last_print_time = 0
         self._original_signal_handlers = {}
-        self._scroll_area_set = False
-        self._last_print_time = 0  # Initialize this attribute
-
-        # Save original stderr for restoration
-        self._original_stderr = out
-
-        # Register cleanup handlers
         self._register_cleanup_handlers()
 
-        # Set up scroll region immediately if we have a TTY
-        # This ensures proper display from the very beginning
-        if self._is_tty():
-            self._setup_scroll_region()
+    def _is_tty(self):
+        return hasattr(self.out, "isatty") and self.out.isatty() and not self.silent
 
     def _register_cleanup_handlers(self):
-        """Register handlers for graceful cleanup on all exit scenarios"""
-        # Register atexit handler for normal exits
-        atexit.register(self._emergency_cleanup)
-
-        # Register signal handlers for interrupt signals
+        atexit.register(self._cleanup_progress_bar)
         signals = [signal.SIGINT, signal.SIGTERM, signal.SIGHUP]
         for sig in signals:
             try:
                 self._original_signal_handlers[sig] = signal.getsignal(sig)
                 signal.signal(sig, self._signal_handler)
             except (ValueError, OSError):
-                # Some signals may not be available on all platforms
                 pass
 
     def _unregister_cleanup_handlers(self):
-        """Restore original signal handlers"""
         for sig, handler in self._original_signal_handlers.items():
             try:
                 signal.signal(sig, handler)
             except (ValueError, OSError):
                 pass
-        atexit.unregister(self._emergency_cleanup)
+        atexit.unregister(self._cleanup_progress_bar)
 
     def _signal_handler(self, signum, frame):
-        """Handle signals by cleaning up and re-raising"""
-        self._emergency_cleanup()
-        # Restore original handler and re-raise signal
-        if signum in self._original_signal_handlers:
-            original_handler = self._original_signal_handlers[signum]
-            if original_handler and original_handler not in [
-                signal.SIG_DFL,
-                signal.SIG_IGN,
-            ]:
-                original_handler(signum, frame)
-            else:
-                # Default behavior: exit
-                sys.exit(128 + signum)
+        GracefulExit.request_exit()
+        self._cleanup_progress_bar()
 
-    def _setup_scroll_region(self):
-        """Reserve the bottom line for progress bar without disturbing existing content"""
-        if not self._is_tty() or self.silent or self._scroll_area_set:
+        signal_name = {
+            signal.SIGINT: "SIGINT",
+            signal.SIGTERM: "SIGTERM",
+            signal.SIGHUP: "SIGHUP",
+        }.get(signum, f"signal {signum}")
+
+        sys.stderr.write(f"\nReceived {signal_name}, shutting down gracefully...\n")
+        sys.stderr.flush()
+
+    def _cleanup_progress_bar(self):
+        if not self._progress_line or self.silent:
             return
 
         try:
-            # Instead of setting up a scroll region (which can overwrite content),
-            # we'll just ensure there's a blank line at the bottom and manage it manually
-            self.out.write("\n")  # Add a newline to make space
+            self.out.write("\r\x1b[2K\n")
             self.out.flush()
-            self._scroll_area_set = True
-            self._terminal_modified = True
-        except Exception:
-            # If we can't write, fall back to simple mode
-            pass
-
-    def _restore_scroll_region(self):
-        """Clean up the reserved progress bar line"""
-        if not self._scroll_area_set:
-            return
-
-        try:
-            # Clear the progress bar line
-            if self._is_tty():
-                self.out.write("\x1b[2K")  # Clear current line
-                self.out.flush()
-            self._scroll_area_set = False
+            self._progress_line = ""
         except Exception:
             pass
 
-    def _emergency_cleanup(self):
-        """Emergency cleanup that's safe to call multiple times"""
-        if not self._terminal_modified:
-            return
-
-        try:
-            if self._is_tty():
-                # Just clear the current line and move to next line
-                self.out.write("\x1b[2K\n")
-                self.out.flush()
-            self._terminal_modified = False
-        except Exception:
-            # If we can't write to the terminal, there's nothing more we can do
-            pass
-
-    def _hide_progress(self):
-        """Temporarily hide the progress bar"""
-        if self.silent or not self._progress_line or not self._is_tty():
-            return
-
-        try:
-            # Save cursor, go to progress line, clear it, restore cursor
-            self.out.write("\x1b[s")  # Save cursor
-            self.out.write(
-                f"\x1b[{self._get_progress_line()};1H"
-            )  # Move to progress line
-            self.out.write("\x1b[2K")  # Clear the progress bar line
-            self.out.write("\x1b[u")  # Restore cursor
-            self.out.flush()
-        except Exception:
-            pass
-
-    def _show_progress(self):
-        """Show the progress bar again"""
-        if self.silent or not self._progress_line or not self._is_tty():
-            return
-        self._display(self._progress_line)
-
-    def get_terminal_size(self) -> tuple[int, int]:
-        """Get terminal dimensions (rows, columns)"""
-        try:
-            size = shutil.get_terminal_size()
-            return size.lines, size.columns
-        except (OSError, ValueError, AttributeError):
-            return 24, 80  # Fallback size
-
-    def _get_progress_line(self):
-        """Get the line number where the progress bar should be displayed"""
-        try:
-            rows, cols = self.get_terminal_size()
-            return rows  # Use the last line of the terminal
-        except Exception:
-            return 24  # Fallback
+    def finish(self):
+        self._cleanup_progress_bar()
+        self._unregister_cleanup_handlers()
 
     @property
     def has_progress(self):
         return bool(self._progress_line)
 
-    def _is_tty(self):
-        return hasattr(self.out, "isatty") and self.out.isatty() and not self.silent
-
     def start_processing(self):
-        """Initialize the total processing start time."""
         if self.start_time is None:
             self.start_time = time.time()
-        # Scroll region is now set up in __init__, so no need to call it again here
-
-    def finish(self):
-        """Clean up the progress bar display."""
-        if not self.silent:
-            self._emergency_cleanup()
-        self._unregister_cleanup_handlers()
 
     def start_file(self):
         self.file_start = time.time()
-        # Ensure start_time is set when first file starts
         if self.start_time is None:
             self.start_time = time.time()
 
     def update_progress(self, idx, pct=0.0):
-        if self.silent:
+        if self.silent or GracefulExit.should_exit():
             return
         line = self._format_line(idx, pct)
         if line == self._progress_line:
             return
         self._progress_line = line
-        self._terminal_modified = True
-        with self.orchestrator.guard():
-            self._display(line)
+        self._display(line)
 
     def finish_file(self, idx):
-        self.update_progress(idx, 100.0)
+        if not GracefulExit.should_exit():
+            self.update_progress(idx, 100.0)
 
     def _format_line(self, idx, pct):
-        """Preserve the exact same format as the original"""
         now = time.time()
         bar = f"[{'|' * int(pct / 100 * self.blocks)}{'-' * (self.blocks - int(pct / 100 * self.blocks))}]"
         elapsed_file = datetime.fromtimestamp(now - (self.file_start or now)).strftime(
             "%M:%S"
         )
 
-        # Total elapsed — treat as a duration, not an epoch
         total_sec = int(now - (self.start_time or now))
-        # Manual formatting gives HH:MM:SS even for >24 h
         hours, remainder = divmod(total_sec, 3600)
         minutes, seconds = divmod(remainder, 60)
         elapsed_total = f"{int(hours):02}:{int(minutes):02}:{int(seconds):02}"
@@ -265,15 +167,12 @@ class ProgressBar:
         return f"Progress [{idx}/{self.total}]: {pct:.0f}% {bar} {elapsed_file} ({elapsed_total})"
 
     def redraw(self):
-        if self.silent or not self._progress_line:
+        if self.silent or not self._progress_line or GracefulExit.should_exit():
             return
-        with self.orchestrator.guard():
-            self._show_progress()
+        self._display(self._progress_line)
 
     def _display(self, line):
-        """Display progress bar on the reserved bottom line"""
         if not self._is_tty():
-            # Non-TTY fallback - print periodically to avoid spam
             now = time.time()
             if now - self._last_print_time >= 5 or "100%" in line:
                 self.out.write(f"{line}\n")
@@ -281,18 +180,10 @@ class ProgressBar:
                 self._last_print_time = now
             return
 
-        # For TTY: display progress bar on the reserved bottom line
         try:
-            # Save cursor, move to progress line, clear and write, restore cursor
-            self.out.write("\x1b[s")  # Save cursor
-            self.out.write(
-                f"\x1b[{self._get_progress_line()};1H"
-            )  # Move to progress line
-            self.out.write(f"\x1b[2K{line}")  # Clear line and write progress
-            self.out.write("\x1b[u")  # Restore cursor
+            self.out.write(f"\r\x1b[2K{line}")
             self.out.flush()
         except Exception:
-            # Fallback if ANSI codes fail
             self.out.write(f"\r{line}")
             self.out.flush()
 
@@ -307,18 +198,12 @@ def setup_logging(log_file, progress_bar=None):
     logger = logging.getLogger("camera_archiver")
     logger.setLevel(logging.INFO)
     for h in list(logger.handlers):
-        try:
-            h.close()
-        except Exception:
-            pass
         logger.removeHandler(h)
     fmt = "%(asctime)s - %(levelname)s - %(message)s"
     fh = logging.FileHandler(log_file, encoding="utf-8")
     fh.setFormatter(logging.Formatter(fmt))
     logger.addHandler(fh)
-    # Use the same stream as the progress bar to avoid conflicts
     stream = progress_bar.out if progress_bar else sys.stdout
-    # Use the progress bar's orchestrator for proper coordination
     orch = progress_bar.orchestrator if progress_bar else ConsoleOrchestrator()
     sh = GuardedStreamHandler(orch, stream=stream, progress_bar=progress_bar)
     sh.setFormatter(logging.Formatter(fmt))
@@ -349,37 +234,21 @@ def safe_remove(
     is_output=False,
     source_root: Path | None = None,
 ):
-    """
-    Remove a file or directory.  When *use_trash* is True and a valid
-    *trash_root* is supplied the item is moved to that folder instead of being
-    permanently deleted.
+    if GracefulExit.should_exit():
+        return
 
-    The moved item is placed under either an ``input`` or ``output``
-    sub‑folder inside the trash root, preserving the relative path from
-    *source_root* (if given).  If *is_output* is True the file is
-    considered an archived output; otherwise it is treated as an input.
-    """
     if dry_run:
         logger.info(f"[DRY RUN] Would remove {p}")
     else:
         try:
             if source_root is None:
-                # Fallback to the top‑level of the path that contains p.
-                # This keeps the deepest part of the hierarchy (e.g. 2025/09/08)
-                try:
-                    source_root = p.parent
-                except Exception:
-                    source_root = Path(p.name)
+                source_root = p.parent
 
             if use_trash and trash_root:
-                # Decide which subfolder to place the item in
                 dest_sub = "output" if is_output else "input"
-
-                # Compute relative path inside the trash sub‑folder
                 rel_path = p.relative_to(source_root) if source_root else Path(p.name)
                 base_dest = trash_root / dest_sub / rel_path
 
-                # Build destination file name and avoid collisions
                 counter = 0
                 new_dest = base_dest
                 while new_dest.exists():
@@ -388,7 +257,6 @@ def safe_remove(
                     stem = new_dest.stem + suffix
                     new_dest = new_dest.parent / (stem + new_dest.suffix)
 
-                # Ensure the destination directory exists
                 new_dest.parent.mkdir(parents=True, exist_ok=True)
                 shutil.move(str(p), str(new_dest))
                 logger.info(f"Moved to trash: {p} -> {new_dest}")
@@ -396,7 +264,6 @@ def safe_remove(
                 if p.is_file():
                     p.unlink()
                 elif p.is_dir():
-                    # Only empty directories reach this point
                     p.rmdir()
                 else:
                     logger.warning(f"Unsupported file type for removal: {p}")
@@ -406,21 +273,20 @@ def safe_remove(
 
 
 def get_video_duration(inp):
-    if not shutil.which("ffprobe"):
+    if GracefulExit.should_exit() or not shutil.which("ffprobe"):
         return None
     try:
-        cmd_str = (
-            "ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "
-            f"{shlex.quote(str(inp))}"
-        )
-        cmd = shlex.split(cmd_str)
-        out = subprocess.check_output(cmd, text=True)
+        cmd_str = f"ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 {shlex.quote(str(inp))}"
+        out = subprocess.check_output(shlex.split(cmd_str), text=True)
         return float(out.strip())
     except Exception:
         return None
 
 
 def transcode_file(inp, outp, logger, progress_cb=None):
+    if GracefulExit.should_exit():
+        return False
+
     cmd_str = (
         f"ffmpeg -hide_banner -hwaccel qsv -hwaccel_output_format qsv -y "
         f"-i {shlex.quote(str(inp))} "
@@ -428,12 +294,10 @@ def transcode_file(inp, outp, logger, progress_cb=None):
         f"-global_quality 26 -c:v h264_qsv -an "
         f"{shlex.quote(str(outp))}"
     )
-    cmd = shlex.split(cmd_str)
-    # logger.info(f"Using the following transcode command: {cmd_str}")
     total = get_video_duration(inp)
 
     proc = subprocess.Popen(
-        cmd,
+        shlex.split(cmd_str),
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
@@ -445,6 +309,16 @@ def transcode_file(inp, outp, logger, progress_cb=None):
     cur_pct = 0.0
     if proc.stdout:
         for line in iter(proc.stdout.readline, ""):
+            if GracefulExit.should_exit():
+                logger.info("Cancellation requested, terminating ffmpeg process...")
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait()
+                return False
+
             if not line:
                 break
             log_lines.append(line)
@@ -460,27 +334,25 @@ def transcode_file(inp, outp, logger, progress_cb=None):
                 prev_pct = cur_pct
 
     rc = proc.wait()
-    # Log ffmpeg output on failure
-    if rc != 0:
+    if rc != 0 and not GracefulExit.should_exit():
         msg = f"FFmpeg failed (code {rc}) for {inp} -> {outp}\n" + "".join(log_lines)
         logger.error(msg)
-    return rc == 0
+    return rc == 0 and not GracefulExit.should_exit()
 
 
 def scan_files(base_dir):
-    """
-    Scan *base_dir* for MP4/JPG pairs while **ignoring** anything inside a
-    sub‑directory named ``.deleted``.
-    """
+    if GracefulExit.should_exit():
+        return [], {}
+
     mp4s = []
     mapping = {}
     for p in base_dir.rglob("*.*"):
-        # Skip any file that resides under a folder called ".deleted"
-        if ".deleted" in p.parts:
+        if GracefulExit.should_exit():
+            break
+
+        if ".deleted" in p.parts or not p.is_file():
             continue
 
-        if not p.is_file():
-            continue
         ts = parse_timestamp_from_filename(p.name)
         if not ts:
             continue
@@ -518,22 +390,19 @@ def process_files(
     trash_root=None,
     source_root: Path | None = None,
 ):
-    """
-    Process the list of (path, timestamp) tuples.  Any input file that
-    lives under *trash_root* is skipped outright – it will never be
-    transcoded or otherwise touched.
-    """
     logger.info(f"Found {len(old_list)} files to process")
-    if not old_list:
-        logger.info("No files to process")
+    if not old_list or GracefulExit.should_exit():
+        logger.info("No files to process or cancellation requested")
         return set()
 
-    # Initialize the progress bar's total timer
     bar.start_processing()
-
     processed = set()
+
     for idx, (fp, ts) in enumerate(old_list, 1):
-        # Skip trashed items – they are exempt from transcoding
+        if GracefulExit.should_exit():
+            logger.info("Cancellation requested, stopping file processing...")
+            break
+
         if trash_root and fp.is_relative_to(trash_root):
             logger.info(f"[SKIP] Trashed file {fp} – not transcoded")
             continue
@@ -541,12 +410,14 @@ def process_files(
         outp = output_path(fp, ts, out_dir)
         outp.parent.mkdir(parents=True, exist_ok=True)
         jpg = mapping.get(ts.strftime("%Y%m%d%H%M%S"), {}).get(".jpg")
+
         if dry_run:
             logger.info(f"[DRY RUN] Would transcode {fp}->{outp}")
             if jpg:
                 logger.info(f"[DRY RUN] Would remove paired JPG: {jpg}")
             bar.update_progress(idx, 100.0)
             continue
+
         if not no_skip and outp.exists() and outp.stat().st_size > 1_048_576:
             logger.info(f"[SKIP] Existing archive large enough: {outp}")
             bar.update_progress(idx, 100.0)
@@ -562,6 +433,7 @@ def process_files(
                 )
                 processed.add(jpg)
             continue
+
         bar.start_file()
         logger.info(f"Transcoding {fp}->{outp}")
         ok = transcode_file(fp, outp, logger, lambda pct: bar.update_progress(idx, pct))
@@ -586,10 +458,12 @@ def process_files(
                 )
                 processed.add(jpg)
         else:
-            logger.error(f"Transcoding failed: {fp}")
-            if jpg:
-                logger.info(f"Keeping paired JPG due to transcoding failure: {jpg}")
+            if not GracefulExit.should_exit():
+                logger.error(f"Transcoding failed: {fp}")
+                if jpg:
+                    logger.info(f"Keeping paired JPG due to transcoding failure: {jpg}")
             break
+
     bar.finish()
     return processed
 
@@ -597,13 +471,14 @@ def process_files(
 def remove_orphaned_jpgs(
     mapping, processed, logger, dry_run=False, use_trash=False, trash_root=None
 ):
-    """
-    Delete any JPG that has no matching MP4 and hasn't already been removed.
-    The *use_trash* / *trash_root* pair is forwarded to :func:`safe_remove`
-    so the caller can decide whether to move the file or delete it outright.
-    """
+    if GracefulExit.should_exit():
+        return
+
     count = 0
     for _, files in mapping.items():
+        if GracefulExit.should_exit():
+            break
+
         jpg = files.get(".jpg")
         mp4 = files.get(".mp4")
         if not jpg or jpg in processed:
@@ -617,26 +492,25 @@ def remove_orphaned_jpgs(
                 jpg, logger, dry_run, use_trash=use_trash, trash_root=trash_root
             )
             count += 1
-    if dry_run:
+
+    if dry_run and not GracefulExit.should_exit():
         logger.info(f"[DRY RUN] Would remove {count} orphaned JPG files")
-    else:
+    elif not GracefulExit.should_exit():
         logger.info(f"Removed {count} orphaned JPG files")
 
 
 def clean_empty_directories(
     root_dir, logger=None, use_trash=False, trash_root=None, is_output=False
 ):
-    """
-    Walk *root_dir* bottom‑up and delete any empty directory that matches
-    the <YYYY>/<MM>/<DD> pattern.  When *use_trash* is True and a valid
-    *trash_root* is supplied the directory is moved there instead of being
-    removed.
-    """
+    if GracefulExit.should_exit():
+        return
+
     root = Path(root_dir)
     for dirpath, dirs, files in os.walk(root, topdown=False):
-        p = Path(dirpath)
+        if GracefulExit.should_exit():
+            break
 
-        # Skip the root itself
+        p = Path(dirpath)
         if p == root:
             continue
 
@@ -645,7 +519,6 @@ def clean_empty_directories(
         except ValueError:
             continue
 
-        # Only consider directories that look like <YYYY>/<MM>/<DD>
         if len(rel_parts) != 3:
             continue
 
@@ -682,15 +555,9 @@ def clean_empty_directories(
 def cleanup_archive_size_limit(
     out_dir, logger, max_size_gb, dry_run, use_trash=False, trash_root=None
 ):
-    """
-    Remove the oldest archived files when the total size of all
-    ``archived-*.mp4`` files in *out_dir* exceeds *max_size_gb*.
-    When *dry_run* is True only a log message is emitted.
+    if GracefulExit.should_exit():
+        return
 
-    If *use_trash* and a valid *trash_root* are supplied, removed
-    archive files are moved to that folder under an ``output`` sub‑directory
-    instead of being permanently deleted.
-    """
     archive_files = list(out_dir.rglob("archived-*.mp4"))
     if not archive_files:
         return
@@ -710,8 +577,11 @@ def cleanup_archive_size_limit(
             f"Archive size exceeds limit ({max_size_gb} GB), removing oldest files..."
         )
         for f in sorted(archive_files, key=lambda p: p.stat().st_mtime):
+            if GracefulExit.should_exit():
+                logger.info("Cancellation requested during archive cleanup")
+                break
+
             sz = f.stat().st_size
-            # Move to trash or delete permanently depending on flags
             if use_trash and trash_root:
                 safe_remove(
                     f,
@@ -729,53 +599,7 @@ def cleanup_archive_size_limit(
         logger.info(f"Final archive size: {cur_size / (1024**3):.1f} GB")
 
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="Archive and transcode camera files based on timestamp parsing"
-    )
-    parser.add_argument(
-        "--directory", "-d", type=Path, default="/camera", help="Input directory"
-    )
-    parser.add_argument(
-        "--output",
-        "-o",
-        type=Path,
-        default="/camera/archived",
-        help="Destination for archived MP4s",
-    )
-    parser.add_argument("--age", "-a", type=int, default=30, help="Age in days")
-    parser.add_argument(
-        "--dry-run", "-n", action="store_true", help="Show actions only"
-    )
-    parser.add_argument(
-        "--max-size",
-        "-m",
-        type=int,
-        default=500,
-        help="Maximum archive size in GB (used only when not dry-run)",
-    )
-    parser.add_argument(
-        "--no-skip",
-        "-s",
-        action="store_true",
-        help="Do not skip transcoding when archived copy exists",
-    )
-    # New flags for trash handling
-    parser.add_argument(
-        "--use-trash",
-        action="store_true",
-        help="Move deleted items to a trash directory instead of permanently deleting them",
-    )
-    parser.add_argument(
-        "--trashdir",
-        type=Path,
-        help="Specify custom trash directory (default: /camera/.deleted)",
-    )
-    args = parser.parse_args()
-    if len(sys.argv) == 1:
-        parser.print_help()
-        sys.exit(0)
-
+def run_archiver(args):
     base_dir = args.directory if args.directory.exists() else Path("/camera")
     if not base_dir.exists():
         print(
@@ -784,12 +608,10 @@ def main():
         sys.exit(1)
 
     out_dir = args.output or (base_dir / "archived")
-    trash_root: Path | None = None
+    trash_root = None
     if args.trashdir:
-        # A custom trash directory was supplied – use it regardless of --use-trash
         trash_root = args.trashdir
     elif args.use_trash:
-        # Default trash location when only --use‑trash is given
         trash_root = base_dir / ".deleted"
 
     if trash_root is not None:
@@ -810,7 +632,8 @@ def main():
         f"Size limit: {args.max_size} GB",
         f"Dry run: {args.dry_run}",
     ]:
-        logger.info(msg)
+        if not GracefulExit.should_exit():
+            logger.info(msg)
 
     processed = process_files(
         old_list=old_list,
@@ -824,46 +647,83 @@ def main():
         trash_root=trash_root,
         source_root=base_dir,
     )
-    remove_orphaned_jpgs(
-        mapping,
-        processed,
-        logger,
-        args.dry_run,
-        args.use_trash,
-        trash_root,
-    )
 
-    # Clean up any empty directories left under input and output paths
-    clean_empty_directories(base_dir, logger, is_output=False)
-    clean_empty_directories(out_dir, logger, is_output=True)
+    if not GracefulExit.should_exit():
+        remove_orphaned_jpgs(
+            mapping, processed, logger, args.dry_run, args.use_trash, trash_root
+        )
+        clean_empty_directories(base_dir, logger, is_output=False)
+        clean_empty_directories(out_dir, logger, is_output=True)
+        cleanup_archive_size_limit(
+            out_dir,
+            logger,
+            args.max_size,
+            args.dry_run,
+            use_trash=args.use_trash,
+            trash_root=trash_root,
+        )
 
-    # Enforce the archive size limit (moved into a helper function)
-    cleanup_archive_size_limit(
-        out_dir,
-        logger,
-        args.max_size,
-        args.dry_run,
-        use_trash=args.use_trash,
-        trash_root=trash_root,
-    )
-
-    if args.dry_run:
+    if GracefulExit.should_exit():
+        logger.info("Archive process was cancelled")
+    elif args.dry_run:
         logger.info("[DRY RUN] Done - no files were actually modified")
     else:
         logger.info("Archive process completed successfully")
 
 
-if __name__ == "__main__":
+def main():
     try:
-        main()
-    except KeyboardInterrupt:
-        # Handle Ctrl+C gracefully
-        sys.stderr.write("\n[INTERRUPTED] Process interrupted by user.\n")
-        sys.exit(130)  # Standard exit code for SIGINT
-    except Exception as e:
-        # Log unexpected errors before exiting
-        logging.getLogger("camera_archiver").error(
-            "Unexpected error occurred", exc_info=True
+        parser = argparse.ArgumentParser(
+            description="Archive and transcode camera files based on timestamp parsing"
         )
-        sys.stderr.write(f"[ERROR] Unexpected error: {e}\n")
+        parser.add_argument(
+            "--directory", "-d", type=Path, default="/camera", help="Input directory"
+        )
+        parser.add_argument(
+            "--output",
+            "-o",
+            type=Path,
+            default="/camera/archived",
+            help="Destination for archived MP4s",
+        )
+        parser.add_argument("--age", "-a", type=int, default=30, help="Age in days")
+        parser.add_argument(
+            "--dry-run", "-n", action="store_true", help="Show actions only"
+        )
+        parser.add_argument(
+            "--max-size", "-m", type=int, default=500, help="Maximum archive size in GB"
+        )
+        parser.add_argument(
+            "--no-skip",
+            "-s",
+            action="store_true",
+            help="Do not skip transcoding when archived copy exists",
+        )
+        parser.add_argument(
+            "--use-trash",
+            action="store_true",
+            help="Move deleted items to trash instead of deleting",
+        )
+        parser.add_argument(
+            "--trashdir", type=Path, help="Specify custom trash directory"
+        )
+        args = parser.parse_args()
+        if len(sys.argv) == 1:
+            parser.print_help()
+            sys.exit(0)
+
+        return run_archiver(args)
+    except KeyboardInterrupt:
+        GracefulExit.request_exit()
+        print("\nReceived KeyboardInterrupt, shutting down gracefully...")
         sys.exit(1)
+    except Exception as e:
+        if not GracefulExit.should_exit():
+            logging.getLogger("camera_archiver").error(f"Unexpected error: {e}")
+            raise
+        else:
+            print("Process was cancelled")
+
+
+if __name__ == "__main__":
+    main()
