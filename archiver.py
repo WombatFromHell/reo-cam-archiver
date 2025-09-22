@@ -40,14 +40,18 @@ class GuardedStreamHandler(logging.StreamHandler):
             if self.progress_bar and self.progress_bar.has_progress:
                 # Only perform special handling on TTY terminals
                 if hasattr(self.stream, "isatty") and self.stream.isatty():
-                    # Clear the current line and write the log message
-                    self.stream.write("\x1b[2K\r")
-            # Write the log record
-            self.stream.write(msg)
-            self.flush()
-            if self.progress_bar and self.progress_bar.has_progress:
-                # Redraw the progress bar after writing the log
-                self.progress_bar.redraw()
+                    # Clear the current progress bar line and write the log message on a new line
+                    self.stream.write("\r\x1b[K")  # Clear current line
+                    self.stream.write(msg)  # Write log message
+                    # Redraw the progress bar on the next line
+                    self.stream.write(f"\r\x1b[K{self.progress_bar._progress_line}")
+                else:
+                    # Non-TTY: just write the message
+                    self.stream.write(msg)
+            else:
+                # No progress bar active, normal writing
+                self.stream.write(msg)
+            self.stream.flush()
 
 
 class ProgressBar:
@@ -64,63 +68,10 @@ class ProgressBar:
         self._active = False
         self._thread = None
         self._stop_event = threading.Event()
+        self._last_print_time = 0
 
         # Save original stderr for restoration
         self._original_stderr = out
-
-        # Setup terminal for dedicated progress bar area
-        if not self.silent:
-            self._setup_terminal()
-
-    def _setup_terminal(self):
-        """Setup terminal for dedicated progress bar area at bottom"""
-        if not self._is_tty():
-            return
-
-        try:
-            # Clear screen and move to top
-            self.out.write("\x1b[2J\x1b[H")
-            self.out.flush()
-
-            # Create scrollable area (all but last line)
-            rows = self.get_terminal_size()[0]
-            self._scroll_area_height = max(1, rows - 1)
-            self.out.write(f"\x1b[0;{self._scroll_area_height}r")
-            self.out.flush()
-        except Exception:
-            # Fallback if terminal setup fails
-            pass
-
-    def _restore_terminal(self):
-        """Restore terminal to normal state"""
-        if not self._is_tty():
-            return
-
-        try:
-            # Reset scrolling region
-            rows = self.get_terminal_size()[0]
-            self.out.write(f"\x1b[0;{rows}r")
-            self.out.flush()
-
-            # Clear progress bar line
-            self.out.write(f"\x1b[{rows};1H\x1b[K")
-            self.out.flush()
-
-            # Move cursor below progress bar
-            self.out.write(f"\x1b[{rows};1H\n")
-            self.out.flush()
-        except Exception:
-            pass
-
-    def get_terminal_size(self) -> tuple[int, int]:
-        """Get terminal dimensions (rows, columns)"""
-        try:
-            import shutil
-
-            size = shutil.get_terminal_size()
-            return size.lines, size.columns
-        except (OSError, ValueError, AttributeError):
-            return 24, 80  # Fallback size
 
     @property
     def has_progress(self):
@@ -135,8 +86,14 @@ class ProgressBar:
             self.start_time = time.time()
 
     def finish(self):
-        if not self.silent:
-            self._restore_terminal()
+        """Clean up the progress bar display."""
+        if not self.silent and self._progress_line:
+            # Clear the progress line and move cursor to next line
+            if self._is_tty():
+                self.out.write("\r\x1b[2K")  # Clear current line
+            else:
+                self.out.write("\n")
+            self.out.flush()
 
     def start_file(self):
         self.file_start = time.time()
@@ -181,42 +138,25 @@ class ProgressBar:
             self._display(self._progress_line)
 
     def _display(self, line):
-        """Display progress bar in dedicated bottom area"""
+        """Display progress bar using simple carriage return approach"""
         if not self._is_tty():
-            # Non-TTY fallback - original behavior
+            # Non-TTY fallback - print periodically to avoid spam
             now = time.time()
-            if getattr(self, "_last_print_time", 0) < now - 5:
-                self.out.write(f"\r{line}\n")
+            if now - self._last_print_time >= 5 or "100%" in line:
+                self.out.write(f"{line}\n")
                 self.out.flush()
                 self._last_print_time = now
             return
 
+        # For TTY: use carriage return to overwrite the same line
         try:
-            # For TTY: move to bottom line and display progress bar
-            rows = self.get_terminal_size()[0]
-            # Save cursor position, move to progress bar line, clear line, write progress, restore cursor
-            self.out.write(f"\x1b[s\x1b[{rows};1H\x1b[2K\r{line}\x1b[u")
+            # \r moves to beginning, \x1b[K clears to end of line
+            self.out.write(f"\r\x1b[K{line}")
             self.out.flush()
         except Exception:
-            # Fallback to simple display if ANSI codes fail
+            # Fallback if ANSI codes fail
             self.out.write(f"\r{line}")
             self.out.flush()
-
-    def auto_update(self, interval: float = 0.1, update_func=None):
-        """Start automatic updates in a background thread (optional)"""
-        if self.silent:
-            return
-
-        def update_loop():
-            while not self._stop_event.is_set():
-                if update_func:
-                    _ = update_func()
-                    # You'd need to adapt this to match your update logic
-                    # For now, this is a placeholder for future enhancement
-                time.sleep(interval)
-
-        self._thread = threading.Thread(target=update_loop, daemon=True)
-        self._thread.start()
 
     def __enter__(self):
         return self
