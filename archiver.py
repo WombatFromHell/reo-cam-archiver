@@ -12,8 +12,6 @@ import threading
 import os
 import shutil
 
-TIMESTAMP_RE = re.compile(r"REO_.*_(\d{14})\.(mp4|jpg)$", re.IGNORECASE)
-
 
 class ConsoleOrchestrator:
     """Thread‑safe lock for console output."""
@@ -36,23 +34,19 @@ class GuardedStreamHandler(logging.StreamHandler):
     def emit(self, record):
         """
         Write a log record to the stream while keeping the progress bar intact.
-        The previous implementation cleared the wrong line and then redrew the
-        progress bar on top of the freshly‑written message.  That caused logs
-        to be truncated or overwritten.
         """
         msg = self.format(record) + self.terminator
         with self.orchestrator.guard():
             if self.progress_bar and self.progress_bar.has_progress:
                 # Only perform special handling on TTY terminals
                 if hasattr(self.stream, "isatty") and self.stream.isatty():
-                    # Clear the line where the progress bar currently lives.
-                    # This ensures that the log message is written on a fresh line.
+                    # Clear the current line and write the log message
                     self.stream.write("\x1b[2K\r")
-            # Write the log record (it ends with a newline)
+            # Write the log record
             self.stream.write(msg)
             self.flush()
             if self.progress_bar and self.progress_bar.has_progress:
-                # Redraw the progress bar on its own line after writing the log
+                # Redraw the progress bar after writing the log
                 self.progress_bar.redraw()
 
 
@@ -67,13 +61,73 @@ class ProgressBar:
         self.start_time = None
         self.file_start = None
         self._progress_line = ""
+        self._active = False
+        self._thread = None
+        self._stop_event = threading.Event()
+
+        # Save original stderr for restoration
+        self._original_stderr = out
+
+        # Setup terminal for dedicated progress bar area
+        if not self.silent:
+            self._setup_terminal()
+
+    def _setup_terminal(self):
+        """Setup terminal for dedicated progress bar area at bottom"""
+        if not self._is_tty():
+            return
+
+        try:
+            # Clear screen and move to top
+            self.out.write("\x1b[2J\x1b[H")
+            self.out.flush()
+
+            # Create scrollable area (all but last line)
+            rows = self.get_terminal_size()[0]
+            self._scroll_area_height = max(1, rows - 1)
+            self.out.write(f"\x1b[0;{self._scroll_area_height}r")
+            self.out.flush()
+        except Exception:
+            # Fallback if terminal setup fails
+            pass
+
+    def _restore_terminal(self):
+        """Restore terminal to normal state"""
+        if not self._is_tty():
+            return
+
+        try:
+            # Reset scrolling region
+            rows = self.get_terminal_size()[0]
+            self.out.write(f"\x1b[0;{rows}r")
+            self.out.flush()
+
+            # Clear progress bar line
+            self.out.write(f"\x1b[{rows};1H\x1b[K")
+            self.out.flush()
+
+            # Move cursor below progress bar
+            self.out.write(f"\x1b[{rows};1H\n")
+            self.out.flush()
+        except Exception:
+            pass
+
+    def get_terminal_size(self) -> tuple[int, int]:
+        """Get terminal dimensions (rows, columns)"""
+        try:
+            import shutil
+
+            size = shutil.get_terminal_size()
+            return size.lines, size.columns
+        except (OSError, ValueError, AttributeError):
+            return 24, 80  # Fallback size
 
     @property
     def has_progress(self):
         return bool(self._progress_line)
 
     def _is_tty(self):
-        return hasattr(self.out, "isatty") and self.out.isatty()
+        return hasattr(self.out, "isatty") and self.out.isatty() and not self.silent
 
     def start_processing(self):
         """Initialize the total processing start time."""
@@ -82,14 +136,7 @@ class ProgressBar:
 
     def finish(self):
         if not self.silent:
-            # Clear the current progress line
-            if self._is_tty():
-                # ANSI: clear line, carriage‑return, newline
-                self.out.write("\x1b[2K\r\n")
-            else:
-                # Non‑TTY terminals – just output a newline
-                self.out.write("\n")
-            self.out.flush()
+            self._restore_terminal()
 
     def start_file(self):
         self.file_start = time.time()
@@ -111,6 +158,7 @@ class ProgressBar:
         self.update_progress(idx, 100.0)
 
     def _format_line(self, idx, pct):
+        """Preserve the exact same format as the original"""
         now = time.time()
         bar = f"[{'|' * int(pct / 100 * self.blocks)}{'-' * (self.blocks - int(pct / 100 * self.blocks))}]"
         elapsed_file = datetime.fromtimestamp(now - (self.file_start or now)).strftime(
@@ -126,31 +174,55 @@ class ProgressBar:
 
         return f"Progress [{idx}/{self.total}]: {pct:.0f}% {bar} {elapsed_file} ({elapsed_total})"
 
-    def _clear_area(self):
-        if not self._is_tty():
-            return
-        # Move cursor down one line, clear it, then move back up
-        self.out.write("\x1b[1E\x1b[2K\x1b[1A")
-        self.out.flush()
-
     def redraw(self):
-        # Fixed logic: redraw when NOT silent and we have a progress line
         if self.silent or not self._progress_line:
             return
         with self.orchestrator.guard():
             self._display(self._progress_line)
 
     def _display(self, line):
+        """Display progress bar in dedicated bottom area"""
         if not self._is_tty():
+            # Non-TTY fallback - original behavior
             now = time.time()
             if getattr(self, "_last_print_time", 0) < now - 5:
                 self.out.write(f"\r{line}\n")
                 self.out.flush()
                 self._last_print_time = now
             return
-        # For TTY: save cursor, clear line, write progress, restore cursor
-        self.out.write(f"\x1b[s\x1b[2K\r{line}\x1b[u")
-        self.out.flush()
+
+        try:
+            # For TTY: move to bottom line and display progress bar
+            rows = self.get_terminal_size()[0]
+            # Save cursor position, move to progress bar line, clear line, write progress, restore cursor
+            self.out.write(f"\x1b[s\x1b[{rows};1H\x1b[2K\r{line}\x1b[u")
+            self.out.flush()
+        except Exception:
+            # Fallback to simple display if ANSI codes fail
+            self.out.write(f"\r{line}")
+            self.out.flush()
+
+    def auto_update(self, interval: float = 0.1, update_func=None):
+        """Start automatic updates in a background thread (optional)"""
+        if self.silent:
+            return
+
+        def update_loop():
+            while not self._stop_event.is_set():
+                if update_func:
+                    _ = update_func()
+                    # You'd need to adapt this to match your update logic
+                    # For now, this is a placeholder for future enhancement
+                time.sleep(interval)
+
+        self._thread = threading.Thread(target=update_loop, daemon=True)
+        self._thread.start()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.finish()
 
 
 def setup_logging(log_file, progress_bar=None):
@@ -179,6 +251,7 @@ def setup_logging(log_file, progress_bar=None):
 
 
 def parse_timestamp_from_filename(name):
+    TIMESTAMP_RE = re.compile(r"REO_.*_(\d{14})\.(mp4|jpg)$", re.IGNORECASE)
     m = TIMESTAMP_RE.search(name)
     if not m:
         return None

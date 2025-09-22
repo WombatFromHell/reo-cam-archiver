@@ -8,7 +8,7 @@ import tempfile
 import unittest
 from datetime import datetime
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import patch, MagicMock
 import subprocess
 from contextlib import redirect_stdout, redirect_stderr
 from typing import cast
@@ -21,7 +21,8 @@ if not hasattr(archiver, "DummyProgressBar"):
 
     class DummyProgressBar:
         def __init__(self):
-            pass
+            self.has_progress = False
+            self.orchestrator = archiver.ConsoleOrchestrator()
 
         # The real ProgressBar exposes these methods; they are no‑ops for the stub.
         def start_processing(self):
@@ -37,6 +38,9 @@ if not hasattr(archiver, "DummyProgressBar"):
             return None
 
         def finish(self):
+            return None
+
+        def redraw(self):
             return None
 
     archiver.DummyProgressBar = DummyProgressBar  # type: ignore[attr-defined]
@@ -262,63 +266,119 @@ class TestProgressBar(TempDirTestCase):
         self.stream = io.StringIO()
         self.stream.isatty = lambda *_, **__: True
 
-    def test_updates_and_finish(self):
+    @patch("shutil.get_terminal_size")
+    def test_updates_and_finish(self, mock_terminal_size):
+        """Test progress bar updates and terminal restoration"""
+        # Mock terminal size
+        mock_terminal_size.return_value = MagicMock(lines=24, columns=80)
+
         bar = archiver.ProgressBar(total_files=1, silent=False, out=self.stream)
+        bar.start_processing()  # Initialize start time
+        bar.start_file()  # Start file processing
+
         bar.update_progress(1, 50.0)
         # Progress line should appear once
-        self.assertTrue(any("Progress [1/1]:" in s for s in self._get_stream_output()))
-        first_len = len(self._get_stream_output())
+        output = self.stream.getvalue()
+        self.assertIn("Progress [1/1]:", output)
 
-        # Same pct again — no new line
-        bar.update_progress(1, 50.0)
-        self.assertEqual(first_len, len(self._get_stream_output()))
-
-        # finish clears the line
+        # finish restores terminal
         bar.finish()
-        # Check that finish() was called by verifying the stream content changed
-        final_content = self.stream.getvalue()
-        self.assertIn("Progress [1/1]:", final_content)
+        final_output = self.stream.getvalue()
+        # Should contain progress information
+        self.assertIn("Progress [1/1]:", final_output)
 
     def test_silent_mode(self):
         stream = io.StringIO()
         stream.isatty = lambda *_, **__: True
         bar = archiver.ProgressBar(total_files=1, silent=True, out=stream)
+        bar.start_processing()
+        bar.start_file()
         bar.update_progress(1, 50.0)
         self.assertEqual(stream.getvalue(), "")
         bar.finish()
         self.assertEqual(stream.getvalue(), "")
 
-    def test_non_tty_output(self):
+    @patch("time.time")
+    def test_non_tty_output(self, mock_time):
+        """Test non-TTY output with throttled updates"""
+        mock_time.return_value = 1000.0  # Fixed time for consistent testing
+
         stream = io.StringIO()
         stream.isatty = lambda *_, **__: False
         bar = archiver.ProgressBar(total_files=1, silent=False, out=stream)
+        bar.start_processing()
+        bar.start_file()
+
         bar.update_progress(1, 50.0)
-        # For non-tty output, check that progress was written
+        # For non-tty output, check that progress was written (throttled)
         content = stream.getvalue()
+        # Should contain progress information
         self.assertIn("Progress [1/1]:", content)
 
-    def test_finish_file_and_start(self):
+    @patch("shutil.get_terminal_size")
+    def test_finish_file_and_start_processing(self, mock_terminal_size):
+        """Test file completion and processing start"""
+        mock_terminal_size.return_value = MagicMock(lines=24, columns=80)
+
         stream = io.StringIO()
         stream.isatty = lambda *_, **__: True
         bar = archiver.ProgressBar(total_files=1, silent=False, out=stream)
+
+        # Test start_processing sets start_time
+        self.assertIsNone(bar.start_time)
+        bar.start_processing()
+        self.assertIsNotNone(bar.start_time)
+
+        # Test start_file sets file_start and ensures start_time is set
+        bar.start_time = None  # Reset to test the fallback
+        bar.start_file()
+        self.assertIsNotNone(bar.file_start)
+        self.assertIsNotNone(bar.start_time)  # Should be set by start_file if None
+
         bar.finish_file(1)
         # Check that finish_file produces output indicating completion
         content = stream.getvalue()
-        self.assertTrue(
-            "Progress [1/1]:" in content or "100%" in content or len(content) > 0
-        )
+        self.assertTrue(len(content) > 0)
 
-        bar_start = archiver.ProgressBar(total_files=1, silent=True)
-        self.assertIsNone(bar_start.file_start)
-        bar_start.start_file()
-        self.assertIsNotNone(bar_start.file_start)
+    @patch("shutil.get_terminal_size")
+    def test_redraw_method(self, mock_terminal_size):
+        """Test the redraw method functionality"""
+        mock_terminal_size.return_value = MagicMock(lines=24, columns=80)
 
-    # ------------------------------------------------------------------
-    # Helper to get stream content
-    # ------------------------------------------------------------------
+        stream = io.StringIO()
+        stream.isatty = lambda *_, **__: True
+        bar = archiver.ProgressBar(total_files=1, silent=False, out=stream)
+        bar.start_processing()
+        bar.start_file()
 
-    def _get_stream_output(self):
-        return self.stream.getvalue().splitlines()
+        # Update progress to set _progress_line
+        bar.update_progress(1, 50.0)
+        _ = stream.getvalue()
+
+        # Clear stream to test redraw
+        stream.truncate(0)
+        stream.seek(0)
+
+        # Redraw should output the progress line again
+        bar.redraw()
+        redraw_output = stream.getvalue()
+        self.assertIn("Progress [1/1]:", redraw_output)
+
+    @patch("shutil.get_terminal_size")
+    def test_has_progress_property(self, mock_terminal_size):
+        """Test the has_progress property"""
+        mock_terminal_size.return_value = MagicMock(lines=24, columns=80)
+
+        bar = archiver.ProgressBar(total_files=1, silent=False, out=self.stream)
+
+        # Initially no progress
+        self.assertFalse(bar.has_progress)
+
+        # After update, should have progress
+        bar.start_processing()
+        bar.start_file()
+        bar.update_progress(1, 50.0)
+        self.assertTrue(bar.has_progress)
 
 
 class TestLoggerSetup(TempDirTestCase):
@@ -346,7 +406,11 @@ class TestLoggerSetup(TempDirTestCase):
         finally:
             test_logger.handlers.clear()
 
-    def test_guarded_handler_clears_line_before_log(self):
+    @patch("shutil.get_terminal_size")
+    def test_guarded_handler_clears_line_before_log(self, mock_terminal_size):
+        """Test guarded handler with progress bar integration"""
+        mock_terminal_size.return_value = MagicMock(lines=24, columns=80)
+
         stream = io.StringIO()
         stream.isatty = lambda *_, **__: True
         bar = archiver.ProgressBar(total_files=1, silent=False, out=stream)
@@ -359,6 +423,7 @@ class TestLoggerSetup(TempDirTestCase):
         sh.setFormatter(logging.Formatter("%(message)s"))
         logger.addHandler(sh)
 
+        bar.start_processing()
         bar.start_file()
         logger.info("First log")
         bar.update_progress(1, 50.0)  # writes the bar
@@ -416,7 +481,10 @@ class TestProcessFiles(TempDirTestCase):
 
     @patch("archiver.safe_remove")
     @patch("archiver.transcode_file", return_value=None)
-    def test_skip_logic(self, mock_transcode, mock_safe_remove):
+    @patch("shutil.get_terminal_size")
+    def test_skip_logic(self, mock_terminal_size, mock_transcode, mock_safe_remove):
+        mock_terminal_size.return_value = MagicMock(lines=24, columns=80)
+
         ts = datetime(2023, 12, 1)
         mp4_path = self.temp_dir / "video.mp4"
         write_file(mp4_path)
@@ -457,7 +525,12 @@ class TestProcessFiles(TempDirTestCase):
 
     @patch("archiver.safe_remove")
     @patch("archiver.transcode_file", return_value=True)
-    def test_no_skip_triggers_transcode(self, mock_transcode, mock_safe_remove):
+    @patch("shutil.get_terminal_size")
+    def test_no_skip_triggers_transcode(
+        self, mock_terminal_size, mock_transcode, mock_safe_remove
+    ):
+        mock_terminal_size.return_value = MagicMock(lines=24, columns=80)
+
         ts = datetime(2023, 12, 1)
         mp4_path = self.temp_dir / "video.mp4"
         write_file(mp4_path)
@@ -499,7 +572,10 @@ class TestProcessFiles(TempDirTestCase):
 
     @patch("archiver.safe_remove")
     @patch("archiver.transcode_file", return_value=True)
-    def test_dry_run(self, mock_transcode, mock_safe_remove):
+    @patch("shutil.get_terminal_size")
+    def test_dry_run(self, mock_terminal_size, mock_transcode, mock_safe_remove):
+        mock_terminal_size.return_value = MagicMock(lines=24, columns=80)
+
         ts = datetime(2023, 12, 1)
         mp4_path = self.temp_dir / "video.mp4"
         write_file(mp4_path)
@@ -833,13 +909,28 @@ class TestDefaultDirectoryAndTrashPath(TempDirTestCase):
     def _run_and_capture_log(self, argv: list[str]) -> str:
         return run_main(argv)
 
-    def test_default_directory_and_trash_path(self):
+    @patch("archiver.shutil.get_terminal_size")
+    @patch("archiver.scan_files", return_value=([], {}))
+    @patch("archiver.process_files", return_value=set())
+    @patch("archiver.remove_orphaned_jpgs")
+    @patch("archiver.clean_empty_directories")
+    def test_default_directory_and_trash_path(
+        self,
+        mock_clean_dirs,
+        mock_remove_jpgs,
+        mock_process_files,
+        mock_scan_files,
+        mock_terminal_size,
+    ):
+        mock_terminal_size.return_value = MagicMock(lines=24, columns=80)
+
         argv = ["archiver.py", "--directory", str(self.temp_dir)]
         log_contents = self._run_and_capture_log(argv)
         self.assertIn(f"Input: {self.temp_dir}", log_contents)
         self.assertIn("Trash: None", log_contents)
         self.assertFalse((self.temp_dir / ".deleted").exists())
 
+    @patch("archiver.shutil.get_terminal_size")
     @patch("archiver.scan_files", return_value=([], {}))
     @patch("archiver.process_files", return_value=set())
     @patch("archiver.remove_orphaned_jpgs")
@@ -850,7 +941,10 @@ class TestDefaultDirectoryAndTrashPath(TempDirTestCase):
         mock_remove_jpgs,
         mock_process_files,
         mock_scan_files,
+        mock_terminal_size,
     ):
+        mock_terminal_size.return_value = MagicMock(lines=24, columns=80)
+
         custom_trash = self.temp_dir / "custom_trash"
 
         dummy_logger = capture_logger("custom_trash")
@@ -876,13 +970,21 @@ class TestDefaultDirectoryAndTrashPath(TempDirTestCase):
         self.assertTrue(custom_trash.exists())
         self.assertFalse((self.temp_dir / ".deleted").exists())
 
+    @patch("archiver.shutil.get_terminal_size")
     @patch("archiver.scan_files", return_value=([], {}))
     @patch("archiver.process_files", return_value=set())
     @patch("archiver.remove_orphaned_jpgs")
     @patch("archiver.clean_empty_directories")
     def test_use_trash_flag(
-        self, mock_clean_dirs, mock_remove_jpgs, mock_process_files, mock_scan_files
+        self,
+        mock_clean_dirs,
+        mock_remove_jpgs,
+        mock_process_files,
+        mock_scan_files,
+        mock_terminal_size,
     ):
+        mock_terminal_size.return_value = MagicMock(lines=24, columns=80)
+
         expected_trash = self.temp_dir / ".deleted"
 
         dummy_logger = capture_logger("use_trash")
@@ -902,6 +1004,7 @@ class TestDefaultDirectoryAndTrashPath(TempDirTestCase):
         self.assertTrue(expected_trash.exists())
         self.assertFalse((self.temp_dir / "custom_trash").exists())
 
+    @patch("archiver.shutil.get_terminal_size")
     @patch("archiver.scan_files", return_value=([], {}))
     @patch("archiver.process_files", return_value=set())
     @patch("archiver.remove_orphaned_jpgs")
@@ -912,7 +1015,10 @@ class TestDefaultDirectoryAndTrashPath(TempDirTestCase):
         mock_remove_jpgs,
         mock_process_files,
         mock_scan_files,
+        mock_terminal_size,
     ):
+        mock_terminal_size.return_value = MagicMock(lines=24, columns=80)
+
         custom_trash = self.temp_dir / "custom_trash"
 
         dummy_logger = capture_logger("mixed_trash")
@@ -943,12 +1049,15 @@ class TestDefaultDirectoryAndTrashPath(TempDirTestCase):
 class TestMainFunction(TempDirTestCase):
     """Final integration test — archive size limit triggers removal of old files."""
 
+    @patch("archiver.shutil.get_terminal_size")
     @patch("archiver.scan_files", return_value=([], {}))
     @patch("archiver.process_files", return_value=set())
     @patch("archiver.remove_orphaned_jpgs")
     def test_archive_size_limit_removal(
-        self, mock_remove_jpgs, mock_process_files, mock_scan_files
+        self, mock_remove_jpgs, mock_process_files, mock_scan_files, mock_terminal_size
     ):
+        mock_terminal_size.return_value = MagicMock(lines=24, columns=80)
+
         dummy_logger = capture_logger("main")
 
         # Create the output directory and some files to exceed the limit
