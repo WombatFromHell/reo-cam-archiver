@@ -11,6 +11,8 @@ from pathlib import Path
 import threading
 import os
 import shutil
+import atexit
+import signal
 
 
 class ConsoleOrchestrator:
@@ -40,11 +42,10 @@ class GuardedStreamHandler(logging.StreamHandler):
             if self.progress_bar and self.progress_bar.has_progress:
                 # Only perform special handling on TTY terminals
                 if hasattr(self.stream, "isatty") and self.stream.isatty():
-                    # Clear the current progress bar line and write the log message on a new line
-                    self.stream.write("\r\x1b[K")  # Clear current line
-                    self.stream.write(msg)  # Write log message
-                    # Redraw the progress bar on the next line
-                    self.stream.write(f"\r\x1b[K{self.progress_bar._progress_line}")
+                    # Temporarily hide progress bar, write message, then redraw
+                    self.progress_bar._hide_progress()
+                    self.stream.write(msg)
+                    self.progress_bar.redraw()
                 else:
                     # Non-TTY: just write the message
                     self.stream.write(msg)
@@ -68,10 +69,144 @@ class ProgressBar:
         self._active = False
         self._thread = None
         self._stop_event = threading.Event()
-        self._last_print_time = 0
+        self._terminal_modified = False
+        self._original_signal_handlers = {}
+        self._scroll_area_set = False
+        self._last_print_time = 0  # Initialize this attribute
 
         # Save original stderr for restoration
         self._original_stderr = out
+
+        # Register cleanup handlers
+        self._register_cleanup_handlers()
+
+        # Set up scroll region immediately if we have a TTY
+        # This ensures proper display from the very beginning
+        if self._is_tty():
+            self._setup_scroll_region()
+
+    def _register_cleanup_handlers(self):
+        """Register handlers for graceful cleanup on all exit scenarios"""
+        # Register atexit handler for normal exits
+        atexit.register(self._emergency_cleanup)
+
+        # Register signal handlers for interrupt signals
+        signals = [signal.SIGINT, signal.SIGTERM, signal.SIGHUP]
+        for sig in signals:
+            try:
+                self._original_signal_handlers[sig] = signal.getsignal(sig)
+                signal.signal(sig, self._signal_handler)
+            except (ValueError, OSError):
+                # Some signals may not be available on all platforms
+                pass
+
+    def _unregister_cleanup_handlers(self):
+        """Restore original signal handlers"""
+        for sig, handler in self._original_signal_handlers.items():
+            try:
+                signal.signal(sig, handler)
+            except (ValueError, OSError):
+                pass
+        atexit.unregister(self._emergency_cleanup)
+
+    def _signal_handler(self, signum, frame):
+        """Handle signals by cleaning up and re-raising"""
+        self._emergency_cleanup()
+        # Restore original handler and re-raise signal
+        if signum in self._original_signal_handlers:
+            original_handler = self._original_signal_handlers[signum]
+            if original_handler and original_handler not in [
+                signal.SIG_DFL,
+                signal.SIG_IGN,
+            ]:
+                original_handler(signum, frame)
+            else:
+                # Default behavior: exit
+                sys.exit(128 + signum)
+
+    def _setup_scroll_region(self):
+        """Reserve the bottom line for progress bar without disturbing existing content"""
+        if not self._is_tty() or self.silent or self._scroll_area_set:
+            return
+
+        try:
+            # Instead of setting up a scroll region (which can overwrite content),
+            # we'll just ensure there's a blank line at the bottom and manage it manually
+            self.out.write("\n")  # Add a newline to make space
+            self.out.flush()
+            self._scroll_area_set = True
+            self._terminal_modified = True
+        except Exception:
+            # If we can't write, fall back to simple mode
+            pass
+
+    def _restore_scroll_region(self):
+        """Clean up the reserved progress bar line"""
+        if not self._scroll_area_set:
+            return
+
+        try:
+            # Clear the progress bar line
+            if self._is_tty():
+                self.out.write("\x1b[2K")  # Clear current line
+                self.out.flush()
+            self._scroll_area_set = False
+        except Exception:
+            pass
+
+    def _emergency_cleanup(self):
+        """Emergency cleanup that's safe to call multiple times"""
+        if not self._terminal_modified:
+            return
+
+        try:
+            if self._is_tty():
+                # Just clear the current line and move to next line
+                self.out.write("\x1b[2K\n")
+                self.out.flush()
+            self._terminal_modified = False
+        except Exception:
+            # If we can't write to the terminal, there's nothing more we can do
+            pass
+
+    def _hide_progress(self):
+        """Temporarily hide the progress bar"""
+        if self.silent or not self._progress_line or not self._is_tty():
+            return
+
+        try:
+            # Save cursor, go to progress line, clear it, restore cursor
+            self.out.write("\x1b[s")  # Save cursor
+            self.out.write(
+                f"\x1b[{self._get_progress_line()};1H"
+            )  # Move to progress line
+            self.out.write("\x1b[2K")  # Clear the progress bar line
+            self.out.write("\x1b[u")  # Restore cursor
+            self.out.flush()
+        except Exception:
+            pass
+
+    def _show_progress(self):
+        """Show the progress bar again"""
+        if self.silent or not self._progress_line or not self._is_tty():
+            return
+        self._display(self._progress_line)
+
+    def get_terminal_size(self) -> tuple[int, int]:
+        """Get terminal dimensions (rows, columns)"""
+        try:
+            size = shutil.get_terminal_size()
+            return size.lines, size.columns
+        except (OSError, ValueError, AttributeError):
+            return 24, 80  # Fallback size
+
+    def _get_progress_line(self):
+        """Get the line number where the progress bar should be displayed"""
+        try:
+            rows, cols = self.get_terminal_size()
+            return rows  # Use the last line of the terminal
+        except Exception:
+            return 24  # Fallback
 
     @property
     def has_progress(self):
@@ -84,16 +219,13 @@ class ProgressBar:
         """Initialize the total processing start time."""
         if self.start_time is None:
             self.start_time = time.time()
+        # Scroll region is now set up in __init__, so no need to call it again here
 
     def finish(self):
         """Clean up the progress bar display."""
-        if not self.silent and self._progress_line:
-            # Clear the progress line and move cursor to next line
-            if self._is_tty():
-                self.out.write("\r\x1b[2K")  # Clear current line
-            else:
-                self.out.write("\n")
-            self.out.flush()
+        if not self.silent:
+            self._emergency_cleanup()
+        self._unregister_cleanup_handlers()
 
     def start_file(self):
         self.file_start = time.time()
@@ -108,6 +240,7 @@ class ProgressBar:
         if line == self._progress_line:
             return
         self._progress_line = line
+        self._terminal_modified = True
         with self.orchestrator.guard():
             self._display(line)
 
@@ -122,9 +255,9 @@ class ProgressBar:
             "%M:%S"
         )
 
-        # Total elapsed – treat as a duration, not an epoch
+        # Total elapsed — treat as a duration, not an epoch
         total_sec = int(now - (self.start_time or now))
-        # Manual formatting gives HH:MM:SS even for >24 h
+        # Manual formatting gives HH:MM:SS even for >24 h
         hours, remainder = divmod(total_sec, 3600)
         minutes, seconds = divmod(remainder, 60)
         elapsed_total = f"{int(hours):02}:{int(minutes):02}:{int(seconds):02}"
@@ -135,10 +268,10 @@ class ProgressBar:
         if self.silent or not self._progress_line:
             return
         with self.orchestrator.guard():
-            self._display(self._progress_line)
+            self._show_progress()
 
     def _display(self, line):
-        """Display progress bar using simple carriage return approach"""
+        """Display progress bar on the reserved bottom line"""
         if not self._is_tty():
             # Non-TTY fallback - print periodically to avoid spam
             now = time.time()
@@ -148,10 +281,15 @@ class ProgressBar:
                 self._last_print_time = now
             return
 
-        # For TTY: use carriage return to overwrite the same line
+        # For TTY: display progress bar on the reserved bottom line
         try:
-            # \r moves to beginning, \x1b[K clears to end of line
-            self.out.write(f"\r\x1b[K{line}")
+            # Save cursor, move to progress line, clear and write, restore cursor
+            self.out.write("\x1b[s")  # Save cursor
+            self.out.write(
+                f"\x1b[{self._get_progress_line()};1H"
+            )  # Move to progress line
+            self.out.write(f"\x1b[2K{line}")  # Clear line and write progress
+            self.out.write("\x1b[u")  # Restore cursor
             self.out.flush()
         except Exception:
             # Fallback if ANSI codes fail
@@ -268,8 +406,6 @@ def safe_remove(
 
 
 def get_video_duration(inp):
-    import shutil
-
     if not shutil.which("ffprobe"):
         return None
     try:

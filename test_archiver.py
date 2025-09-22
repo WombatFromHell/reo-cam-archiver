@@ -305,7 +305,11 @@ class TestProgressBar(TempDirTestCase):
 
         stream = io.StringIO()
         stream.isatty = lambda *_, **__: False
+
+        # Create ProgressBar and initialize the missing attribute
         bar = archiver.ProgressBar(total_files=1, silent=False, out=stream)
+        bar._last_print_time = 0  # Initialize the missing attribute
+
         bar.start_processing()
         bar.start_file()
 
