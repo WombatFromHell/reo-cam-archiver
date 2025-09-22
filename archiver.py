@@ -854,4 +854,16 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        # Handle Ctrl+C gracefully
+        sys.stderr.write("\n[INTERRUPTED] Process interrupted by user.\n")
+        sys.exit(130)  # Standard exit code for SIGINT
+    except Exception as e:
+        # Log unexpected errors before exiting
+        logging.getLogger("camera_archiver").error(
+            "Unexpected error occurred", exc_info=True
+        )
+        sys.stderr.write(f"[ERROR] Unexpected error: {e}\n")
+        sys.exit(1)
