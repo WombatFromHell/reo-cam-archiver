@@ -73,7 +73,7 @@ class ProgressBar:
         self.start_time = None
         self.file_start = None
         self._progress_line = ""
-        self._last_print_time = 0
+        self._last_print_time = time.time()  # Initialize with current time instead of 0
         self._original_signal_handlers = {}
         self._register_cleanup_handlers()
 
@@ -558,18 +558,18 @@ def cleanup_archive_size_limit(
     if GracefulExit.should_exit():
         return
 
+    if dry_run:
+        logger.info(
+            f"[DRY RUN] Would check archive size limit ({max_size_gb} GB) and remove old files if needed"
+        )
+        return
+
     archive_files = list(out_dir.rglob("archived-*.mp4"))
     if not archive_files:
         return
 
     cur_size = sum(p.stat().st_size for p in archive_files if p.is_file())
     limit = max_size_gb * (1024**3)
-
-    if dry_run:
-        logger.info(
-            f"[DRY RUN] Would check archive size limit ({max_size_gb} GB) and remove old files if needed"
-        )
-        return
 
     logger.info(f"Current archive size: {cur_size / (1024**3):.1f} GB")
     if cur_size > limit:
@@ -605,7 +605,7 @@ def run_archiver(args):
         print(
             f"Error: Directory {args.directory} does not exist and /camera is missing"
         )
-        sys.exit(1)
+        return 1  # Return error code instead of sys.exit(1)
 
     out_dir = args.output or (base_dir / "archived")
     trash_root = None
@@ -665,10 +665,13 @@ def run_archiver(args):
 
     if GracefulExit.should_exit():
         logger.info("Archive process was cancelled")
+        return 1  # Return error code for cancelled process
     elif args.dry_run:
         logger.info("[DRY RUN] Done - no files were actually modified")
+        return 0  # Return success code for dry run
     else:
         logger.info("Archive process completed successfully")
+        return 0  # Return success code for normal completion
 
 
 def main():
@@ -710,9 +713,10 @@ def main():
         args = parser.parse_args()
         if len(sys.argv) == 1:
             parser.print_help()
-            sys.exit(0)
+            sys.exit(1)  # Exit with code 1 when no arguments provided
 
-        return run_archiver(args)
+        exit_code = run_archiver(args)
+        sys.exit(exit_code)  # Exit with run_archiver's code, or 0 if None
     except KeyboardInterrupt:
         GracefulExit.request_exit()
         print("\nReceived KeyboardInterrupt, shutting down gracefully...")
@@ -723,6 +727,7 @@ def main():
             raise
         else:
             print("Process was cancelled")
+            sys.exit(1)
 
 
 if __name__ == "__main__":
