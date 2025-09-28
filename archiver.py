@@ -5,7 +5,6 @@ import re
 import subprocess
 import sys
 import time
-import shlex
 from datetime import datetime, timedelta
 from pathlib import Path
 import threading
@@ -73,7 +72,7 @@ class ProgressBar:
         self.start_time = None
         self.file_start = None
         self._progress_line = ""
-        self._last_print_time = time.time()  # Initialize with current time instead of 0
+        self._last_print_time = time.time()
         self._original_signal_handlers = {}
         self._register_cleanup_handlers()
 
@@ -239,46 +238,59 @@ def safe_remove(
 
     if dry_run:
         logger.info(f"[DRY RUN] Would remove {p}")
-    else:
-        try:
-            if source_root is None:
-                source_root = p.parent
+        return
 
-            if use_trash and trash_root:
-                dest_sub = "output" if is_output else "input"
-                rel_path = p.relative_to(source_root) if source_root else Path(p.name)
-                base_dest = trash_root / dest_sub / rel_path
+    try:
+        if source_root is None:
+            source_root = p.parent
 
-                counter = 0
-                new_dest = base_dest
-                while new_dest.exists():
-                    counter += 1
-                    suffix = f"_{int(time.time())}_{counter}"
-                    stem = new_dest.stem + suffix
-                    new_dest = new_dest.parent / (stem + new_dest.suffix)
+        if use_trash and trash_root:
+            dest_sub = "output" if is_output else "input"
+            rel_path = p.relative_to(source_root) if source_root else Path(p.name)
+            base_dest = trash_root / dest_sub / rel_path
 
-                new_dest.parent.mkdir(parents=True, exist_ok=True)
-                shutil.move(str(p), str(new_dest))
-                logger.info(f"Moved to trash: {p} -> {new_dest}")
+            counter = 0
+            new_dest = base_dest
+            while new_dest.exists():
+                counter += 1
+                suffix = f"_{int(time.time())}_{counter}"
+                stem = new_dest.stem + suffix
+                new_dest = new_dest.parent / (stem + new_dest.suffix)
+
+            new_dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(p), str(new_dest))
+            logger.info(f"Moved to trash: {p} -> {new_dest}")
+        else:
+            if p.is_file():
+                p.unlink()
+            elif p.is_dir():
+                p.rmdir()
             else:
-                if p.is_file():
-                    p.unlink()
-                elif p.is_dir():
-                    p.rmdir()
-                else:
-                    logger.warning(f"Unsupported file type for removal: {p}")
-                logger.info(f"Removed: {p}")
-        except Exception as e:
-            logger.error(f"Failed to remove {p}: {e}")
+                logger.warning(f"Unsupported file type for removal: {p}")
+            logger.info(f"Removed: {p}")
+    except Exception as e:
+        logger.error(f"Failed to remove {p}: {e}")
 
 
 def get_video_duration(inp):
     if GracefulExit.should_exit() or not shutil.which("ffprobe"):
         return None
     try:
-        cmd_str = f"ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 {shlex.quote(str(inp))}"
-        out = subprocess.check_output(shlex.split(cmd_str), text=True)
-        return float(out.strip())
+        cmd = [
+            "ffprobe",
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+            str(inp),
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        duration_str = result.stdout.strip()
+        if duration_str and duration_str != "N/A":
+            return float(duration_str)
+        return None
     except Exception:
         return None
 
@@ -287,17 +299,29 @@ def transcode_file(inp, outp, logger, progress_cb=None):
     if GracefulExit.should_exit():
         return False
 
-    cmd_str = (
-        f"ffmpeg -hide_banner -hwaccel qsv -hwaccel_output_format qsv -y "
-        f"-i {shlex.quote(str(inp))} "
-        f"-vf scale_qsv=w=1024:h=768:mode=hq "
-        f"-global_quality 26 -c:v h264_qsv -an "
-        f"{shlex.quote(str(outp))}"
-    )
+    cmd = [
+        "ffmpeg",
+        "-hide_banner",
+        "-hwaccel",
+        "qsv",
+        "-hwaccel_output_format",
+        "qsv",
+        "-y",
+        "-i",
+        str(inp),
+        "-vf",
+        "scale_qsv=w=1024:h=768:mode=hq",
+        "-global_quality",
+        "26",
+        "-c:v",
+        "h264_qsv",
+        "-an",
+        str(outp),
+    ]
     total = get_video_duration(inp)
 
     proc = subprocess.Popen(
-        shlex.split(cmd_str),
+        cmd,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
@@ -346,7 +370,7 @@ def scan_files(base_dir, include_trash=False, trash_root=None):
 
     mp4s = []
     mapping = {}
-    trash_files = set()  # Track trash files separately
+    trash_files = set()
 
     # Scan base directory
     for p in base_dir.rglob("*.*"):
@@ -385,7 +409,7 @@ def scan_files(base_dir, include_trash=False, trash_root=None):
 
                     # Add to mapping and mark as trash
                     mapping.setdefault(key, {})[ext] = p
-                    trash_files.add(p)  # Track this as a trash file
+                    trash_files.add(p)
                     if ext == ".mp4":
                         mp4s.append((p, ts))
 
@@ -404,6 +428,35 @@ def output_path(fp: Path, ts: datetime, out_dir: Path) -> Path:
             / f"{ts.day:02d}"
             / f"archived-{ts.strftime('%Y%m%d%H%M%S')}.mp4"
         )
+
+
+def get_all_archive_files(out_dir, trash_root=None):
+    """Get all archive files including trash if enabled."""
+    archive_files = list(out_dir.rglob("archived-*.mp4")) if out_dir.exists() else []
+
+    if trash_root:
+        trash_output_dir = trash_root / "output"
+        if trash_output_dir.exists():
+            archive_files.extend(list(trash_output_dir.rglob("archived-*.mp4")))
+
+    return archive_files
+
+
+def calculate_total_size(files):
+    """Calculate total size of files, handling potential errors."""
+    total_size = 0
+    valid_files = []
+
+    for file_path in files:
+        if file_path.is_file():
+            try:
+                size = file_path.stat().st_size
+                total_size += size
+                valid_files.append((file_path, size))
+            except (OSError, IOError):
+                pass  # Skip files we can't access
+
+    return total_size, valid_files
 
 
 def intelligent_cleanup(
@@ -425,23 +478,16 @@ def intelligent_cleanup(
     if not old_list:
         return set(), []  # processed_files, files_to_remove
 
-    # Get all files (including trash) and their sizes
+    # Get all archive files
+    archive_files = get_all_archive_files(out_dir, trash_root)
+
+    # Combine archive files and old_list for total size calculation
     all_files = []
-    total_size = 0
-
-    # Include archive files for size calculation
-    archive_files = list(out_dir.rglob("archived-*.mp4")) if out_dir.exists() else []
-    if use_trash and trash_root:
-        trash_output_dir = trash_root / "output"
-        if trash_output_dir.exists():
-            archive_files.extend(list(trash_output_dir.rglob("archived-*.mp4")))
-
     for archive_file in archive_files:
         if archive_file.is_file():
             try:
                 size = archive_file.stat().st_size
-            except (OSError, IOError) as e:
-                logger.warning(f"Could not access file {archive_file}: {e}")
+            except (OSError, IOError):
                 continue
             # Parse timestamp from archive filename
             ts_match = re.search(r"archived-(\d{14})\.mp4$", archive_file.name)
@@ -458,7 +504,6 @@ def intelligent_cleanup(
                             and archive_file.is_relative_to(trash_root),
                         }
                     )
-                    total_size += size
                 except ValueError:
                     pass
 
@@ -479,12 +524,13 @@ def intelligent_cleanup(
                     "is_trash": trash_root and fp.is_relative_to(trash_root),
                 }
             )
-            total_size += size
 
     size_limit = max_size_gb * (1024**3)
     age_cutoff = datetime.now() - timedelta(days=age_days)
 
-    logger.info(f"Current total size: {total_size / (1024**3):.1f} GB")
+    logger.info(
+        f"Current total size: {sum(f['size'] for f in all_files) / (1024**3):.1f} GB"
+    )
     logger.info(f"Size limit: {max_size_gb} GB")
     logger.info(f"Age cutoff: {age_cutoff.strftime('%Y-%m-%d %H:%M:%S')}")
 
@@ -493,7 +539,7 @@ def intelligent_cleanup(
 
     files_to_remove = []
     processed_files = set()
-    remaining_size = total_size
+    remaining_size = sum(f["size"] for f in all_files)
 
     # PHASE 1: Remove files to meet SIZE threshold (priority)
     if remaining_size > size_limit:
@@ -674,7 +720,6 @@ def process_files_intelligent(
 
         # Skip if already in trash but not marked for removal
         if is_trash_file:
-            # logger.info(f"[SKIP] Trash file kept (within thresholds): {fp}")
             bar.update_progress(idx, 100.0)
             continue
 
@@ -827,6 +872,10 @@ def clean_empty_directories(
 def cleanup_archive_size_limit(
     out_dir, logger, max_size_gb, dry_run, use_trash=False, trash_root=None
 ):
+    """
+    Legacy function to maintain compatibility with tests.
+    This is now a wrapper around the intelligent cleanup logic.
+    """
     if GracefulExit.should_exit():
         return
 
@@ -853,23 +902,33 @@ def cleanup_archive_size_limit(
     if not archive_files:
         return
 
-    cur_size = sum(p.stat().st_size for p in archive_files if p.is_file())
+    # Calculate current size
+    total_size = 0
+    valid_files = []
+    for f in archive_files:
+        if f.is_file():
+            try:
+                size = f.stat().st_size
+                total_size += size
+                valid_files.append((f, size))
+            except (OSError, IOError):
+                continue
+
     limit = max_size_gb * (1024**3)
 
     logger.info(
-        f"Current archive size (including trash): {cur_size / (1024**3):.1f} GB"
+        f"Current archive size (including trash): {total_size / (1024**3):.1f} GB"
     )
-    if cur_size > limit:
+    if total_size > limit:
         logger.info(
             f"Archive size exceeds limit ({max_size_gb} GB), removing oldest files..."
         )
         # Sort by modification time (oldest first)
-        for f in sorted(archive_files, key=lambda p: p.stat().st_mtime):
+        for f, size in sorted(valid_files, key=lambda x: x[0].stat().st_mtime):
             if GracefulExit.should_exit():
                 logger.info("Cancellation requested during archive cleanup")
                 break
 
-            sz = f.stat().st_size
             if use_trash and trash_root:
                 # Check if file is in trash already
                 if trash_root in f.parents:
@@ -893,10 +952,10 @@ def cleanup_archive_size_limit(
             else:
                 f.unlink()
                 logger.info(f"Removed old archive: {f}")
-            cur_size -= sz
-            if cur_size <= limit:
+            total_size -= size
+            if total_size <= limit:
                 break
-        logger.info(f"Final archive size: {cur_size / (1024**3):.1f} GB")
+        logger.info(f"Final archive size: {total_size / (1024**3):.1f} GB")
 
 
 def run_archiver(args):
@@ -928,21 +987,6 @@ def run_archiver(args):
     bar = ProgressBar(total_files=len(old_list), silent=args.dry_run, out=sys.stderr)
     logger = setup_logging(base_dir / "transcoding.log", progress_bar=bar)
 
-    # Log how many trash files are included
-    trash_files_count = sum(
-        1
-        for p, t in old_list
-        if any(
-            "_is_trash" in key and mapping[key].get(".mp4") == p
-            for key in mapping
-            if "_is_trash" in key
-        )
-    )
-    if trash_files_count > 0 and not GracefulExit.should_exit():
-        logger.info(
-            f"Including {trash_files_count} trash files in age threshold calculation"
-        )
-
     for msg in [
         "Starting camera archive process...",
         f"Input: {base_dir}",
@@ -966,6 +1010,8 @@ def run_archiver(args):
         use_trash=args.use_trash,
         trash_root=trash_root,
         source_root=base_dir,
+        max_size_gb=args.max_size,
+        age_days=args.age,
     )
 
     if not GracefulExit.should_exit():
@@ -1034,13 +1080,18 @@ def main():
         parser.add_argument(
             "--trashdir", type=Path, help="Specify custom trash directory"
         )
+        parser.add_argument(
+            "--cleanup",
+            action="store_true",
+            help="Skip transcoding and only perform cleanup (orphaned JPGs, empty dirs, size/age limits)",
+        )
         args = parser.parse_args()
         if len(sys.argv) == 1:
             parser.print_help()
-            sys.exit(1)  # Exit with code 1 when no arguments provided
+            sys.exit(1)
 
         exit_code = run_archiver(args)
-        sys.exit(exit_code)  # Exit with run_archiver's code, or 0 if None
+        sys.exit(exit_code)
     except KeyboardInterrupt:
         GracefulExit.request_exit()
         print("\nReceived KeyboardInterrupt, shutting down gracefully...")
