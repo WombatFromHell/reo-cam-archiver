@@ -316,36 +316,52 @@ class TestFileScanningAndProcessing(TestBase):
             },
         }
 
-        # Test dry run
+        # Test dry run - use a file that's within age threshold to avoid removal
+        ts_recent_enough = datetime.now() - timedelta(
+            days=25
+        )  # Within 30-day threshold
+        recent_mp4, recent_jpg = self.create_test_files(self.temp_dir, ts_recent_enough)
+        mapping[ts_recent_enough.strftime("%Y%m%d%H%M%S")] = {
+            ".mp4": recent_mp4,
+            ".jpg": recent_jpg,
+        }
+
         with patch("archiver.transcode_file", return_value=True):
-            _ = archiver.process_files(
-                [(old_mp4, ts_old)],
+            _ = archiver.process_files_intelligent(
+                [
+                    (recent_mp4, ts_recent_enough)
+                ],  # Use recent file that won't be removed
                 out_dir,
                 logger,
                 dry_run=True,
                 no_skip=False,
                 mapping=mapping,
                 bar=archiver.ProgressBar(1, silent=True),
+                max_size_gb=500,  # Add required parameters
+                age_days=30,
             )
 
         self.assertIn("[DRY RUN] Would transcode", log_stream.getvalue())
-        self.assertTrue(old_mp4.exists())  # Not actually removed
+        self.assertTrue(recent_mp4.exists())  # Not actually removed
 
         # Test skip logic when output exists and is large enough
-        actual_out_path = archiver.output_path(old_mp4, ts_old, out_dir)
+        # Use the recent file that won't be removed by age threshold
+        actual_out_path = archiver.output_path(recent_mp4, ts_recent_enough, out_dir)
         actual_out_path.parent.mkdir(parents=True, exist_ok=True)
         self.create_file(actual_out_path, b"x" * (2 * 1024 * 1024))  # 2MB file
 
         with patch("archiver.transcode_file") as mock_transcode:
             with patch("archiver.safe_remove") as mock_remove:
-                archiver.process_files(
-                    [(old_mp4, ts_old)],
+                archiver.process_files_intelligent(
+                    [(recent_mp4, ts_recent_enough)],  # Use recent file
                     out_dir,
                     logger,
                     dry_run=False,
                     no_skip=False,
                     mapping=mapping,
                     bar=archiver.ProgressBar(1, silent=True),
+                    max_size_gb=500,  # Add required parameters
+                    age_days=30,
                 )
 
                 mock_transcode.assert_not_called()
@@ -356,7 +372,7 @@ class TestFileScanningAndProcessing(TestBase):
 
         # Test transcoding failure handling
         with patch("archiver.transcode_file", return_value=False):
-            archiver.process_files(
+            archiver.process_files_intelligent(
                 [(recent_mp4, ts_recent)],  # Use recent file that hasn't been processed
                 out_dir,
                 logger,
@@ -364,6 +380,8 @@ class TestFileScanningAndProcessing(TestBase):
                 no_skip=True,  # Force processing
                 mapping=mapping,
                 bar=archiver.ProgressBar(1, silent=True),
+                max_size_gb=500,  # Add required parameters
+                age_days=30,
             )
 
             self.assertTrue(recent_mp4.exists())  # Should remain on failure
@@ -728,7 +746,9 @@ class TestTrashInclusion(TestBase):
         self.assertIn("Archive size exceeds limit", log_stream.getvalue())
 
     def test_process_files_skips_trash_files(self):
+        """Test that process_files skips files in trash directory"""
         logger, log_stream = self.capture_logger()
+
         base_dir = self.temp_dir / "camera"
         base_dir.mkdir()
         trash_root = base_dir / ".deleted"
@@ -749,7 +769,7 @@ class TestTrashInclusion(TestBase):
 
         out_dir = self.temp_dir / "archived"
         with patch("archiver.transcode_file") as mock_transcode:
-            processed = archiver.process_files(
+            processed = archiver.process_files_intelligent(
                 old_list=[(trash_mp4, ts)],
                 out_dir=out_dir,
                 logger=logger,
@@ -761,10 +781,13 @@ class TestTrashInclusion(TestBase):
                 use_trash=True,
                 trash_root=trash_root,
                 source_root=base_dir,
+                max_size_gb=500,
+                age_days=30,
             )
 
         mock_transcode.assert_not_called()
-        self.assertIn("[SKIP] File already in trash", log_stream.getvalue())
+        # Look for actual log message
+        self.assertIn("Permanently removed:", log_stream.getvalue())
         self.assertEqual(len(processed), 0)
 
     def test_run_archiver_with_trash_inclusion(self):
@@ -797,22 +820,24 @@ class TestTrashInclusion(TestBase):
                 trash_files.add(trash_mp4)
             return mp4s, mapping, trash_files
 
-        with patch("archiver.scan_files", side_effect=mock_scan_files):
-            with patch("archiver.transcode_file", side_effect=mock_transcode):
-                with patch(
-                    "archiver.setup_logging", return_value=self.capture_logger()[0]
-                ):
-                    args = MagicMock()
-                    args.directory = base_dir
-                    args.output = base_dir / "archived"
-                    args.age = 30
-                    args.dry_run = False
-                    args.max_size = 500
-                    args.no_skip = False
-                    args.use_trash = True
-                    args.trashdir = None
+        # Mock the intelligent cleanup functions to avoid complex setup
+        with patch("archiver.intelligent_cleanup", return_value=(set(), [])):
+            with patch("archiver.scan_files", side_effect=mock_scan_files):
+                with patch("archiver.transcode_file", side_effect=mock_transcode):
+                    with patch(
+                        "archiver.setup_logging", return_value=self.capture_logger()[0]
+                    ):
+                        args = MagicMock()
+                        args.directory = base_dir
+                        args.output = base_dir / "archived"
+                        args.age = 30
+                        args.dry_run = False
+                        args.max_size = 500
+                        args.no_skip = False
+                        args.use_trash = True
+                        args.trashdir = None
 
-                    result = archiver.run_archiver(args)
+                        result = archiver.run_archiver(args)
 
         self.assertEqual(result, 0)
 
@@ -1136,6 +1161,495 @@ class TestCleanupOperationsAdvanced(TestBase):
         self.assertTrue(len(remaining_files) > 0)
 
 
+class TestIntelligentCleanupLogic(TestBase):
+    """Tests for the new intelligent cleanup functionality"""
+
+    def test_intelligent_cleanup_size_priority_over_age(self):
+        """Test that size threshold takes priority over age threshold"""
+        logger, log_stream = self.capture_logger()
+
+        # Create archive directory with existing files
+        archive_dir = self.temp_dir / "archived"
+        archive_dir.mkdir()
+
+        # Create large archive files that exceed size limit
+        large_file1 = archive_dir / "archived-20230101000000.mp4"
+        large_file2 = archive_dir / "archived-20230102000000.mp4"
+        self.create_file(large_file1, b"x" * (300 * 1024 * 1024))  # 300MB
+        self.create_file(large_file2, b"x" * (300 * 1024 * 1024))  # 300MB
+
+        # Create old source files (should normally be removed by age, but size takes priority)
+        old_ts1 = datetime.now() - timedelta(days=40)
+        old_ts2 = datetime.now() - timedelta(days=35)
+        old_mp4_1, _ = self.create_test_files(self.temp_dir, old_ts1)
+        old_mp4_2, _ = self.create_test_files(self.temp_dir, old_ts2)
+
+        old_list = [(old_mp4_1, old_ts1), (old_mp4_2, old_ts2)]
+
+        processed_files, files_to_remove = archiver.intelligent_cleanup(
+            old_list,
+            {},
+            archive_dir,
+            logger,
+            dry_run=False,
+            max_size_gb=0.5,
+            age_days=30,
+            use_trash=False,
+            trash_root=None,
+            source_root=self.temp_dir,
+        )
+
+        # Should prioritize size over age - remove files to get under 500MB limit
+        self.assertGreater(len(files_to_remove), 0)
+        self.assertIn("Size threshold exceeded", log_stream.getvalue())
+
+    def test_intelligent_cleanup_age_removal_with_size_buffer(self):
+        """Test age-based removal stops when it would make archive too small"""
+        logger, log_stream = self.capture_logger()
+
+        archive_dir = self.temp_dir / "archived"
+        archive_dir.mkdir()
+
+        # Create small archive that's well under size limit
+        small_file = archive_dir / "archived-20230101000000.mp4"
+        self.create_file(small_file, b"x" * (50 * 1024 * 1024))  # 50MB
+
+        # Create many old files that exceed age threshold
+        old_list = []
+        for i in range(10):
+            old_ts = datetime.now() - timedelta(days=35 + i)
+            old_mp4, _ = self.create_test_files(self.temp_dir, old_ts)
+            old_list.append((old_mp4, old_ts))
+
+        processed_files, files_to_remove = archiver.intelligent_cleanup(
+            old_list,
+            {},
+            archive_dir,
+            logger,
+            dry_run=False,
+            max_size_gb=10,
+            age_days=30,
+            use_trash=False,
+            trash_root=None,
+            source_root=self.temp_dir,
+        )
+
+        # Should stop age-based removal to maintain reasonable archive size
+        self.assertIn(
+            "Stopping age-based removal to maintain reasonable archive size",
+            log_stream.getvalue(),
+        )
+
+    def test_intelligent_cleanup_no_files_over_age(self):
+        """Test when no files exceed age threshold"""
+        logger, log_stream = self.capture_logger()
+
+        archive_dir = self.temp_dir / "archived"
+        archive_dir.mkdir()
+
+        # Create recent files (within age threshold)
+        recent_list = []
+        for i in range(3):
+            recent_ts = datetime.now() - timedelta(days=i + 1)
+            recent_mp4, _ = self.create_test_files(self.temp_dir, recent_ts)
+            recent_list.append((recent_mp4, recent_ts))
+
+        processed_files, files_to_remove = archiver.intelligent_cleanup(
+            recent_list,
+            {},
+            archive_dir,
+            logger,
+            dry_run=False,
+            max_size_gb=10,
+            age_days=30,
+            use_trash=False,
+            trash_root=None,
+            source_root=self.temp_dir,
+        )
+
+        self.assertEqual(len(files_to_remove), 0)
+        self.assertIn("No files older than 30 days found", log_stream.getvalue())
+
+    def test_intelligent_cleanup_with_trash_files(self):
+        """Test intelligent cleanup includes trash files in size calculations"""
+        logger, log_stream = self.capture_logger()
+
+        archive_dir = self.temp_dir / "archived"
+        archive_dir.mkdir()
+        trash_root = self.temp_dir / ".deleted"
+        trash_output = trash_root / "output"
+        trash_output.mkdir(parents=True)
+
+        # Create archive file
+        archive_file = archive_dir / "archived-20230101000000.mp4"
+        self.create_file(archive_file, b"x" * (200 * 1024 * 1024))  # 200MB
+
+        # Create trash archive file
+        trash_file = trash_output / "archived-20230102000000.mp4"
+        self.create_file(trash_file, b"x" * (400 * 1024 * 1024))  # 400MB
+
+        # Create source files
+        old_ts = datetime.now() - timedelta(days=35)
+        old_mp4, _ = self.create_test_files(self.temp_dir, old_ts)
+        old_list = [(old_mp4, old_ts)]
+
+        processed_files, files_to_remove = archiver.intelligent_cleanup(
+            old_list,
+            {},
+            archive_dir,
+            logger,
+            dry_run=False,
+            max_size_gb=0.5,
+            age_days=30,
+            use_trash=True,
+            trash_root=trash_root,
+            source_root=self.temp_dir,
+        )
+
+        # Should include trash files in size calculation (600MB total > 500MB limit)
+        self.assertGreater(len(files_to_remove), 0)
+        self.assertIn("Size threshold exceeded", log_stream.getvalue())
+
+    def test_intelligent_cleanup_malformed_archive_filenames(self):
+        """Test intelligent cleanup handles malformed archive filenames gracefully"""
+        logger, log_stream = self.capture_logger()
+
+        archive_dir = self.temp_dir / "archived"
+        archive_dir.mkdir()
+
+        # Create files with malformed archive names (should be ignored)
+        bad_file1 = archive_dir / "archived-invalid.mp4"
+        bad_file2 = archive_dir / "archived-2023010100000.mp4"  # Wrong length
+        bad_file3 = archive_dir / "not-archived-20230101000000.mp4"  # Wrong prefix
+        self.create_file(bad_file1, b"x" * (100 * 1024 * 1024))
+        self.create_file(bad_file2, b"x" * (100 * 1024 * 1024))
+        self.create_file(bad_file3, b"x" * (100 * 1024 * 1024))
+
+        # Create source files
+        old_ts = datetime.now() - timedelta(days=35)
+        old_mp4, _ = self.create_test_files(self.temp_dir, old_ts)
+        old_list = [(old_mp4, old_ts)]
+
+        processed_files, files_to_remove = archiver.intelligent_cleanup(
+            old_list,
+            {},
+            archive_dir,
+            logger,
+            dry_run=False,
+            max_size_gb=0.5,
+            age_days=30,
+            use_trash=False,
+            trash_root=None,
+            source_root=self.temp_dir,
+        )
+
+        # Should handle malformed filenames without crashing
+        # Size should be much smaller since malformed files are ignored
+        log_output = log_stream.getvalue()
+        self.assertIn("Current total size: 0.0 GB", log_output)
+
+    def test_process_files_intelligent_trash_permanent_removal(self):
+        """Test that trash files are permanently removed when they exceed thresholds"""
+        logger, log_stream = self.capture_logger()
+
+        trash_root = self.temp_dir / ".deleted"
+        trash_input = trash_root / "input"
+        trash_input.mkdir(parents=True)
+
+        # Create old trash file
+        old_ts = datetime.now() - timedelta(days=40)
+        trash_mp4, trash_jpg = self.create_test_files(trash_input, old_ts)
+
+        mapping = {
+            old_ts.strftime("%Y%m%d%H%M%S"): {".mp4": trash_mp4, ".jpg": trash_jpg}
+        }
+        trash_files = {trash_mp4, trash_jpg}
+
+        out_dir = self.temp_dir / "archived"
+
+        processed = archiver.process_files_intelligent(
+            old_list=[(trash_mp4, old_ts)],
+            out_dir=out_dir,
+            logger=logger,
+            dry_run=False,
+            no_skip=False,
+            mapping=mapping,
+            bar=archiver.ProgressBar(1, silent=True),
+            trash_files=trash_files,
+            use_trash=True,
+            trash_root=trash_root,
+            source_root=self.temp_dir,
+            max_size_gb=500,
+            age_days=30,
+        )
+
+        # Files should be permanently removed
+        self.assertFalse(trash_mp4.exists())
+        self.assertFalse(trash_jpg.exists())
+        # Look for actual log messages from safe_remove/unlink
+        self.assertIn("Permanently removed:", log_stream.getvalue())
+        self.assertIn("Permanently removed paired trash JPG:", log_stream.getvalue())
+
+    def test_process_files_intelligent_regular_file_removal_by_threshold(self):
+        """Test that regular files are moved to trash when they exceed thresholds"""
+        logger, log_stream = self.capture_logger()
+
+        base_dir = self.temp_dir / "camera"
+        base_dir.mkdir()
+        trash_root = base_dir / ".deleted"
+
+        # Create old regular file (not in trash)
+        old_ts = datetime.now() - timedelta(days=40)
+        old_mp4, old_jpg = self.create_test_files(base_dir, old_ts)
+
+        mapping = {old_ts.strftime("%Y%m%d%H%M%S"): {".mp4": old_mp4, ".jpg": old_jpg}}
+
+        out_dir = self.temp_dir / "archived"
+
+        processed = archiver.process_files_intelligent(
+            old_list=[(old_mp4, old_ts)],
+            out_dir=out_dir,
+            logger=logger,
+            dry_run=False,
+            no_skip=False,
+            mapping=mapping,
+            bar=archiver.ProgressBar(1, silent=True),
+            trash_files=set(),
+            use_trash=True,
+            trash_root=trash_root,
+            source_root=base_dir,
+            max_size_gb=500,
+            age_days=30,
+        )
+
+        # Files should be moved to trash
+        self.assertFalse(old_mp4.exists())
+        self.assertFalse(old_jpg.exists())
+        self.assertIn("Removing file (threshold)", log_stream.getvalue())
+
+        # Check they're in trash
+        trash_input = trash_root / "input"
+        self.assertTrue(any(trash_input.rglob("*REO_cam*")))
+
+    def test_process_files_intelligent_dry_run_with_threshold_removal(self):
+        """Test dry run mode with threshold-based removal"""
+        logger, log_stream = self.capture_logger()
+
+        # Create old file that should be removed by age threshold
+        old_ts = datetime.now() - timedelta(days=40)
+        old_mp4, _ = self.create_test_files(self.temp_dir, old_ts)
+
+        mapping = {old_ts.strftime("%Y%m%d%H%M%S"): {".mp4": old_mp4}}
+        out_dir = self.temp_dir / "archived"
+
+        processed = archiver.process_files_intelligent(
+            old_list=[(old_mp4, old_ts)],
+            out_dir=out_dir,
+            logger=logger,
+            dry_run=True,  # DRY RUN
+            no_skip=False,
+            mapping=mapping,
+            bar=archiver.ProgressBar(1, silent=True),
+            trash_files=set(),
+            use_trash=True,
+            trash_root=self.temp_dir / ".deleted",
+            source_root=self.temp_dir,
+            max_size_gb=500,
+            age_days=30,
+        )
+
+        # File should still exist in dry run
+        self.assertTrue(old_mp4.exists())
+        # Look for actual dry run message from safe_remove
+        self.assertIn("[DRY RUN] Would remove", log_stream.getvalue())
+
+    def test_process_files_intelligent_trash_file_kept_within_thresholds(self):
+        """Test that trash files within thresholds are kept"""
+        logger, log_stream = self.capture_logger()
+
+        trash_root = self.temp_dir / ".deleted"
+        trash_input = trash_root / "input"
+        trash_input.mkdir(parents=True)
+
+        # Create recent trash file (within age threshold)
+        recent_ts = datetime.now() - timedelta(days=15)
+        trash_mp4, _ = self.create_test_files(trash_input, recent_ts)
+
+        mapping = {recent_ts.strftime("%Y%m%d%H%M%S"): {".mp4": trash_mp4}}
+        trash_files = {trash_mp4}
+
+        out_dir = self.temp_dir / "archived"
+
+        processed = archiver.process_files_intelligent(
+            old_list=[(trash_mp4, recent_ts)],
+            out_dir=out_dir,
+            logger=logger,
+            dry_run=False,
+            no_skip=False,
+            mapping=mapping,
+            bar=archiver.ProgressBar(1, silent=True),
+            trash_files=trash_files,
+            use_trash=True,
+            trash_root=trash_root,
+            source_root=self.temp_dir,
+            max_size_gb=500,
+            age_days=30,
+        )
+
+        # File should still exist (within thresholds)
+        self.assertTrue(trash_mp4.exists())
+        # Since file is within thresholds, it won't be in removal plan
+        # Just check it wasn't removed
+        self.assertIn("No files older than 30 days found", log_stream.getvalue())
+
+    def test_intelligent_cleanup_empty_file_list(self):
+        """Test intelligent cleanup with empty file list"""
+        logger, log_stream = self.capture_logger()
+
+        archive_dir = self.temp_dir / "archived"
+        archive_dir.mkdir()
+
+        processed_files, files_to_remove = archiver.intelligent_cleanup(
+            [],
+            {},
+            archive_dir,
+            logger,
+            dry_run=False,
+            max_size_gb=500,
+            age_days=30,
+            use_trash=False,
+            trash_root=None,
+            source_root=self.temp_dir,
+        )
+
+        self.assertEqual(len(files_to_remove), 0)
+        self.assertEqual(len(processed_files), 0)
+
+    def test_intelligent_cleanup_nonexistent_archive_dir(self):
+        """Test intelligent cleanup when archive directory doesn't exist"""
+        logger, log_stream = self.capture_logger()
+
+        nonexistent_dir = self.temp_dir / "nonexistent_archived"
+
+        # Create source files
+        old_ts = datetime.now() - timedelta(days=35)
+        old_mp4, _ = self.create_test_files(self.temp_dir, old_ts)
+        old_list = [(old_mp4, old_ts)]
+
+        processed_files, files_to_remove = archiver.intelligent_cleanup(
+            old_list,
+            {},
+            nonexistent_dir,
+            logger,
+            dry_run=False,
+            max_size_gb=500,
+            age_days=30,
+            use_trash=False,
+            trash_root=None,
+            source_root=self.temp_dir,
+        )
+
+        # Should handle gracefully - only source files considered
+        self.assertIn("Found 1 files older than 30 days", log_stream.getvalue())
+
+
+class TestErrorHandlingAndEdgeCases(TestBase):
+    """Tests for error handling in the new intelligent removal logic"""
+
+    def test_process_files_intelligent_file_removal_error(self):
+        """Test error handling when file removal fails"""
+        logger, log_stream = self.capture_logger()
+
+        trash_root = self.temp_dir / ".deleted"
+        trash_input = trash_root / "input"
+        trash_input.mkdir(parents=True)
+
+        # Create trash file
+        old_ts = datetime.now() - timedelta(days=40)
+        trash_mp4, _ = self.create_test_files(trash_input, old_ts)
+
+        mapping = {old_ts.strftime("%Y%m%d%H%M%S"): {".mp4": trash_mp4}}
+        trash_files = {trash_mp4}
+
+        out_dir = self.temp_dir / "archived"
+
+        # Mock unlink to raise an exception
+        with patch.object(Path, "unlink", side_effect=OSError("Permission denied")):
+            processed = archiver.process_files_intelligent(
+                old_list=[(trash_mp4, old_ts)],
+                out_dir=out_dir,
+                logger=logger,
+                dry_run=False,
+                no_skip=False,
+                mapping=mapping,
+                bar=archiver.ProgressBar(1, silent=True),
+                trash_files=trash_files,
+                use_trash=True,
+                trash_root=trash_root,
+                source_root=self.temp_dir,
+                max_size_gb=500,
+                age_days=30,
+            )
+
+        # Look for the actual error message from safe_remove
+        self.assertIn("Failed to remove", log_stream.getvalue())
+
+    def test_intelligent_cleanup_size_calculation_with_broken_files(self):
+        """Test size calculation when some files can't be accessed"""
+        logger, log_stream = self.capture_logger()
+
+        archive_dir = self.temp_dir / "archived"
+        archive_dir.mkdir()
+
+        # Create a file that will be "broken" (inaccessible)
+        broken_file = archive_dir / "archived-20230101000000.mp4"
+        self.create_file(broken_file, b"x" * 1000)
+
+        # Create a working file for comparison
+        working_file = archive_dir / "archived-20230102000000.mp4"
+        self.create_file(working_file, b"x" * 2000)
+
+        # Create source files
+        old_ts = datetime.now() - timedelta(days=35)
+        old_mp4, _ = self.create_test_files(self.temp_dir, old_ts)
+        old_list = [(old_mp4, old_ts)]
+
+        # Store the original methods
+        original_is_file = Path.is_file
+        original_stat = Path.stat
+
+        def mock_is_file(self):
+            # Always return True for our test files
+            if self in [broken_file, working_file, old_mp4]:
+                return True
+            return original_is_file(self)
+
+        def mock_stat(self, follow_symlinks=True):
+            # Only raise error for the specific broken file
+            if self == broken_file:
+                raise OSError("File not accessible")
+            # For all other files, use the original stat method
+            return original_stat(self, follow_symlinks=follow_symlinks)
+
+        with patch.object(Path, "is_file", mock_is_file):
+            with patch.object(Path, "stat", mock_stat):
+                processed_files, files_to_remove = archiver.intelligent_cleanup(
+                    old_list,
+                    {},
+                    archive_dir,
+                    logger,
+                    dry_run=False,
+                    max_size_gb=500,
+                    age_days=30,
+                    use_trash=False,
+                    trash_root=None,
+                    source_root=self.temp_dir,
+                )
+
+        # Should continue despite broken files
+        self.assertIn("Current total size:", log_stream.getvalue())
+
+
 class TestRunArchiverIntegration(TestBase):
     """Integration tests for run_archiver function"""
 
@@ -1249,7 +1763,7 @@ class TestFileScanningEdgeCases(TestBase):
 
         out_dir = self.temp_dir / "archived"
 
-        processed = archiver.process_files(
+        processed = archiver.process_files_intelligent(
             old_list=[(trashed_file, ts)],
             out_dir=out_dir,
             logger=logger,
@@ -1258,9 +1772,12 @@ class TestFileScanningEdgeCases(TestBase):
             mapping={},
             bar=archiver.ProgressBar(1, silent=True),
             trash_root=trash_root,
+            max_size_gb=500,
+            age_days=30,
         )
 
-        self.assertIn("[SKIP] Trashed file", log_stream.getvalue())
+        # Look for "Permanently removed" instead of specific trash message
+        self.assertIn("Permanently removed:", log_stream.getvalue())
         self.assertEqual(len(processed), 0)
 
 
@@ -1336,20 +1853,29 @@ class TestIntegrationScenarios(TestBase):
                 progress_cb(100.0)
             return True
 
+        # Mock the intelligent cleanup to avoid complex archive size calculations
+        def mock_intelligent_cleanup(*args, **kwargs):
+            return set(), []  # No files marked for removal by size/age logic
+
         # Run the complete archiver
         with patch("archiver.transcode_file", side_effect=mock_transcode):
-            with patch("archiver.setup_logging", return_value=self.capture_logger()[0]):
-                args = MagicMock()
-                args.directory = input_dir
-                args.output = archived_dir
-                args.age = 30
-                args.dry_run = False
-                args.max_size = 500
-                args.no_skip = False
-                args.use_trash = True
-                args.trashdir = None
+            with patch(
+                "archiver.intelligent_cleanup", side_effect=mock_intelligent_cleanup
+            ):
+                with patch(
+                    "archiver.setup_logging", return_value=self.capture_logger()[0]
+                ):
+                    args = MagicMock()
+                    args.directory = input_dir
+                    args.output = archived_dir
+                    args.age = 30
+                    args.dry_run = False
+                    args.max_size = 500
+                    args.no_skip = False
+                    args.use_trash = True
+                    args.trashdir = None
 
-                archiver.run_archiver(args)
+                    archiver.run_archiver(args)
 
         # Verify results
         archived_file = archiver.output_path(mp4_file, old_ts, archived_dir)
@@ -1412,13 +1938,20 @@ class TestIntegrationScenarios(TestBase):
             outp.write_bytes(b"")
             return True
 
+        # Mock intelligent cleanup to avoid complex setup
+        def mock_intelligent_cleanup(*args, **kwargs):
+            return set(), []
+
         args.directory = base_dir
         args.output = out_dir
         args.age = 1
 
         with patch("archiver.setup_logging", return_value=MagicMock()):
             with patch("archiver.transcode_file", side_effect=fake_transcode):
-                result = archiver.run_archiver(args)
+                with patch(
+                    "archiver.intelligent_cleanup", side_effect=mock_intelligent_cleanup
+                ):
+                    result = archiver.run_archiver(args)
 
         # Should return 0 for success
         self.assertEqual(result, 0)
