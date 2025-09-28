@@ -340,17 +340,20 @@ def transcode_file(inp, outp, logger, progress_cb=None):
     return rc == 0 and not GracefulExit.should_exit()
 
 
-def scan_files(base_dir):
+def scan_files(base_dir, include_trash=False, trash_root=None):
     if GracefulExit.should_exit():
-        return [], {}
+        return [], {}, set()
 
     mp4s = []
     mapping = {}
+    trash_files = set()  # Track trash files separately
+
+    # Scan base directory
     for p in base_dir.rglob("*.*"):
         if GracefulExit.should_exit():
             break
 
-        if ".deleted" in p.parts or not p.is_file():
+        if not p.is_file():
             continue
 
         ts = parse_timestamp_from_filename(p.name)
@@ -361,7 +364,32 @@ def scan_files(base_dir):
         mapping.setdefault(key, {})[ext] = p
         if ext == ".mp4":
             mp4s.append((p, ts))
-    return mp4s, mapping
+
+    # Scan trash directory if enabled
+    if include_trash and trash_root and trash_root.exists():
+        for trash_type in ["input", "output"]:
+            trash_dir = trash_root / trash_type
+            if trash_dir.exists():
+                for p in trash_dir.rglob("*.*"):
+                    if GracefulExit.should_exit():
+                        break
+
+                    if not p.is_file():
+                        continue
+
+                    ts = parse_timestamp_from_filename(p.name)
+                    if not ts:
+                        continue
+                    key = ts.strftime("%Y%m%d%H%M%S")
+                    ext = p.suffix.lower()
+
+                    # Add to mapping and mark as trash
+                    mapping.setdefault(key, {})[ext] = p
+                    trash_files.add(p)  # Track this as a trash file
+                    if ext == ".mp4":
+                        mp4s.append((p, ts))
+
+    return mp4s, mapping, trash_files
 
 
 def output_path(fp: Path, ts: datetime, out_dir: Path) -> Path:
@@ -386,10 +414,14 @@ def process_files(
     no_skip,
     mapping,
     bar,
+    trash_files=None,  # Add trash_files parameter
     use_trash=False,
     trash_root=None,
     source_root: Path | None = None,
 ):
+    if trash_files is None:
+        trash_files = set()
+
     logger.info(f"Found {len(old_list)} files to process")
     if not old_list or GracefulExit.should_exit():
         logger.info("No files to process or cancellation requested")
@@ -402,6 +434,12 @@ def process_files(
         if GracefulExit.should_exit():
             logger.info("Cancellation requested, stopping file processing...")
             break
+
+        # Skip processing if file is already in trash (we're just including it for size calculations)
+        if fp in trash_files:
+            logger.info(f"[SKIP] File already in trash: {fp}")
+            bar.update_progress(idx, 100.0)
+            continue
 
         if trash_root and fp.is_relative_to(trash_root):
             logger.info(f"[SKIP] Trashed file {fp} – not transcoded")
@@ -564,18 +602,34 @@ def cleanup_archive_size_limit(
         )
         return
 
+    # Get archive files
     archive_files = list(out_dir.rglob("archived-*.mp4"))
+
+    # Include trash output files if use_trash is enabled
+    if use_trash and trash_root:
+        trash_output_dir = trash_root / "output"
+        if trash_output_dir.exists():
+            trash_files = list(trash_output_dir.rglob("archived-*.mp4"))
+            archive_files.extend(trash_files)
+            if trash_files and not GracefulExit.should_exit():
+                logger.info(
+                    f"Including {len(trash_files)} trash files in size calculation"
+                )
+
     if not archive_files:
         return
 
     cur_size = sum(p.stat().st_size for p in archive_files if p.is_file())
     limit = max_size_gb * (1024**3)
 
-    logger.info(f"Current archive size: {cur_size / (1024**3):.1f} GB")
+    logger.info(
+        f"Current archive size (including trash): {cur_size / (1024**3):.1f} GB"
+    )
     if cur_size > limit:
         logger.info(
             f"Archive size exceeds limit ({max_size_gb} GB), removing oldest files..."
         )
+        # Sort by modification time (oldest first)
         for f in sorted(archive_files, key=lambda p: p.stat().st_mtime):
             if GracefulExit.should_exit():
                 logger.info("Cancellation requested during archive cleanup")
@@ -583,19 +637,31 @@ def cleanup_archive_size_limit(
 
             sz = f.stat().st_size
             if use_trash and trash_root:
-                safe_remove(
-                    f,
-                    logger,
-                    dry_run=False,
-                    use_trash=True,
-                    trash_root=trash_root,
-                    is_output=True,
-                    source_root=out_dir,
-                )
+                # Check if file is in trash already
+                if trash_root in f.parents:
+                    # Permanently remove from trash
+                    try:
+                        f.unlink()
+                        logger.info(f"Permanently removed from trash: {f}")
+                    except Exception as e:
+                        logger.error(f"Failed to remove from trash: {f}: {e}")
+                else:
+                    # Move to trash
+                    safe_remove(
+                        f,
+                        logger,
+                        dry_run=False,
+                        use_trash=True,
+                        trash_root=trash_root,
+                        is_output=True,
+                        source_root=out_dir,
+                    )
             else:
                 f.unlink()
+                logger.info(f"Removed old archive: {f}")
             cur_size -= sz
-            logger.info(f"Removed old archive: {f}")
+            if cur_size <= limit:
+                break
         logger.info(f"Final archive size: {cur_size / (1024**3):.1f} GB")
 
 
@@ -617,11 +683,31 @@ def run_archiver(args):
     if trash_root is not None:
         trash_root.mkdir(parents=True, exist_ok=True)
 
-    mp4s, mapping = scan_files(base_dir)
+    # Include trash files in scan when use_trash is enabled
+    mp4s, mapping, trash_files = scan_files(
+        base_dir, include_trash=args.use_trash, trash_root=trash_root
+    )
     cutoff = datetime.now() - timedelta(days=args.age)
     old_list = [(p, t) for p, t in mp4s if t < cutoff]
+
+    # Create progress bar and logger
     bar = ProgressBar(total_files=len(old_list), silent=args.dry_run, out=sys.stderr)
     logger = setup_logging(base_dir / "transcoding.log", progress_bar=bar)
+
+    # Log how many trash files are included
+    trash_files_count = sum(
+        1
+        for p, t in old_list
+        if any(
+            "_is_trash" in key and mapping[key].get(".mp4") == p
+            for key in mapping
+            if "_is_trash" in key
+        )
+    )
+    if trash_files_count > 0 and not GracefulExit.should_exit():
+        logger.info(
+            f"Including {trash_files_count} trash files in age threshold calculation"
+        )
 
     for msg in [
         "Starting camera archive process...",
@@ -652,8 +738,12 @@ def run_archiver(args):
         remove_orphaned_jpgs(
             mapping, processed, logger, args.dry_run, args.use_trash, trash_root
         )
-        clean_empty_directories(base_dir, logger, is_output=False)
-        clean_empty_directories(out_dir, logger, is_output=True)
+        clean_empty_directories(
+            base_dir, logger, args.use_trash, trash_root, is_output=False
+        )
+        clean_empty_directories(
+            out_dir, logger, args.use_trash, trash_root, is_output=True
+        )
         cleanup_archive_size_limit(
             out_dir,
             logger,

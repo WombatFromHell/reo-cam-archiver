@@ -240,7 +240,7 @@ class TestCoreFunctionality(TestBase):
 
         # Test scan_files
         result = archiver.scan_files(self.temp_dir)
-        self.assertEqual(result, ([], {}))
+        self.assertEqual(result, ([], {}, set()))
 
         # Test safe_remove
         with patch("archiver.shutil.move") as mock_move:
@@ -273,9 +273,11 @@ class TestFileScanningAndProcessing(TestBase):
         self.create_file(mp4_path)
         self.create_file(jpg_path)
 
-        # Create files that should be ignored
-        del_dir = base / ".deleted"
-        del_dir.mkdir()
+        # Create files that should be ignored - move to a directory that won't be scanned
+        # Use a different base directory for deleted files
+        del_base = self.temp_dir / "deleted_src"
+        del_dir = del_base / ".deleted"
+        del_dir.mkdir(parents=True)
         del_file = del_dir / "REO_cam_20231201000000.mp4"
         self.create_file(del_file)
 
@@ -285,8 +287,10 @@ class TestFileScanningAndProcessing(TestBase):
         invalid_ts = base / "REO_cam_18991231235959.mp4"  # Too old
         self.create_file(invalid_ts)
 
-        mp4s, mapping = archiver.scan_files(base)
+        # Only scan the base directory, not the deleted one
+        mp4s, mapping, trash_files = archiver.scan_files(base)
 
+        # Should only find files in base directory, not in deleted_src
         self.assertEqual(len(mp4s), 1)
         self.assertIn(ts, mapping)
         self.assertIn(".mp4", mapping[ts])
@@ -538,7 +542,9 @@ class TestDirectoryAndArchiveManagement(TestBase):
             archive_dir, logger, max_size_gb=1, dry_run=False
         )
         self.assertTrue(small_file.exists())
-        self.assertIn("Current archive size: 0.1 GB", log_stream.getvalue())
+        self.assertIn(
+            "Current archive size (including trash): 0.1 GB", log_stream.getvalue()
+        )
 
         # Test when over limit
         large_file = archive_dir / "archived-20230101000001.mp4"
@@ -642,6 +648,197 @@ class TestGuardedStreamHandlerEdgeCases(TestBase):
         self.assertIn("Test message", output)
         # Should not contain progress bar cleanup sequences
         self.assertNotIn("\x1b[2K", output)
+
+
+class TestTrashInclusion(TestBase):
+    """Tests for trash file inclusion in size and age thresholds"""
+
+    def test_scan_files_includes_trash_when_enabled(self):
+        base_dir = self.temp_dir / "camera"
+        base_dir.mkdir()
+        # Use a trash root that's separate from base_dir to avoid double-scanning
+        trash_root = self.temp_dir / ".deleted"
+
+        # Create files in base directory
+        ts = datetime.now() - timedelta(days=40)
+        base_mp4, base_jpg = self.create_test_files(base_dir, ts)
+
+        # Create files in trash
+        trash_input = trash_root / "input"
+        trash_input.mkdir(parents=True)
+        trash_mp4, trash_jpg = self.create_test_files(trash_input, ts)
+
+        # Test without trash inclusion - should only find base files
+        mp4s, mapping, trash_files = archiver.scan_files(
+            base_dir, include_trash=False, trash_root=trash_root
+        )
+        self.assertEqual(len(mp4s), 1)  # Only base file
+        self.assertEqual(len(mapping), 1)  # Only base file mapping
+        self.assertEqual(len(trash_files), 0)  # No trash files
+
+        # Test with trash inclusion - should find both base and trash files
+        mp4s, mapping, trash_files = archiver.scan_files(
+            base_dir, include_trash=True, trash_root=trash_root
+        )
+        # With trash included, we should find both files
+        self.assertEqual(len(mp4s), 2)  # Both base and trash MP4s
+        self.assertEqual(len(mapping), 1)  # Same timestamp key
+        self.assertEqual(len(trash_files), 2)  # Both MP4 and JPG in trash
+        self.assertIn(trash_mp4, trash_files)
+        self.assertIn(trash_jpg, trash_files)
+
+    def test_cleanup_archive_size_limit_includes_trash(self):
+        logger, log_stream = self.capture_logger()
+        archive_dir = self.temp_dir / "archived"
+        archive_dir.mkdir()
+        trash_root = self.temp_dir / ".deleted"
+        trash_output = trash_root / "output" / "2023" / "12" / "01"
+        trash_output.mkdir(parents=True)
+
+        # Create archive files
+        archive_file = archive_dir / "archived-20231201000000.mp4"
+        self.create_file(archive_file, b"x" * (400 * 1024 * 1024))  # 400MB
+
+        # Create trash archive files
+        trash_file = trash_output / "archived-20231201000001.mp4"
+        self.create_file(trash_file, b"x" * (300 * 1024 * 1024))  # 300MB
+
+        # Test without trash inclusion
+        archiver.cleanup_archive_size_limit(
+            archive_dir, logger, max_size_gb=0.5, dry_run=False, use_trash=False
+        )
+        # Only archive file should be considered (400MB < 500MB limit)
+        self.assertTrue(archive_file.exists())
+        self.assertTrue(trash_file.exists())
+
+        # Test with trash inclusion (total 700MB > 500MB limit)
+        archiver.cleanup_archive_size_limit(
+            archive_dir,
+            logger,
+            max_size_gb=0.5,
+            dry_run=False,
+            use_trash=True,
+            trash_root=trash_root,
+        )
+
+        # Should remove files until under limit
+        self.assertIn(
+            "Including 1 trash files in size calculation", log_stream.getvalue()
+        )
+        self.assertIn("Archive size exceeds limit", log_stream.getvalue())
+
+    def test_process_files_skips_trash_files(self):
+        logger, log_stream = self.capture_logger()
+        base_dir = self.temp_dir / "camera"
+        base_dir.mkdir()
+        trash_root = base_dir / ".deleted"
+        trash_input = trash_root / "input"
+        trash_input.mkdir(parents=True)
+
+        # Create trash file
+        ts = datetime.now() - timedelta(days=40)
+        trash_mp4, _ = self.create_test_files(trash_input, ts)
+
+        # Create mapping and trash_files set
+        mapping = {
+            ts.strftime("%Y%m%d%H%M%S"): {
+                ".mp4": trash_mp4,
+            }
+        }
+        trash_files = {trash_mp4}
+
+        out_dir = self.temp_dir / "archived"
+        with patch("archiver.transcode_file") as mock_transcode:
+            processed = archiver.process_files(
+                old_list=[(trash_mp4, ts)],
+                out_dir=out_dir,
+                logger=logger,
+                dry_run=False,
+                no_skip=False,
+                mapping=mapping,
+                bar=archiver.ProgressBar(1, silent=True),
+                trash_files=trash_files,
+                use_trash=True,
+                trash_root=trash_root,
+                source_root=base_dir,
+            )
+
+        mock_transcode.assert_not_called()
+        self.assertIn("[SKIP] File already in trash", log_stream.getvalue())
+        self.assertEqual(len(processed), 0)
+
+    def test_run_archiver_with_trash_inclusion(self):
+        base_dir = self.temp_dir / "camera"
+        base_dir.mkdir()
+        trash_root = base_dir / ".deleted"
+
+        # Create old files in base and trash
+        ts_old = datetime.now() - timedelta(days=40)
+        base_mp4, _ = self.create_test_files(base_dir, ts_old)
+        trash_input = trash_root / "input"
+        trash_input.mkdir(parents=True)
+        trash_mp4, _ = self.create_test_files(trash_input, ts_old)
+
+        def mock_transcode(inp, outp, logger, progress_cb=None):
+            outp.parent.mkdir(parents=True, exist_ok=True)
+            outp.write_bytes(b"transcoded")
+            return True
+
+        def mock_scan_files(base_dir, include_trash=False, trash_root=None):
+            mp4s = [(base_mp4, ts_old)]
+            mapping = {ts_old.strftime("%Y%m%d%H%M%S"): {".mp4": base_mp4}}
+            trash_files = set()
+
+            if include_trash and trash_root:
+                mp4s.append((trash_mp4, ts_old))
+                mapping[ts_old.strftime("%Y%m%d%H%M%S")][".mp4"] = (
+                    trash_mp4  # Override or add separate entry
+                )
+                trash_files.add(trash_mp4)
+            return mp4s, mapping, trash_files
+
+        with patch("archiver.scan_files", side_effect=mock_scan_files):
+            with patch("archiver.transcode_file", side_effect=mock_transcode):
+                with patch(
+                    "archiver.setup_logging", return_value=self.capture_logger()[0]
+                ):
+                    args = MagicMock()
+                    args.directory = base_dir
+                    args.output = base_dir / "archived"
+                    args.age = 30
+                    args.dry_run = False
+                    args.max_size = 500
+                    args.no_skip = False
+                    args.use_trash = True
+                    args.trashdir = None
+
+                    result = archiver.run_archiver(args)
+
+        self.assertEqual(result, 0)
+
+    def test_cleanup_trash_files_permanently_when_in_trash(self):
+        logger, log_stream = self.capture_logger()
+        archive_dir = self.temp_dir / "archived"
+        archive_dir.mkdir()
+        trash_root = self.temp_dir / ".deleted"
+        trash_output = trash_root / "output" / "2023" / "12" / "01"
+        trash_output.mkdir(parents=True)
+
+        # Create trash archive file
+        trash_file = trash_output / "archived-20231201000000.mp4"
+        self.create_file(trash_file, b"x" * (600 * 1024 * 1024))  # 600MB
+
+        archiver.cleanup_archive_size_limit(
+            archive_dir,
+            logger,
+            max_size_gb=0.5,
+            dry_run=False,
+            use_trash=True,
+            trash_root=trash_root,
+        )
+
+        self.assertIn("Permanently removed from trash", log_stream.getvalue())
+        self.assertFalse(trash_file.exists())
 
 
 class TestSafeRemoveAdvanced(TestBase):
@@ -992,16 +1189,18 @@ class TestRunArchiverIntegration(TestBase):
         # Test graceful exit during processing
         archiver.GracefulExit.request_exit()
 
-        with patch("archiver.setup_logging", return_value=self.capture_logger()[0]):
-            result = archiver.run_archiver(args)
+        # Mock scan_files to return 3 values instead of 2
+        with patch("archiver.scan_files", return_value=([], {}, set())):  # ← Fix here
+            with patch("archiver.setup_logging", return_value=self.capture_logger()[0]):
+                result = archiver.run_archiver(args)
 
         self.assertEqual(result, 1)  # Should return error code for cancelled process
 
         # Reset for next test
         archiver.GracefulExit.exit_requested = False
 
-        # Test successful completion
-        with patch("archiver.scan_files", return_value=([], {})):
+        # Test successful completion - also fix this mock
+        with patch("archiver.scan_files", return_value=([], {}, set())):  # ← Fix here
             with patch("archiver.setup_logging", return_value=self.capture_logger()[0]):
                 result = archiver.run_archiver(args)
 
@@ -1030,7 +1229,7 @@ class TestFileScanningEdgeCases(TestBase):
             return call_count > 5  # Exit partway through
 
         with patch("archiver.GracefulExit.should_exit", side_effect=exit_side_effect):
-            mp4s, mapping = archiver.scan_files(base_dir)
+            mp4s, mapping, trash_files = archiver.scan_files(base_dir)
 
         # Should have stopped scanning early
         self.assertTrue(len(mp4s) < 10)
