@@ -18,7 +18,6 @@ import shutil
 import atexit
 import signal
 from typing import Dict, List, Optional, Set, Tuple, Callable
-from dataclasses import dataclass
 
 
 # Constants
@@ -27,15 +26,22 @@ DEFAULT_PROGRESS_WIDTH = 30
 PROGRESS_UPDATE_INTERVAL = 5  # seconds for non-TTY output
 
 
-@dataclass
 class FileInfo:
     """Represents a file with its metadata for cleanup decisions."""
 
-    path: Path
-    timestamp: datetime
-    size: int
-    is_archive: bool
-    is_trash: bool
+    def __init__(
+        self,
+        path: Path,
+        timestamp: datetime,
+        size: int,
+        is_archive: bool,
+        is_trash: bool,
+    ):
+        self.path = path
+        self.timestamp = timestamp
+        self.size = size
+        self.is_archive = is_archive
+        self.is_trash = is_trash
 
 
 class GracefulExit:
@@ -592,11 +598,7 @@ def collect_file_info(
                 if archive_file not in seen_paths:
                     all_files.append(
                         FileInfo(
-                            path=archive_file,
-                            timestamp=ts,
-                            size=size,
-                            is_archive=True,
-                            is_trash=is_trash,
+                            archive_file, ts, size, is_archive=True, is_trash=is_trash
                         )
                     )
                     seen_paths.add(archive_file)
@@ -618,15 +620,7 @@ def collect_file_info(
         is_trash = trash_root is not None and any(
             p in fp.parents for p in [trash_root, trash_root / "input"]
         )
-        all_files.append(
-            FileInfo(
-                path=fp,
-                timestamp=ts,
-                size=size,
-                is_archive=False,
-                is_trash=is_trash,
-            )
-        )
+        all_files.append(FileInfo(fp, ts, size, is_archive=False, is_trash=is_trash))
         seen_paths.add(fp)
 
     return all_files
@@ -694,37 +688,30 @@ def intelligent_cleanup(
             f"({len(files_to_remove)} files marked for removal)"
         )
     else:
-        # PHASE 2: Enforce age limit (only if under size limit)
-        # Skip age-based cleanup when age_days is non-positive OR when exactly at size limit
-        if age_days <= 0 or remaining_size == size_limit:
-            if age_days <= 0:
-                logger.debug(
-                    "Age-based cleanup skipped due to non‑positive age threshold"
-                )
-            else:
-                logger.debug(
-                    "Age-based cleanup skipped because archive is exactly at size limit"
-                )
-            files_over_age = []
-        else:
+        # PHASE 2: Enforce age limit (only if under size limit AND age_days > 0)
+        if age_days > 0:
             files_over_age = [f for f in all_files if f.timestamp < age_cutoff]
 
-        if files_over_age:
-            logger.info(f"Found {len(files_over_age)} files older than {age_days} days")
+            if files_over_age:
+                logger.info(
+                    f"Found {len(files_over_age)} files older than {age_days} days"
+                )
 
-            for file_info in files_over_age:
-                files_to_remove.append(file_info)
-                remaining_size -= file_info.size
+                for file_info in files_over_age:
+                    files_to_remove.append(file_info)
+                    remaining_size -= file_info.size
 
-                if dry_run:
-                    logger.info(
-                        f"[DRY RUN] Would remove for age: {file_info.path} "
-                        f"({file_info.size / (1024**2):.1f} MB, {file_info.timestamp})"
-                    )
+                    if dry_run:
+                        logger.info(
+                            f"[DRY RUN] Would remove for age: {file_info.path} "
+                            f"({file_info.size / (1024**2):.1f} MB, {file_info.timestamp})"
+                        )
 
-            logger.info(f"Added {len(files_over_age)} files for age‑based removal")
+                logger.info(f"Added {len(files_over_age)} files for age‑based removal")
+            else:
+                logger.info(f"No files older than {age_days} days found")
         else:
-            logger.info(f"No files older than {age_days} days found")
+            logger.info("Age-based cleanup disabled (age_days <= 0)")
 
     # Remove duplicates and sort by timestamp for orderly processing
     unique_files = {f.path: f for f in files_to_remove}
@@ -1006,12 +993,40 @@ def run_archiver(args) -> int:
     mp4s, mapping, trash_files = scan_files(
         base_dir, include_trash=args.use_trash, trash_root=trash_root
     )
-    cutoff = datetime.now() - timedelta(days=args.age)
-    old_list = [(p, t) for p, t in mp4s if t < cutoff]
 
-    # Create progress bar and logger
-    bar = ProgressBar(total_files=len(old_list), silent=args.dry_run, out=sys.stderr)
-    logger = setup_logging(base_dir / "transcoding.log", progress_bar=bar)
+    # Create progress bar and logger based on mode
+    if args.cleanup:
+        # Cleanup mode: no transcoding, so 0 files for progress bar
+        bar = ProgressBar(total_files=0, silent=True, out=sys.stderr)
+        logger = setup_logging(base_dir / "transcoding.log", progress_bar=bar)
+        logger.info(
+            "Cleanup mode: skipping transcoding, only performing cleanup operations"
+        )
+        processed = set()
+    else:
+        # Normal mode: transcoding files, use actual count
+        cutoff = datetime.now() - timedelta(days=args.age)
+        old_list = [(p, t) for p, t in mp4s if t < cutoff]
+        bar = ProgressBar(
+            total_files=len(old_list), silent=args.dry_run, out=sys.stderr
+        )
+        logger = setup_logging(base_dir / "transcoding.log", progress_bar=bar)
+
+        processed = process_files_intelligent(
+            old_list=old_list,
+            out_dir=out_dir,
+            logger=logger,
+            dry_run=args.dry_run,
+            no_skip=args.no_skip,
+            mapping=mapping,
+            bar=bar,
+            trash_files=trash_files,
+            use_trash=args.use_trash,
+            trash_root=trash_root,
+            source_root=base_dir,
+            max_size_gb=args.max_size,
+            age_days=args.age,
+        )
 
     for msg in [
         "Starting camera archive process...",
@@ -1021,26 +1036,12 @@ def run_archiver(args) -> int:
         f"Age threshold: {args.age} days",
         f"Size limit: {args.max_size} GB",
         f"Dry run: {args.dry_run}",
+        f"Cleanup only: {args.cleanup}",
     ]:
         if not GracefulExit.should_exit():
             logger.info(msg)
 
-    processed = process_files_intelligent(
-        old_list=old_list,
-        out_dir=out_dir,
-        logger=logger,
-        dry_run=args.dry_run,
-        no_skip=args.no_skip,
-        mapping=mapping,
-        bar=bar,
-        trash_files=trash_files,
-        use_trash=args.use_trash,
-        trash_root=trash_root,
-        source_root=base_dir,
-        max_size_gb=args.max_size,
-        age_days=args.age,
-    )
-
+    # Always perform cleanup operations (orphaned JPGs, empty dirs, size limits)
     if not GracefulExit.should_exit():
         remove_orphaned_jpgs(
             mapping, processed, logger, args.dry_run, args.use_trash, trash_root
