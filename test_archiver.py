@@ -319,7 +319,7 @@ class TestComprehensiveIntegration(TestBase):
             mock_popen.assert_not_called()
         archiver.GracefulExit.exit_requested = False
 
-        # Test successful transcoding with progress
+        # Test successful transcoding with progress (covers mkdir parent creation)
         mock_proc = self.create_mock_ffmpeg_process(
             ["frame=1 time=00:00:01.00", "frame=2 time=00:00:02.00"]
         )
@@ -328,12 +328,22 @@ class TestComprehensiveIntegration(TestBase):
         def progress_cb(pct):
             progress_data.append(pct)
 
+        out_path = (
+            self.temp_dir
+            / "archived"
+            / "2023"
+            / "12"
+            / "01"
+            / "archived-20231201123045.mp4"
+        )
         with patch("subprocess.Popen", return_value=mock_proc):
             with patch("archiver.get_video_duration", return_value=10.0):
                 result = archiver.transcode_file(
-                    Path("in"), Path("out"), logger, progress_cb
+                    Path("in"), out_path, logger, progress_cb
                 )
                 self.assertTrue(result)
+                # Verify parent directories were created
+                self.assertTrue(out_path.parent.exists())
                 self.assertEqual(len(progress_data), 2)
                 self.assertAlmostEqual(progress_data[0], 10.0)
                 self.assertAlmostEqual(progress_data[1], 20.0)

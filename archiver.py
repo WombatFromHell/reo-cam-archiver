@@ -392,6 +392,9 @@ def transcode_file(
     if GracefulExit.should_exit():
         return False
 
+    # Ensure output directory exists
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
     cmd = [
         "ffmpeg",
         "-hide_banner",
