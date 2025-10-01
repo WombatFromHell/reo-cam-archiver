@@ -630,25 +630,18 @@ def collect_file_info(
 
 
 def intelligent_cleanup(
-    old_list: List[Tuple[Path, datetime]],
-    out_dir: Path,
+    all_files: List[FileInfo],
     logger: logging.Logger,
     dry_run: bool,
     max_size_gb: int,
     age_days: int,
-    use_trash: bool = False,
-    trash_root: Optional[Path] = None,
-    source_root: Optional[Path] = None,
-) -> Tuple[Set[Path], List[FileInfo]]:
+) -> List[FileInfo]:
     """
-    Intelligent cleanup with corrected strategy:
-    1. If over size limit: remove oldest files until under limit
-    2. Else (under size limit): remove files older than age_days
+    Select files to remove based on location priority and size/age constraints.
+    Priority order: Trash > Archive > Source (oldest first within each category).
     """
-    # Collect all file info (always scan, even if old_list is empty)
-    all_files = collect_file_info(old_list, out_dir, trash_root)
     if not all_files:
-        return set(), []
+        return []
 
     # Calculate totals
     total_size = sum(f.size for f in all_files)
@@ -659,32 +652,57 @@ def intelligent_cleanup(
     logger.info(f"Size limit: {max_size_gb} GB")
     logger.info(f"Age cutoff: {age_cutoff.strftime('%Y-%m-%d %H:%M:%S')}")
 
-    # Sort by timestamp (oldest first) for consistent removal order
-    all_files.sort(key=lambda x: x.timestamp)
+    # Categorize files by location priority (0 = highest priority for removal)
+    categorized_files: Dict[int, List[FileInfo]] = {0: [], 1: [], 2: []}
+
+    for file_info in all_files:
+        if file_info.is_trash:
+            categorized_files[0].append(file_info)
+        elif file_info.is_archive:
+            categorized_files[1].append(file_info)
+        else:
+            categorized_files[2].append(file_info)
+
+    # Sort each category by timestamp (oldest first)
+    for category in categorized_files.values():
+        category.sort(key=lambda x: x.timestamp)
 
     files_to_remove = []
-    processed_files = set()
     remaining_size = total_size
 
     # PHASE 1: Enforce size limit (if over limit)
     if remaining_size > size_limit:
         logger.info("Archive size exceeds limit")
         logger.info(
-            f"Size threshold exceeded, removing oldest files to reach {max_size_gb} GB..."
+            f"Size threshold exceeded, removing files by priority to reach {max_size_gb} GB..."
+        )
+        logger.info(
+            "Priority order: Trash > Archive > Source (oldest first within each)"
         )
 
-        for file_info in all_files:
+        # Remove files starting from highest priority (0) to lowest (2)
+        for priority in range(3):
             if remaining_size <= size_limit:
                 break
 
-            files_to_remove.append(file_info)
-            remaining_size -= file_info.size
+            category_name = {0: "Trash", 1: "Archive", 2: "Source"}[priority]
+            category_files = categorized_files[priority]
 
-            if dry_run:
-                logger.info(
-                    f"[DRY RUN] Would remove for size: {file_info.path} "
-                    f"({file_info.size / (1024**2):.1f} MB, {file_info.timestamp})"
-                )
+            if category_files:
+                logger.info(f"Processing {category_name} files for size cleanup...")
+
+                for file_info in category_files:
+                    if remaining_size <= size_limit:
+                        break
+
+                    files_to_remove.append(file_info)
+                    remaining_size -= file_info.size
+
+                    if dry_run:
+                        logger.info(
+                            f"[DRY RUN] Would remove {category_name} file for size: {file_info.path} "
+                            f"({file_info.size / (1024**2):.1f} MB, {file_info.timestamp})"
+                        )
 
         logger.info(
             f"After size cleanup: {remaining_size / (1024**3):.1f} GB "
@@ -693,40 +711,71 @@ def intelligent_cleanup(
     else:
         # PHASE 2: Enforce age limit (only if under size limit AND age_days > 0)
         if age_days > 0:
-            files_over_age = [f for f in all_files if f.timestamp < age_cutoff]
+            files_over_age_by_priority: Dict[int, List[FileInfo]] = {
+                0: [],
+                1: [],
+                2: [],
+            }
 
-            if files_over_age:
-                logger.info(
-                    f"Found {len(files_over_age)} files older than {age_days} days"
-                )
+            for priority in range(3):
+                files_over_age_by_priority[priority] = [
+                    f for f in categorized_files[priority] if f.timestamp < age_cutoff
+                ]
 
-                for file_info in files_over_age:
-                    files_to_remove.append(file_info)
-                    remaining_size -= file_info.size
+            total_over_age = sum(
+                len(files) for files in files_over_age_by_priority.values()
+            )
 
-                    if dry_run:
+            if total_over_age > 0:
+                logger.info(f"Found {total_over_age} files older than {age_days} days")
+
+                # Remove age-eligible files by priority order
+                for priority in range(3):
+                    category_name = {0: "Trash", 1: "Archive", 2: "Source"}[priority]
+                    age_files = files_over_age_by_priority[priority]
+
+                    if age_files:
                         logger.info(
-                            f"[DRY RUN] Would remove for age: {file_info.path} "
-                            f"({file_info.size / (1024**2):.1f} MB, {file_info.timestamp})"
+                            f"Processing {category_name} files for age cleanup..."
                         )
 
-                logger.info(f"Added {len(files_over_age)} files for age‑based removal")
+                        for file_info in age_files:
+                            files_to_remove.append(file_info)
+                            remaining_size -= file_info.size
+
+                            if dry_run:
+                                logger.info(
+                                    f"[DRY RUN] Would remove {category_name} file for age: {file_info.path} "
+                                    f"({file_info.size / (1024**2):.1f} MB, {file_info.timestamp})"
+                                )
+
+                logger.info(f"Added {total_over_age} files for age-based removal")
             else:
                 logger.info(f"No files older than {age_days} days found")
         else:
             logger.info("Age-based cleanup disabled (age_days <= 0)")
 
-    # Remove duplicates and sort by timestamp for orderly processing
+    # Remove duplicates and sort by priority then timestamp
     unique_files = {f.path: f for f in files_to_remove}
     files_to_remove = list(unique_files.values())
-    files_to_remove.sort(key=lambda x: x.timestamp)
+
+    def sort_key(file_info: FileInfo):
+        if file_info.is_trash:
+            priority = 0
+        elif file_info.is_archive:
+            priority = 1
+        else:
+            priority = 2
+        return (priority, file_info.timestamp)
+
+    files_to_remove.sort(key=sort_key)
 
     logger.info(
         f"Final removal plan: {len(files_to_remove)} files, "
         f"final size: {remaining_size / (1024**3):.1f} GB"
     )
 
-    return processed_files, files_to_remove
+    return files_to_remove
 
 
 def process_files_intelligent(
@@ -742,7 +791,7 @@ def process_files_intelligent(
     trash_root: Optional[Path] = None,
     source_root: Optional[Path] = None,
     max_size_gb: int = 500,
-    age_days: int = 30,
+    age_days: int = 30,  # kept for backward compat, but unused
 ) -> Set[Path]:
     """Process (transcode) files and return the set of *all* paths that were
     finally removed (source MP4s + paired JPGs)."""
@@ -754,31 +803,10 @@ def process_files_intelligent(
         logger.info("No files to process or cancellation requested")
         return set()
 
-    # 1.  Decide what has to disappear (age / size rules)
-    removal_set, _info_list = intelligent_cleanup(
-        old_list,
-        out_dir,
-        logger,
-        dry_run,
-        max_size_gb,
-        age_days,
-        use_trash,
-        trash_root,
-        source_root,
-    )
-
-    # 2.  Build a second set: every path we will really delete after a
-    #     successful transcode (source MP4 + paired JPG).
     to_delete: Set[Path] = set()
     for fp, ts in old_list:
         if GracefulExit.should_exit():
             break
-        if fp in removal_set:  # size / age rule
-            to_delete.add(fp)
-            jpg = mapping.get(ts.strftime("%Y%m%d%H%M%S"), {}).get(".jpg")
-            if jpg:
-                to_delete.add(jpg)
-            continue
         if fp in trash_files:  # already in trash
             continue
 
@@ -820,7 +848,7 @@ def process_files_intelligent(
 
     bar.start_processing()
 
-    # 3.  Actually remove everything once
+    # Actually remove everything once
     for p in sorted(to_delete, key=lambda _p: _p.name):
         remove_one(
             p,
@@ -933,44 +961,62 @@ def clean_empty_directories(
 
 
 def cleanup_archive_size_limit(
+    base_dir: Path,
     out_dir: Path,
     logger: logging.Logger,
     max_size_gb: int,
     dry_run: bool,
     use_trash: bool = False,
     trash_root: Optional[Path] = None,
+    age_days: int = 30,
 ) -> None:
-    """Legacy compatibility wrapper – keeps archive below max_size_gb."""
+    """Comprehensive storage management with location-based priorities."""
     if GracefulExit.should_exit():
         return
 
+    # Step 1: Complete system discovery
+    mp4s, mapping, trash_files = scan_files(
+        base_dir, include_trash=use_trash, trash_root=trash_root
+    )
+
+    # Step 2: Empty directory cleanup (highest priority)
+    if not dry_run:
+        clean_empty_directories(
+            base_dir, logger, use_trash, trash_root, is_output=False
+        )
+        clean_empty_directories(out_dir, logger, use_trash, trash_root, is_output=True)
+        if trash_root:
+            clean_empty_directories(
+                trash_root, logger, use_trash, trash_root, is_output=False
+            )
+
+    # Step 3: File-based cleanup
     if dry_run:
-        logger.info("[DRY RUN] Would enforce archive size limit (%d GB)", max_size_gb)
+        logger.info("[DRY RUN] Would enforce storage limits")
         return
 
-    # Ask intelligent_cleanup to look **only** at the archive tree
-    _to_remove, info_list = intelligent_cleanup(
-        [],
-        out_dir,
-        logger,
-        dry_run=False,
-        max_size_gb=max_size_gb,
-        age_days=0,
-        use_trash=use_trash,
-        trash_root=trash_root,
-        source_root=out_dir,
+    # Collect info for ALL files (not just old ones)
+    all_file_infos = collect_file_info(mp4s, out_dir, trash_root)
+
+    # Step 4: Apply intelligent cleanup
+    files_to_remove = intelligent_cleanup(
+        all_file_infos, logger, dry_run, max_size_gb, age_days
     )
-    # >>> NEW: actually delete the returned files <<<
-    for file_info in info_list:
+
+    # Step 5: Execute file removal
+    for file_info in files_to_remove:
         remove_one(
             file_info.path,
             logger,
             dry_run=False,
             use_trash=use_trash,
             trash_root=trash_root,
-            is_output=True,
-            source_root=out_dir,
+            is_output=file_info.is_archive,
+            source_root=base_dir if not file_info.is_archive else out_dir,
         )
+
+    # Step 6: Clean up orphaned JPGs
+    remove_orphaned_jpgs(mapping, set(), logger, False, use_trash, trash_root)
 
 
 def run_archiver(args) -> int:
@@ -992,22 +1038,13 @@ def run_archiver(args) -> int:
     if trash_root is not None:
         trash_root.mkdir(parents=True, exist_ok=True)
 
-    # Include trash files in scan when use_trash is enabled
+    # Always perform comprehensive discovery
     mp4s, mapping, trash_files = scan_files(
         base_dir, include_trash=args.use_trash, trash_root=trash_root
     )
 
-    # Create progress bar and logger based on mode
-    if args.cleanup:
-        # Cleanup mode: no transcoding, so 0 files for progress bar
-        bar = ProgressBar(total_files=0, silent=True, out=sys.stderr)
-        logger = setup_logging(base_dir / "transcoding.log", progress_bar=bar)
-        logger.info(
-            "Cleanup mode: skipping transcoding, only performing cleanup operations"
-        )
-        processed = set()
-    else:
-        # Normal mode: transcoding files, use actual count
+    if not args.cleanup:
+        # Normal mode: transcoding files
         cutoff = datetime.now() - timedelta(days=args.age)
         old_list = [(p, t) for p, t in mp4s if t < cutoff]
         bar = ProgressBar(
@@ -1015,7 +1052,9 @@ def run_archiver(args) -> int:
         )
         logger = setup_logging(base_dir / "transcoding.log", progress_bar=bar)
 
-        processed = process_files_intelligent(
+        # For backward compatibility in transcoding logic, keep the old process_files_intelligent
+        # but update it to not call intelligent_cleanup internally
+        _ = process_files_intelligent(
             old_list=old_list,
             out_dir=out_dir,
             logger=logger,
@@ -1029,6 +1068,13 @@ def run_archiver(args) -> int:
             source_root=base_dir,
             max_size_gb=args.max_size,
             age_days=args.age,
+        )
+    else:
+        # Cleanup mode: no transcoding
+        bar = ProgressBar(total_files=0, silent=True, out=sys.stderr)
+        logger = setup_logging(base_dir / "transcoding.log", progress_bar=bar)
+        logger.info(
+            "Cleanup mode: skipping transcoding, only performing cleanup operations"
         )
 
     for msg in [
@@ -1044,24 +1090,17 @@ def run_archiver(args) -> int:
         if not GracefulExit.should_exit():
             logger.info(msg)
 
-    # Always perform cleanup operations (orphaned JPGs, empty dirs, size limits)
+    # Always perform comprehensive storage management
     if not GracefulExit.should_exit():
-        remove_orphaned_jpgs(
-            mapping, processed, logger, args.dry_run, args.use_trash, trash_root
-        )
-        clean_empty_directories(
-            base_dir, logger, args.use_trash, trash_root, is_output=False
-        )
-        clean_empty_directories(
-            out_dir, logger, args.use_trash, trash_root, is_output=True
-        )
         cleanup_archive_size_limit(
+            base_dir,
             out_dir,
             logger,
             args.max_size,
             args.dry_run,
             use_trash=args.use_trash,
             trash_root=trash_root,
+            age_days=args.age,
         )
 
     if GracefulExit.should_exit():
