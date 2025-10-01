@@ -5,25 +5,84 @@ with intelligent cleanup based on size and age thresholds.
 """
 
 import argparse
+import atexit
 import logging
+import os
 import re
+import shutil
+import signal
 import subprocess
 import sys
+import threading
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
-import threading
-import os
-import shutil
-import atexit
-import signal
-from typing import Dict, List, Optional, Set, Tuple, Callable
-
+from typing import Callable, Dict, List, Optional, Set, Tuple
 
 # Constants
 MIN_ARCHIVE_SIZE_BYTES = 1_048_576  # 1MB
 DEFAULT_PROGRESS_WIDTH = 30
 PROGRESS_UPDATE_INTERVAL = 5  # seconds for non-TTY output
+
+
+class GracefulExit:
+    """Global flag for graceful exit handling"""
+
+    exit_requested = False
+    _lock = threading.Lock()
+
+    @classmethod
+    def request_exit(cls):
+        with cls._lock:
+            cls.exit_requested = True
+
+    @classmethod
+    def should_exit(cls):
+        with cls._lock:
+            return cls.exit_requested
+
+
+class Config:
+    """Configuration class to manage all settings and CLI arguments"""
+
+    def __init__(self):
+        self.directory = Path("/camera")
+        self.output = Path("/camera/archived")
+        self.trashdir: Optional[Path] = None
+        self.use_trash = True
+        self.age = 30
+        self.dry_run = False
+        self.max_size = 500
+        self.no_skip = False
+        self.cleanup = False
+        self.clean_output = False
+        self.log_file: Optional[Path] = None
+
+    @classmethod
+    def from_args(cls, args):
+        """Create config from parsed CLI arguments"""
+        config = cls()
+        config.directory = (
+            args.directory if args.directory.exists() else Path("/camera")
+        )
+        config.output = args.output or (config.directory / "archived")
+        config.trashdir = args.trashdir
+        config.use_trash = args.use_trash
+        config.age = args.age
+        config.dry_run = args.dry_run
+        config.max_size = args.max_size
+        config.no_skip = args.no_skip
+        config.cleanup = args.cleanup
+        config.clean_output = getattr(args, "clean_output", False)
+        config.log_file = config.directory / "transcoding.log"
+        return config
+
+    def get_trash_root(self) -> Optional[Path]:
+        if not self.use_trash:
+            return None
+        if self.trashdir:
+            return self.trashdir
+        return self.directory / ".deleted"
 
 
 class FileInfo:
@@ -42,23 +101,6 @@ class FileInfo:
         self.size = size
         self.is_archive = is_archive
         self.is_trash = is_trash
-
-
-class GracefulExit:
-    """Global flag for graceful exit handling"""
-
-    exit_requested = False
-    _lock = threading.Lock()
-
-    @classmethod
-    def request_exit(cls):
-        with cls._lock:
-            cls.exit_requested = True
-
-    @classmethod
-    def should_exit(cls):
-        with cls._lock:
-            return cls.exit_requested
 
 
 class ConsoleOrchestrator:
@@ -91,7 +133,9 @@ class GuardedStreamHandler(logging.StreamHandler):
             self.stream.flush()
 
 
-class ProgressBar:
+class ProgressReporter:
+    """Handles progress reporting for file operations"""
+
     def __init__(
         self,
         total_files: int,
@@ -232,320 +276,494 @@ class ProgressBar:
         self.finish()
 
 
-def setup_logging(
-    log_file: Path, progress_bar: Optional[ProgressBar] = None
-) -> logging.Logger:
-    logger = logging.getLogger("camera_archiver")
-    logger.setLevel(logging.INFO)
-    for h in list(logger.handlers):
-        logger.removeHandler(h)
-    fmt = "%(asctime)s - %(levelname)s - %(message)s"
-    fh = logging.FileHandler(log_file, encoding="utf-8")
-    fh.setFormatter(logging.Formatter(fmt))
-    logger.addHandler(fh)
-    stream = progress_bar.out if progress_bar else sys.stdout
-    orch = progress_bar.orchestrator if progress_bar else ConsoleOrchestrator()
-    sh = GuardedStreamHandler(orch, stream=stream, progress_bar=progress_bar)
-    sh.setFormatter(logging.Formatter(fmt))
-    sh.setLevel(logging.INFO)
-    logger.addHandler(sh)
-    logger.propagate = False
-    return logger
+class Logger:
+    """Handles logging setup and operations"""
 
-
-def parse_timestamp_from_filename(name: str) -> Optional[datetime]:
-    """Extract timestamp from filename using REO_*_YYYYMMDDHHMMSS.(mp4|jpg) pattern."""
-    TIMESTAMP_RE = re.compile(r"REO_.*_(\d{14})\.(mp4|jpg)$", re.IGNORECASE)
-    m = TIMESTAMP_RE.search(name)
-    if not m:
-        return None
-    try:
-        ts = datetime.strptime(m.group(1), "%Y%m%d%H%M%S")
-        return ts if 2000 <= ts.year <= 2099 else None
-    except ValueError:
-        return None
-
-
-def remove_one(
-    path: Path,
-    logger: logging.Logger,
-    dry_run: bool,
-    use_trash: bool,
-    trash_root: Optional[Path],
-    is_output: bool,
-    source_root: Path,
-) -> None:
-    """Delete *path* once.  If it is already inside the trash tree it is
-    permanently removed, otherwise it is moved into the trash directory."""
-    if dry_run:
-        logger.info("[DRY RUN] Would remove %s", path)
-        return
-    if use_trash and trash_root and trash_root in path.parents:
-        path.unlink(missing_ok=True)
-        logger.info("Permanently removed (already in trash): %s", path)
-    else:
-        safe_remove(
-            path,
-            logger,
-            dry_run=False,
-            use_trash=use_trash,
-            trash_root=trash_root,
-            is_output=is_output,
-            source_root=source_root,
+    @staticmethod
+    def setup(
+        log_file: Optional[Path], progress_bar: Optional[ProgressReporter] = None
+    ) -> logging.Logger:
+        logger = logging.getLogger("camera_archiver")
+        logger.setLevel(logging.INFO)
+        for h in list(logger.handlers):
+            logger.removeHandler(h)
+        fmt = "%(asctime)s - %(levelname)s - %(message)s"
+        fh = (
+            logging.FileHandler(log_file, encoding="utf-8")
+            if log_file
+            else logging.NullHandler()
         )
+        fh.setFormatter(logging.Formatter(fmt))
+        logger.addHandler(fh)
+        stream = progress_bar.out if progress_bar else sys.stdout
+        orch = progress_bar.orchestrator if progress_bar else ConsoleOrchestrator()
+        sh = GuardedStreamHandler(orch, stream=stream, progress_bar=progress_bar)
+        sh.setFormatter(logging.Formatter(fmt))
+        sh.setLevel(logging.INFO)
+        logger.addHandler(sh)
+        logger.propagate = False
+        return logger
 
 
-def calculate_trash_destination(
-    file_path: Path, source_root: Path, trash_root: Path, is_output: bool = False
-) -> Path:
-    """Calculate the destination path in trash for a given file."""
-    dest_sub = "output" if is_output else "input"
-    try:
-        rel_path = file_path.relative_to(source_root)
-    except ValueError:
-        rel_path = Path(file_path.name)
+class FileScanner:
+    """Handles scanning directories for files with valid timestamps"""
 
-    base_dest = trash_root / dest_sub / rel_path
-    counter = 0
-    new_dest = base_dest
+    @staticmethod
+    def parse_timestamp_from_filename(name: str) -> Optional[datetime]:
+        """Extract timestamp from filename using REO_*_YYYYMMDDHHMMSS.(mp4|jpg) pattern."""
+        TIMESTAMP_RE = re.compile(r"REO_.*_(\d{14})\.(mp4|jpg)$", re.IGNORECASE)
+        m = TIMESTAMP_RE.search(name)
+        if not m:
+            return None
+        try:
+            ts = datetime.strptime(m.group(1), "%Y%m%d%H%M%S")
+            return ts if 2000 <= ts.year <= 2099 else None
+        except ValueError:
+            return None
 
-    while new_dest.exists():
-        counter += 1
-        suffix = f"_{int(time.time())}_{counter}"
-        stem = new_dest.stem + suffix
-        new_dest = new_dest.parent / (stem + new_dest.suffix)
-
-    return new_dest
-
-
-def safe_remove(
-    file_path: Path,
-    logger: logging.Logger,
-    dry_run: bool,
-    use_trash: bool = False,
-    trash_root: Optional[Path] = None,
-    is_output: bool = False,
-    source_root: Optional[Path] = None,
-):
-    """Safely remove a file, optionally moving to trash."""
-    if GracefulExit.should_exit():
-        return
-
-    if dry_run:
-        logger.info(f"[DRY RUN] Would remove {file_path}")
-        return
-
-    try:
-        if source_root is None:
-            source_root = file_path.parent
-
-        if use_trash and trash_root:
-            new_dest = calculate_trash_destination(
-                file_path, source_root, trash_root, is_output
-            )
-            new_dest.parent.mkdir(parents=True, exist_ok=True)
-            shutil.move(str(file_path), str(new_dest))
-            logger.info(f"Moved to trash: {file_path} -> {new_dest}")
-        else:
-            if file_path.is_file():
-                file_path.unlink()
-            elif file_path.is_dir():
-                file_path.rmdir()
-            else:
-                logger.warning(f"Unsupported file type for removal: {file_path}")
-            logger.info(f"Removed: {file_path}")
-    except Exception as e:
-        logger.error(f"Failed to remove {file_path}: {e}")
-
-
-def get_video_duration(file_path: Path) -> Optional[float]:
-    """Get video duration using ffprobe."""
-    if GracefulExit.should_exit() or not shutil.which("ffprobe"):
-        return None
-    try:
-        cmd = [
-            "ffprobe",
-            "-v",
-            "error",
-            "-show_entries",
-            "format=duration",
-            "-of",
-            "default=noprint_wrappers=1:nokey=1",
-            str(file_path),
-        ]
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-        duration_str = result.stdout.strip()
-        if duration_str and duration_str != "N/A":
-            return float(duration_str)
-        return None
-    except Exception:
-        return None
-
-
-def transcode_file(
-    input_path: Path,
-    output_path: Path,
-    logger: logging.Logger,
-    progress_cb: Optional[Callable[[float], None]] = None,
-) -> bool:
-    """Transcode a video file using ffmpeg with QSV hardware acceleration."""
-    if GracefulExit.should_exit():
-        return False
-
-    # Ensure output directory exists
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-
-    cmd = [
-        "ffmpeg",
-        "-hide_banner",
-        "-hwaccel",
-        "qsv",
-        "-hwaccel_output_format",
-        "qsv",
-        "-y",
-        "-i",
-        str(input_path),
-        "-vf",
-        "scale_qsv=w=1024:h=768:mode=hq",
-        "-global_quality",
-        "26",
-        "-c:v",
-        "h264_qsv",
-        "-an",
-        str(output_path),
-    ]
-    total_duration = get_video_duration(input_path)
-
-    proc = subprocess.Popen(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        bufsize=1,
-    )
-
-    log_lines = []
-    prev_pct = -1.0
-    cur_pct = 0.0
-
-    # Handle both file-like objects and iterables for stdout
-    stdout_iter = None
-    if proc.stdout:
-        if hasattr(proc.stdout, "readline"):
-            # File-like object with readline method
-            stdout_iter = iter(proc.stdout.readline, "")
-        elif hasattr(proc.stdout, "__iter__"):
-            # Iterable (like list of strings in tests)
-            stdout_iter = proc.stdout
-        else:
-            logger.error(f"Unsupported stdout type: {type(proc.stdout)}")
-            proc.terminate()
-            return False
-    else:
-        return False
-
-    if stdout_iter:
-        for line in stdout_iter:
-            if GracefulExit.should_exit():
-                logger.info("Cancellation requested, terminating ffmpeg process...")
-                proc.terminate()
-                try:
-                    proc.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-                    proc.wait()
-                return False
-
-            if not line:
-                break
-            log_lines.append(line)
-
-            if total_duration and total_duration > 0:
-                m = re.search(r"time=([0-9:.]+)", line)
-                if m:
-                    h, mn, s = map(float, m.group(1).split(":")[:3])
-                    cur_pct = min(
-                        (h * 3600 + mn * 60 + s) / total_duration * 100, 100.0
-                    )
-            else:
-                cur_pct = min(cur_pct + 1, 99.0)
-
-            if progress_cb and cur_pct != prev_pct:
-                progress_cb(cur_pct)
-                prev_pct = cur_pct
-
-    rc = proc.wait()
-    if rc != 0 and not GracefulExit.should_exit():
-        msg = (
-            f"FFmpeg failed (code {rc}) for {input_path} -> {output_path}\n"
-            + "".join(log_lines)
-        )
-        logger.error(msg)
-    return rc == 0 and not GracefulExit.should_exit()
-
-
-def scan_files(
-    base_dir: Path, include_trash: bool = False, trash_root: Optional[Path] = None
-) -> Tuple[List[Tuple[Path, datetime]], Dict[str, Dict[str, Path]], Set[Path]]:
-    """Scan for MP4 and JPG files with valid timestamps."""
-    if GracefulExit.should_exit():
-        return [], {}, set()
-
-    mp4s = []
-    mapping = {}
-    trash_files = set()
-
-    # Scan base directory
-    for p in base_dir.rglob("*.*"):
+    @staticmethod
+    def scan_files(
+        base_dir: Path, include_trash: bool = False, trash_root: Optional[Path] = None
+    ) -> Tuple[List[Tuple[Path, datetime]], Dict[str, Dict[str, Path]], Set[Path]]:
+        """Scan for MP4 and JPG files with valid timestamps."""
         if GracefulExit.should_exit():
-            break
+            return [], {}, set()
 
-        if not p.is_file():
-            continue
+        mp4s = []
+        mapping = {}
+        trash_files = set()
 
-        ts = parse_timestamp_from_filename(p.name)
-        if not ts:
-            continue
-        key = ts.strftime("%Y%m%d%H%M%S")
-        ext = p.suffix.lower()
-        mapping.setdefault(key, {})[ext] = p
-        if ext == ".mp4":
-            mp4s.append((p, ts))
+        # Scan base directory
+        for p in base_dir.rglob("*.*"):
+            if GracefulExit.should_exit():
+                break
 
-    # Scan trash directory if enabled
-    if include_trash and trash_root and trash_root.exists():
-        for trash_type in ["input", "output"]:
-            trash_dir = trash_root / trash_type
-            if trash_dir.exists():
-                for p in trash_dir.rglob("*.*"):
-                    if GracefulExit.should_exit():
-                        break
+            if not p.is_file():
+                continue
 
-                    if not p.is_file():
-                        continue
+            # Skip files in trash directory when scanning base directory
+            if trash_root and trash_root in p.parents:
+                continue
 
-                    ts = parse_timestamp_from_filename(p.name)
-                    if not ts:
-                        continue
-                    key = ts.strftime("%Y%m%d%H%M%S")
-                    ext = p.suffix.lower()
+            ts = FileScanner.parse_timestamp_from_filename(p.name)
+            if not ts:
+                continue
+            key = ts.strftime("%Y%m%d%H%M%S")
+            ext = p.suffix.lower()
+            mapping.setdefault(key, {})[ext] = p
+            if ext == ".mp4":
+                mp4s.append((p, ts))
 
-                    mapping.setdefault(key, {})[ext] = p
-                    trash_files.add(p)
-                    if ext == ".mp4":
-                        mp4s.append((p, ts))
+        # Scan trash directory if enabled
+        if include_trash and trash_root and trash_root.exists():
+            for trash_type in ["input", "output"]:
+                trash_dir = trash_root / trash_type
+                if trash_dir.exists():
+                    for p in trash_dir.rglob("*.*"):
+                        if GracefulExit.should_exit():
+                            break
 
-    return mp4s, mapping, trash_files
+                        if not p.is_file():
+                            continue
+
+                        ts = FileScanner.parse_timestamp_from_filename(p.name)
+                        if not ts:
+                            continue
+                        key = ts.strftime("%Y%m%d%H%M%S")
+                        ext = p.suffix.lower()
+
+                        mapping.setdefault(key, {})[ext] = p
+                        trash_files.add(p)
+                        if ext == ".mp4":
+                            mp4s.append((p, ts))
+
+        return mp4s, mapping, trash_files
 
 
-def output_path(input_file: Path, timestamp: datetime, out_dir: Path) -> Path:
-    """Generate output path for archived file."""
-    if len(input_file.parts) >= 4:
-        y, m, d = input_file.parts[-4:-1]
-        return (
-            out_dir / y / m / d / f"archived-{timestamp.strftime('%Y%m%d%H%M%S')}.mp4"
+class Transcoder:
+    """Handles video transcoding operations"""
+
+    @staticmethod
+    def get_video_duration(file_path: Path) -> Optional[float]:
+        """Get video duration using ffprobe."""
+        if GracefulExit.should_exit() or not shutil.which("ffprobe"):
+            return None
+        try:
+            cmd = [
+                "ffprobe",
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
+                str(file_path),
+            ]
+            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+            duration_str = result.stdout.strip()
+            if duration_str and duration_str != "N/A":
+                return float(duration_str)
+            return None
+        except Exception:
+            return None
+
+    @staticmethod
+    def transcode_file(
+        input_path: Path,
+        output_path: Path,
+        logger: logging.Logger,
+        progress_cb: Optional[Callable[[float], None]] = None,
+    ) -> bool:
+        """Transcode a video file using ffmpeg with QSV hardware acceleration."""
+        if GracefulExit.should_exit():
+            return False
+
+        # Ensure output directory exists
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+
+        cmd = [
+            "ffmpeg",
+            "-hide_banner",
+            "-hwaccel",
+            "qsv",
+            "-hwaccel_output_format",
+            "qsv",
+            "-y",
+            "-i",
+            str(input_path),
+            "-vf",
+            "scale_qsv=w=1024:h=768:mode=hq",
+            "-global_quality",
+            "26",
+            "-c:v",
+            "h264_qsv",
+            "-an",
+            str(output_path),
+        ]
+        total_duration = Transcoder.get_video_duration(input_path)
+
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
         )
-    else:
+
+        log_lines = []
+        prev_pct = -1.0
+        cur_pct = 0.0
+
+        # Handle both file-like objects and iterables for stdout
+        stdout_iter = None
+        if proc.stdout:
+            if hasattr(proc.stdout, "readline"):
+                # File-like object with readline method
+                stdout_iter = iter(proc.stdout.readline, "")
+            elif hasattr(proc.stdout, "__iter__"):
+                # Iterable (like list of strings in tests)
+                stdout_iter = proc.stdout
+            else:
+                logger.error(f"Unsupported stdout type: {type(proc.stdout)}")
+                proc.terminate()
+                return False
+        else:
+            return False
+
+        if stdout_iter:
+            for line in stdout_iter:
+                if GracefulExit.should_exit():
+                    logger.info("Cancellation requested, terminating ffmpeg process...")
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                        proc.wait()
+                    return False
+
+                if not line:
+                    break
+                log_lines.append(line)
+
+                if total_duration and total_duration > 0:
+                    m = re.search(r"time=([0-9:.]+)", line)
+                    if m:
+                        h, mn, s = map(float, m.group(1).split(":")[:3])
+                        cur_pct = min(
+                            (h * 3600 + mn * 60 + s) / total_duration * 100, 100.0
+                        )
+                else:
+                    cur_pct = min(cur_pct + 1, 99.0)
+
+                if progress_cb and cur_pct != prev_pct:
+                    progress_cb(cur_pct)
+                    prev_pct = cur_pct
+
+        rc = proc.wait()
+        if rc != 0 and not GracefulExit.should_exit():
+            msg = (
+                f"FFmpeg failed (code {rc}) for {input_path} -> {output_path}\n"
+                + "".join(log_lines)
+            )
+            logger.error(msg)
+        return rc == 0 and not GracefulExit.should_exit()
+
+
+class FileCleaner:
+    """Handles file removal and cleanup operations"""
+
+    @staticmethod
+    def remove_one(
+        path: Path,
+        logger: logging.Logger,
+        dry_run: bool,
+        use_trash: bool,
+        trash_root: Optional[Path],
+        is_output: bool,
+        source_root: Path,
+    ) -> None:
+        """Delete *path* once.  If it is already inside the trash tree it is
+        permanently removed, otherwise it is moved into the trash directory."""
+        if dry_run:
+            logger.info("[DRY RUN] Would remove %s", path)
+            return
+        if use_trash and trash_root and trash_root in path.parents:
+            path.unlink(missing_ok=True)
+            logger.info("Permanently removed (already in trash): %s", path)
+        else:
+            FileCleaner.safe_remove(
+                path,
+                logger,
+                dry_run=False,
+                use_trash=use_trash,
+                trash_root=trash_root,
+                is_output=is_output,
+                source_root=source_root,
+            )
+
+    @staticmethod
+    def calculate_trash_destination(
+        file_path: Path, source_root: Path, trash_root: Path, is_output: bool = False
+    ) -> Path:
+        """Calculate the destination path in trash for a given file."""
+        dest_sub = "output" if is_output else "input"
+        try:
+            rel_path = file_path.relative_to(source_root)
+        except ValueError:
+            rel_path = Path(file_path.name)
+
+        base_dest = trash_root / dest_sub / rel_path
+        counter = 0
+        new_dest = base_dest
+
+        while new_dest.exists():
+            counter += 1
+            suffix = f"_{int(time.time())}_{counter}"
+            stem = new_dest.stem + suffix
+            new_dest = new_dest.parent / (stem + new_dest.suffix)
+
+        return new_dest
+
+    @staticmethod
+    def safe_remove(
+        file_path: Path,
+        logger: logging.Logger,
+        dry_run: bool,
+        use_trash: bool = False,
+        trash_root: Optional[Path] = None,
+        is_output: bool = False,
+        source_root: Optional[Path] = None,
+    ):
+        """Safely remove a file, optionally moving to trash."""
+        if GracefulExit.should_exit():
+            return
+
+        if dry_run:
+            logger.info(f"[DRY RUN] Would remove {file_path}")
+            return
+
+        try:
+            if source_root is None:
+                source_root = file_path.parent
+
+            if use_trash and trash_root:
+                new_dest = FileCleaner.calculate_trash_destination(
+                    file_path, source_root, trash_root, is_output
+                )
+                new_dest.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(file_path), str(new_dest))
+                logger.info(f"Moved to trash: {file_path} -> {new_dest}")
+            else:
+                if file_path.is_file():
+                    file_path.unlink()
+                elif file_path.is_dir():
+                    file_path.rmdir()
+                else:
+                    logger.warning(f"Unsupported file type for removal: {file_path}")
+                logger.info(f"Removed: {file_path}")
+        except Exception as e:
+            logger.error(f"Failed to remove {file_path}: {e}")
+
+    @staticmethod
+    def remove_orphaned_jpgs(
+        mapping: Dict[str, Dict[str, Path]],
+        processed: Set[Path],
+        logger: logging.Logger,
+        dry_run: bool = False,
+        use_trash: bool = False,
+        trash_root: Optional[Path] = None,
+    ) -> None:
+        """Remove JPG files without corresponding MP4 files."""
+        if GracefulExit.should_exit():
+            return
+
+        count = 0
+        for key, files in mapping.items():
+            if GracefulExit.should_exit():
+                break
+            jpg = files.get(".jpg")
+            mp4 = files.get(".mp4")
+            if not jpg or jpg in processed:
+                continue
+            if mp4:
+                continue
+            if dry_run:
+                logger.info("[DRY RUN] Found orphaned JPG (no MP4 pair): %s", jpg)
+            else:
+                logger.info("Found orphaned JPG (no MP4 pair): %s", jpg)
+            FileCleaner.remove_one(
+                jpg,
+                logger,
+                dry_run,
+                use_trash,
+                trash_root,
+                is_output=False,
+                source_root=jpg.parent,
+            )
+            count += 1
+
+        if not GracefulExit.should_exit():
+            logger.info(
+                "%s %d orphaned JPG files",
+                "[DRY RUN] Would remove" if dry_run else "Removed",
+                count,
+            )
+
+    @staticmethod
+    def clean_empty_directories(
+        root_dir: Path,
+        logger: Optional[logging.Logger] = None,
+        use_trash: bool = False,
+        trash_root: Optional[Path] = None,
+        is_output: bool = False,
+        is_trash: bool = False,
+    ):
+        """Remove empty date-structured directories."""
+        if GracefulExit.should_exit():
+            return
+
+        root = Path(root_dir)
+        if not root.exists():
+            return
+
+        for dirpath, dirs, files in os.walk(root, topdown=False):
+            if GracefulExit.should_exit():
+                break
+
+            p = Path(dirpath)
+            if p == root:
+                continue
+
+            # For trash directories, remove empty dirs permanently without validation
+            if is_trash:
+                if not files and not dirs:
+                    try:
+                        p.rmdir()
+                        if logger:
+                            logger.info(f"Removed empty trash directory: {p}")
+                    except Exception as e:
+                        if logger:
+                            logger.error(
+                                f"Failed to remove empty trash directory {p}: {e}"
+                            )
+                continue
+
+            # For non-trash directories, apply date-structure validation
+            try:
+                rel_parts = p.relative_to(root).parts
+            except ValueError:
+                continue
+
+            # Only clean directories with exactly 3 parts (year/month/day structure)
+            if len(rel_parts) != 3:
+                continue
+
+            y, m, d = rel_parts
+            try:
+                int(y)
+                int(m)
+                int(d)
+            except Exception:
+                continue
+
+            # Only remove if directory is actually empty
+            if not files and not dirs:
+                try:
+                    if use_trash and trash_root:
+                        new_dest = FileCleaner.calculate_trash_destination(
+                            p, root, trash_root, is_output
+                        )
+                        new_dest.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.move(str(p), str(new_dest))
+                        if logger:
+                            logger.info(
+                                f"Moved empty directory to trash: {p} -> {new_dest}"
+                            )
+                    else:
+                        p.rmdir()
+                        if logger:
+                            logger.info(f"Removed empty directory: {p}")
+                except Exception as e:
+                    if logger:
+                        logger.error(f"Failed to remove empty directory {p}: {e}")
+
+
+class Archiver:
+    """Main archiver class that orchestrates the entire process"""
+
+    def __init__(self, config: Config):
+        self.config = config
+        self.logger: Optional[logging.Logger] = None
+        self.progress_bar: Optional[ProgressReporter] = None
+
+    def setup_logging(self):
+        """Setup logging with optional progress bar"""
+        self.progress_bar = ProgressReporter(
+            total_files=0, silent=self.config.dry_run, out=sys.stderr
+        )
+        self.logger = Logger.setup(self.config.log_file, self.progress_bar)
+
+    def output_path(self, input_file: Path, timestamp: datetime) -> Path:
+        out_dir = self.config.output
+        # Check if parent directories match YYYY/MM/DD pattern
+        if len(input_file.parts) >= 4:
+            y, m, d = input_file.parts[-4:-1]
+            try:
+                int(y)
+                int(m)
+                int(d)
+                # Valid date structure → reuse it
+                return (
+                    out_dir
+                    / y
+                    / m
+                    / d
+                    / f"archived-{timestamp.strftime('%Y%m%d%H%M%S')}.mp4"
+                )
+            except ValueError:
+                pass  # Not a valid date structure → fall through
+        # Use timestamp-based structure
         return (
             out_dir
             / str(timestamp.year)
@@ -554,617 +772,495 @@ def output_path(input_file: Path, timestamp: datetime, out_dir: Path) -> Path:
             / f"archived-{timestamp.strftime('%Y%m%d%H%M%S')}.mp4"
         )
 
+    def get_all_archive_files(self) -> List[Path]:
+        """Get all archive files including trash if enabled."""
+        out_dir = self.config.output
+        trash_root = self.config.get_trash_root()
+        archive_files = (
+            list(out_dir.rglob("archived-*.mp4")) if out_dir.exists() else []
+        )
 
-def get_all_archive_files(
-    out_dir: Path, trash_root: Optional[Path] = None
-) -> List[Path]:
-    """Get all archive files including trash if enabled."""
-    archive_files = list(out_dir.rglob("archived-*.mp4")) if out_dir.exists() else []
+        if trash_root:
+            trash_output_dir = trash_root / "output"
+            if trash_output_dir.exists():
+                archive_files.extend(list(trash_output_dir.rglob("archived-*.mp4")))
 
-    if trash_root:
-        trash_output_dir = trash_root / "output"
-        if trash_output_dir.exists():
-            archive_files.extend(list(trash_output_dir.rglob("archived-*.mp4")))
+        return archive_files
 
-    return archive_files
+    def collect_file_info(
+        self, old_list: List[Tuple[Path, datetime]]
+    ) -> List[FileInfo]:
+        """Collect file information for all relevant files."""
+        all_files = []
+        seen_paths = set()
+        trash_root = self.config.get_trash_root()
 
+        # Get all archive files
+        archive_files = self.get_all_archive_files()
 
-def collect_file_info(
-    old_list: List[Tuple[Path, datetime]],
-    out_dir: Path,
-    trash_root: Optional[Path] = None,
-) -> List[FileInfo]:
-    """Collect file information for all relevant files."""
-    all_files = []
-    seen_paths = set()
-
-    # Get all archive files
-    archive_files = get_all_archive_files(out_dir, trash_root)
-
-    # Process archive files - mark them as archives and skip if in old_list (source)
-    for archive_file in archive_files:
-        try:
-            if not archive_file.is_file():
-                continue
-            size = archive_file.stat().st_size
-        except (OSError, IOError):
-            continue
-
-        ts_match = re.search(r"archived-(\d{14})\.mp4$", archive_file.name)
-        if ts_match:
+        # Process archive files - mark them as archives and skip if in old_list (source)
+        for archive_file in archive_files:
             try:
-                ts = datetime.strptime(ts_match.group(1), "%Y%m%d%H%M%S")
-                is_trash = trash_root is not None and any(
-                    p in archive_file.parents
-                    for p in [trash_root, trash_root / "output"]
-                )
-                if archive_file not in seen_paths:
-                    all_files.append(
-                        FileInfo(
-                            archive_file, ts, size, is_archive=True, is_trash=is_trash
-                        )
-                    )
-                    seen_paths.add(archive_file)
-            except ValueError:
-                pass
-
-    # Process source files from old_list - skip if already processed as archives
-    for fp, ts in old_list:
-        if fp in seen_paths:  # Skip if this is an archive file we've already processed
-            continue
-
-        try:
-            if not fp.is_file():
-                continue
-            size = fp.stat().st_size
-        except (OSError, IOError):
-            continue
-
-        is_trash = trash_root is not None and any(
-            p in fp.parents for p in [trash_root, trash_root / "input"]
-        )
-        all_files.append(FileInfo(fp, ts, size, is_archive=False, is_trash=is_trash))
-        seen_paths.add(fp)
-
-    return all_files
-
-
-def intelligent_cleanup(
-    all_files: List[FileInfo],
-    logger: logging.Logger,
-    dry_run: bool,
-    max_size_gb: int,
-    age_days: int,
-    clean_output: bool = False,  # Renamed parameter
-) -> List[FileInfo]:
-    """
-    Select files to remove based on location priority and size/age constraints.
-    Priority order: Trash > Archive > Source (oldest first within each category).
-    Output/archive files are excluded from age-based removal unless clean_output=True.
-    """
-    if not all_files:
-        return []
-
-    # Calculate totals
-    total_size = sum(f.size for f in all_files)
-    size_limit = max_size_gb * (1024**3)
-    age_cutoff = datetime.now() - timedelta(days=age_days)
-
-    logger.info(f"Current total size: {total_size / (1024**3):.1f} GB")
-    logger.info(f"Size limit: {max_size_gb} GB")
-    logger.info(f"Age cutoff: {age_cutoff.strftime('%Y-%m-%d %H:%M:%S')}")
-    if not clean_output:
-        logger.info("Output files excluded from age-based cleanup")
-
-    # Categorize files by location priority (0 = highest priority for removal)
-    categorized_files: Dict[int, List[FileInfo]] = {0: [], 1: [], 2: []}
-
-    for file_info in all_files:
-        if file_info.is_trash:
-            categorized_files[0].append(file_info)
-        elif file_info.is_archive:
-            categorized_files[1].append(file_info)
-        else:
-            categorized_files[2].append(file_info)
-
-    # Sort each category by timestamp (oldest first)
-    for category in categorized_files.values():
-        category.sort(key=lambda x: x.timestamp)
-
-    files_to_remove = []
-    remaining_size = total_size
-
-    # PHASE 1: Enforce size limit (if over limit)
-    if remaining_size > size_limit:
-        logger.info("Archive size exceeds limit")
-        logger.info(
-            f"Size threshold exceeded, removing files by priority to reach {max_size_gb} GB..."
-        )
-        logger.info(
-            "Priority order: Trash > Archive > Source (oldest first within each)"
-        )
-
-        # Remove files starting from highest priority (0) to lowest (2)
-        for priority in range(3):
-            if remaining_size <= size_limit:
-                break
-
-            category_name = {0: "Trash", 1: "Archive", 2: "Source"}[priority]
-            category_files = categorized_files[priority]
-
-            if category_files:
-                logger.info(f"Processing {category_name} files for size cleanup...")
-
-                for file_info in category_files:
-                    if remaining_size <= size_limit:
-                        break
-
-                    files_to_remove.append(file_info)
-                    remaining_size -= file_info.size
-
-                    if dry_run:
-                        logger.info(
-                            f"[DRY RUN] Would remove {category_name} file for size: {file_info.path} "
-                            f"({file_info.size / (1024**2):.1f} MB, {file_info.timestamp})"
-                        )
-
-        logger.info(
-            f"After size cleanup: {remaining_size / (1024**3):.1f} GB "
-            f"({len(files_to_remove)} files marked for removal)"
-        )
-    else:
-        # PHASE 2: Enforce age limit (only if under size limit AND age_days > 0)
-        if age_days > 0:
-            files_over_age_by_priority: Dict[int, List[FileInfo]] = {
-                0: [],
-                1: [],
-                2: [],
-            }
-
-            for priority in range(3):
-                # Skip archive files (priority 1) if clean_output is False
-                if priority == 1 and not clean_output:
+                if not archive_file.is_file():
                     continue
+                size = archive_file.stat().st_size
+            except (OSError, IOError):
+                continue
 
-                files_over_age_by_priority[priority] = [
-                    f for f in categorized_files[priority] if f.timestamp < age_cutoff
-                ]
+            ts_match = re.search(r"archived-(\d{14})\.mp4$", archive_file.name)
+            if ts_match:
+                try:
+                    ts = datetime.strptime(ts_match.group(1), "%Y%m%d%H%M%S")
+                    is_trash = trash_root is not None and any(
+                        p in archive_file.parents
+                        for p in [trash_root, trash_root / "output"]
+                    )
+                    if archive_file not in seen_paths:
+                        all_files.append(
+                            FileInfo(
+                                archive_file,
+                                ts,
+                                size,
+                                is_archive=True,
+                                is_trash=is_trash,
+                            )
+                        )
+                        seen_paths.add(archive_file)
+                except ValueError:
+                    pass
 
-            total_over_age = sum(
-                len(files) for files in files_over_age_by_priority.values()
+        # Process source files from old_list - skip if already processed as archives
+        for fp, ts in old_list:
+            if (
+                fp in seen_paths
+            ):  # Skip if this is an archive file we've already processed
+                continue
+
+            try:
+                if not fp.is_file():
+                    continue
+                size = fp.stat().st_size
+            except (OSError, IOError):
+                continue
+
+            is_trash = trash_root is not None and any(
+                p in fp.parents for p in [trash_root, trash_root / "input"]
+            )
+            all_files.append(
+                FileInfo(fp, ts, size, is_archive=False, is_trash=is_trash)
+            )
+            seen_paths.add(fp)
+
+        return all_files
+
+    def intelligent_cleanup(self, all_files: List[FileInfo]) -> List[FileInfo]:
+        """
+        Select files to remove based on location priority and size/age constraints.
+        Priority order: Trash > Archive > Source (oldest first within each category).
+        Output/archive files are excluded from age-based removal unless clean_output=True.
+        """
+        if not all_files:
+            return []
+
+        # Ensure logger is set
+        if self.logger is None:
+            raise RuntimeError("Logger not initialized. Call setup_logging() first.")
+
+        # Calculate totals
+        total_size = sum(f.size for f in all_files)
+        size_limit = self.config.max_size * (1024**3)
+        age_cutoff = datetime.now() - timedelta(days=self.config.age)
+
+        self.logger.info(f"Current total size: {total_size / (1024**3):.1f} GB")
+        self.logger.info(f"Size limit: {self.config.max_size} GB")
+        self.logger.info(f"Age cutoff: {age_cutoff.strftime('%Y-%m-%d %H:%M:%S')}")
+        if not self.config.clean_output:
+            self.logger.info("Output files excluded from age-based cleanup")
+
+        # Categorize files by location priority (0 = highest priority for removal)
+        categorized_files: Dict[int, List[FileInfo]] = {0: [], 1: [], 2: []}
+
+        for file_info in all_files:
+            if file_info.is_trash:
+                categorized_files[0].append(file_info)
+            elif file_info.is_archive:
+                categorized_files[1].append(file_info)
+            else:
+                categorized_files[2].append(file_info)
+
+        # Sort each category by timestamp (oldest first)
+        for category in categorized_files.values():
+            category.sort(key=lambda x: x.timestamp)
+
+        files_to_remove = []
+        remaining_size = total_size
+
+        # PHASE 1: Enforce size limit (if over limit)
+        if remaining_size > size_limit:
+            self.logger.info("Archive size exceeds limit")
+            self.logger.info(
+                f"Size threshold exceeded, removing files by priority to reach {self.config.max_size} GB..."
+            )
+            self.logger.info(
+                "Priority order: Trash > Archive > Source (oldest first within each)"
             )
 
-            if total_over_age > 0:
-                logger.info(f"Found {total_over_age} files older than {age_days} days")
+            # Remove files starting from highest priority (0) to lowest (2)
+            for priority in range(3):
+                if remaining_size <= size_limit:
+                    break
 
-                # Remove age-eligible files by priority order
+                category_name = {0: "Trash", 1: "Archive", 2: "Source"}[priority]
+                category_files = categorized_files[priority]
+
+                if category_files:
+                    self.logger.info(
+                        f"Processing {category_name} files for size cleanup..."
+                    )
+
+                    for file_info in category_files:
+                        if remaining_size <= size_limit:
+                            break
+
+                        files_to_remove.append(file_info)
+                        remaining_size -= file_info.size
+
+                        if self.config.dry_run:
+                            self.logger.info(
+                                f"[DRY RUN] Would remove {category_name} file for size: {file_info.path} "
+                                f"({file_info.size / (1024**2):.1f} MB, {file_info.timestamp})"
+                            )
+
+            self.logger.info(
+                f"After size cleanup: {remaining_size / (1024**3):.1f} GB "
+                f"({len(files_to_remove)} files marked for removal)"
+            )
+        else:
+            # PHASE 2: Enforce age limit (only if under size limit AND age_days > 0)
+            if self.config.age > 0:
+                files_over_age_by_priority: Dict[int, List[FileInfo]] = {
+                    0: [],
+                    1: [],
+                    2: [],
+                }
+
                 for priority in range(3):
                     # Skip archive files (priority 1) if clean_output is False
-                    if priority == 1 and not clean_output:
+                    if priority == 1 and not self.config.clean_output:
                         continue
 
-                    category_name = {0: "Trash", 1: "Archive", 2: "Source"}[priority]
-                    age_files = files_over_age_by_priority[priority]
+                    files_over_age_by_priority[priority] = [
+                        f
+                        for f in categorized_files[priority]
+                        if f.timestamp < age_cutoff
+                    ]
 
-                    if age_files:
-                        logger.info(
-                            f"Processing {category_name} files for age cleanup..."
-                        )
+                total_over_age = sum(
+                    len(files) for files in files_over_age_by_priority.values()
+                )
 
-                        for file_info in age_files:
-                            files_to_remove.append(file_info)
-                            remaining_size -= file_info.size
-
-                            if dry_run:
-                                logger.info(
-                                    f"[DRY RUN] Would remove {category_name} file for age: {file_info.path} "
-                                    f"({file_info.size / (1024**2):.1f} MB, {file_info.timestamp})"
-                                )
-
-                logger.info(f"Added {total_over_age} files for age-based removal")
-            else:
-                logger.info(f"No files older than {age_days} days found")
-        else:
-            logger.info("Age-based cleanup disabled (age_days <= 0)")
-
-    # Remove duplicates and sort by priority then timestamp
-    unique_files = {f.path: f for f in files_to_remove}
-    files_to_remove = list(unique_files.values())
-
-    def sort_key(file_info: FileInfo):
-        if file_info.is_trash:
-            priority = 0
-        elif file_info.is_archive:
-            priority = 1
-        else:
-            priority = 2
-        return (priority, file_info.timestamp)
-
-    files_to_remove.sort(key=sort_key)
-
-    logger.info(
-        f"Final removal plan: {len(files_to_remove)} files, "
-        f"final size: {remaining_size / (1024**3):.1f} GB"
-    )
-
-    return files_to_remove
-
-
-def process_files_intelligent(
-    old_list: List[Tuple[Path, datetime]],
-    out_dir: Path,
-    logger: logging.Logger,
-    dry_run: bool,
-    no_skip: bool,
-    mapping: Dict[str, Dict[str, Path]],
-    bar: ProgressBar,
-    trash_files: Optional[Set[Path]] = None,
-    use_trash: bool = False,
-    trash_root: Optional[Path] = None,
-    source_root: Optional[Path] = None,
-    max_size_gb: int = 500,
-    age_days: int = 30,  # kept for backward compat, but unused
-) -> Set[Path]:
-    """Process (transcode) files and return the set of *all* paths that were
-    finally removed (source MP4s + paired JPGs)."""
-    if trash_files is None:
-        trash_files = set()
-
-    logger.info(f"Found {len(old_list)} files to process")
-    if not old_list or GracefulExit.should_exit():
-        logger.info("No files to process or cancellation requested")
-        return set()
-
-    to_delete: Set[Path] = set()
-    for fp, ts in old_list:
-        if GracefulExit.should_exit():
-            break
-        if fp in trash_files:  # already in trash
-            continue
-
-        outp = output_path(fp, ts, out_dir)
-        jpg = mapping.get(ts.strftime("%Y%m%d%H%M%S"), {}).get(".jpg")
-
-        if dry_run:
-            logger.info("[DRY RUN] Would transcode %s -> %s", fp, outp)
-            if jpg:
-                logger.info("[DRY RUN] Would remove paired JPG %s", jpg)
-            continue
-
-        if (
-            not no_skip
-            and outp.exists()
-            and outp.stat().st_size > MIN_ARCHIVE_SIZE_BYTES
-        ):
-            logger.info("[SKIP] Archive exists and is large enough: %s", outp)
-            to_delete.add(fp)
-            if jpg:
-                to_delete.add(jpg)
-            continue
-
-        bar.start_file()
-        logger.info("Transcoding %s -> %s", fp, outp)
-        ok = transcode_file(
-            fp,
-            outp,
-            logger,
-            lambda pct: bar.update_progress(old_list.index((fp, ts)) + 1, pct),
-        )
-        if ok:
-            bar.finish_file(old_list.index((fp, ts)) + 1)
-            to_delete.add(fp)
-            if jpg:
-                to_delete.add(jpg)
-        else:
-            logger.error("Transcoding failed for %s – keeping source", fp)
-
-    bar.start_processing()
-
-    # Actually remove everything once
-    for p in sorted(to_delete, key=lambda _p: _p.name):
-        remove_one(
-            p,
-            logger,
-            dry_run,
-            use_trash,
-            trash_root,
-            is_output=False,
-            source_root=source_root or Path("/camera"),
-        )
-
-    bar.finish()
-    return to_delete
-
-
-def remove_orphaned_jpgs(
-    mapping: Dict[str, Dict[str, Path]],
-    processed: Set[Path],
-    logger: logging.Logger,
-    dry_run: bool = False,
-    use_trash: bool = False,
-    trash_root: Optional[Path] = None,
-) -> None:
-    """Remove JPG files without corresponding MP4 files."""
-    if GracefulExit.should_exit():
-        return
-
-    count = 0
-    for key, files in mapping.items():
-        if GracefulExit.should_exit():
-            break
-        jpg = files.get(".jpg")
-        mp4 = files.get(".mp4")
-        if not jpg or jpg in processed:
-            continue
-        if mp4:
-            continue
-        if dry_run:
-            logger.info("[DRY RUN] Found orphaned JPG (no MP4 pair): %s", jpg)
-        else:
-            logger.info("Found orphaned JPG (no MP4 pair): %s", jpg)
-        remove_one(
-            jpg,
-            logger,
-            dry_run,
-            use_trash,
-            trash_root,
-            is_output=False,
-            source_root=jpg.parent,
-        )
-        count += 1
-
-    if not GracefulExit.should_exit():
-        logger.info(
-            "%s %d orphaned JPG files",
-            "[DRY RUN] Would remove" if dry_run else "Removed",
-            count,
-        )
-
-
-def clean_empty_directories(
-    root_dir: Path,
-    logger: Optional[logging.Logger] = None,
-    use_trash: bool = False,
-    trash_root: Optional[Path] = None,
-    is_output: bool = False,
-    is_trash: bool = False,
-):
-    """Remove empty date-structured directories."""
-    if GracefulExit.should_exit():
-        return
-
-    root = Path(root_dir)
-    if not root.exists():
-        return
-
-    for dirpath, dirs, files in os.walk(root, topdown=False):
-        if GracefulExit.should_exit():
-            break
-
-        p = Path(dirpath)
-        if p == root:
-            continue
-
-        # For trash directories, remove empty dirs permanently without validation
-        if is_trash:
-            if not files and not dirs:
-                try:
-                    p.rmdir()
-                    if logger:
-                        logger.info(f"Removed empty trash directory: {p}")
-                except Exception as e:
-                    if logger:
-                        logger.error(f"Failed to remove empty trash directory {p}: {e}")
-            continue
-
-        # For non-trash directories, apply date-structure validation
-        try:
-            rel_parts = p.relative_to(root).parts
-        except ValueError:
-            continue
-
-        # Only clean directories with exactly 3 parts (year/month/day structure)
-        if len(rel_parts) != 3:
-            continue
-
-        y, m, d = rel_parts
-        try:
-            int(y)
-            int(m)
-            int(d)
-        except Exception:
-            continue
-
-        # Only remove if directory is actually empty
-        if not files and not dirs:
-            try:
-                if use_trash and trash_root:
-                    new_dest = calculate_trash_destination(
-                        p, root, trash_root, is_output
+                if total_over_age > 0:
+                    self.logger.info(
+                        f"Found {total_over_age} files older than {self.config.age} days"
                     )
-                    new_dest.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.move(str(p), str(new_dest))
-                    if logger:
-                        logger.info(
-                            f"Moved empty directory to trash: {p} -> {new_dest}"
-                        )
+
+                    # Remove age-eligible files by priority order
+                    for priority in range(3):
+                        # Skip archive files (priority 1) if clean_output is False
+                        if priority == 1 and not self.config.clean_output:
+                            continue
+
+                        category_name = {0: "Trash", 1: "Archive", 2: "Source"}[
+                            priority
+                        ]
+                        age_files = files_over_age_by_priority[priority]
+
+                        if age_files:
+                            self.logger.info(
+                                f"Processing {category_name} files for age cleanup..."
+                            )
+
+                            for file_info in age_files:
+                                files_to_remove.append(file_info)
+                                remaining_size -= file_info.size
+
+                                if self.config.dry_run:
+                                    self.logger.info(
+                                        f"[DRY RUN] Would remove {category_name} file for age: {file_info.path} "
+                                        f"({file_info.size / (1024**2):.1f} MB, {file_info.timestamp})"
+                                    )
+
+                    self.logger.info(
+                        f"Added {total_over_age} files for age-based removal"
+                    )
                 else:
-                    p.rmdir()
-                    if logger:
-                        logger.info(f"Removed empty directory: {p}")
-            except Exception as e:
-                if logger:
-                    logger.error(f"Failed to remove empty directory {p}: {e}")
+                    self.logger.info(
+                        f"No files older than {self.config.age} days found"
+                    )
+            else:
+                self.logger.info("Age-based cleanup disabled (age_days <= 0)")
 
+        # Remove duplicates and sort by priority then timestamp
+        unique_files = {f.path: f for f in files_to_remove}
+        files_to_remove = list(unique_files.values())
 
-def cleanup_archive_size_limit(
-    base_dir: Path,
-    out_dir: Path,
-    logger: logging.Logger,
-    max_size_gb: int,
-    dry_run: bool,
-    use_trash: bool = False,
-    trash_root: Optional[Path] = None,
-    age_days: int = 30,
-    clean_output: bool = False,  # Renamed parameter
-) -> None:
-    """Comprehensive storage management with location-based priorities."""
-    if GracefulExit.should_exit():
-        return
+        def sort_key(file_info: FileInfo):
+            if file_info.is_trash:
+                priority = 0
+            elif file_info.is_archive:
+                priority = 1
+            else:
+                priority = 2
+            return (priority, file_info.timestamp)
 
-    # Step 1: Complete system discovery
-    mp4s, mapping, trash_files = scan_files(
-        base_dir, include_trash=use_trash, trash_root=trash_root
-    )
+        files_to_remove.sort(key=sort_key)
 
-    if dry_run:
-        logger.info("[DRY RUN] Would clean empty directories")
-        logger.info("[DRY RUN] Would enforce storage limits")
-        # Simulate the intelligent cleanup to show what would happen
-        all_file_infos = collect_file_info(mp4s, out_dir, trash_root)
-        _ = intelligent_cleanup(
-            all_file_infos, logger, dry_run, max_size_gb, age_days, clean_output
-        )
-        logger.info("[DRY RUN] Would clean up orphaned JPG files")
-        return
-
-    # Step 2: File-based cleanup
-    # Collect info for ALL files (not just old ones)
-    all_file_infos = collect_file_info(mp4s, out_dir, trash_root)
-
-    # Step 3: Apply intelligent cleanup
-    files_to_remove = intelligent_cleanup(
-        all_file_infos, logger, dry_run, max_size_gb, age_days, clean_output
-    )
-
-    # Step 4: Execute file removal
-    for file_info in files_to_remove:
-        remove_one(
-            file_info.path,
-            logger,
-            dry_run=False,
-            use_trash=use_trash,
-            trash_root=trash_root,
-            is_output=file_info.is_archive,
-            source_root=base_dir if not file_info.is_archive else out_dir,
+        self.logger.info(
+            f"Final removal plan: {len(files_to_remove)} files, "
+            f"final size: {remaining_size / (1024**3):.1f} GB"
         )
 
-    # Step 5: Clean up orphaned JPGs
-    remove_orphaned_jpgs(mapping, set(), logger, False, use_trash, trash_root)
+        return files_to_remove
 
-    # Step 6: Clean up empty directories AFTER all file operations are complete
-    clean_empty_directories(
-        base_dir, logger, use_trash, trash_root, is_output=False, is_trash=False
-    )
-    clean_empty_directories(
-        out_dir, logger, use_trash, trash_root, is_output=True, is_trash=False
-    )
-    if trash_root and trash_root.exists():
-        clean_empty_directories(
-            trash_root,
-            logger,
-            use_trash=False,
-            trash_root=None,
-            is_output=False,
-            is_trash=True,
+    def process_files_intelligent(
+        self,
+        old_list: List[Tuple[Path, datetime]],
+        mapping: Dict[str, Dict[str, Path]],
+        trash_files: Optional[Set[Path]] = None,
+    ) -> Set[Path]:
+        """Process (transcode) files and return the set of *all* paths that were
+        finally removed (source MP4s + paired JPGs)."""
+        if trash_files is None:
+            trash_files = set()
+
+        # Ensure logger and progress_bar are set
+        if self.logger is None or self.progress_bar is None:
+            raise RuntimeError(
+                "Logger or progress_bar not initialized. Call setup_logging() first."
+            )
+
+        # Store references to avoid type checker issues with lambdas
+        logger = self.logger
+        progress_bar = self.progress_bar
+
+        logger.info(f"Found {len(old_list)} files to process")
+        if not old_list or GracefulExit.should_exit():
+            logger.info("No files to process or cancellation requested")
+            return set()
+
+        to_delete: Set[Path] = set()
+        for fp, ts in old_list:
+            if GracefulExit.should_exit():
+                break
+            if fp in trash_files:  # already in trash
+                continue
+
+            outp = self.output_path(fp, ts)
+            jpg = mapping.get(ts.strftime("%Y%m%d%H%M%S"), {}).get(".jpg")
+
+            if self.config.dry_run:
+                logger.info("[DRY RUN] Would transcode %s -> %s", fp, outp)
+                if jpg:
+                    logger.info("[DRY RUN] Would remove paired JPG %s", jpg)
+                continue
+
+            if (
+                not self.config.no_skip
+                and outp.exists()
+                and outp.stat().st_size > MIN_ARCHIVE_SIZE_BYTES
+            ):
+                logger.info("[SKIP] Archive exists and is large enough: %s", outp)
+                to_delete.add(fp)
+                if jpg:
+                    to_delete.add(jpg)
+                continue
+
+            progress_bar.start_file()
+            logger.info("Transcoding %s -> %s", fp, outp)
+            ok = Transcoder.transcode_file(
+                fp,
+                outp,
+                logger,  # Type checker now knows logger is not None
+                lambda pct: progress_bar.update_progress(
+                    old_list.index((fp, ts)) + 1, pct
+                ),
+            )
+            if ok:
+                progress_bar.finish_file(old_list.index((fp, ts)) + 1)
+                to_delete.add(fp)
+                if jpg:
+                    to_delete.add(jpg)
+            else:
+                logger.error("Transcoding failed for %s – keeping source", fp)
+
+        progress_bar.start_processing()
+
+        # Actually remove everything once
+        for p in sorted(to_delete, key=lambda _p: _p.name):
+            FileCleaner.remove_one(
+                p,
+                logger,  # Type checker now knows logger is not None
+                self.config.dry_run,
+                self.config.use_trash,
+                self.config.get_trash_root(),
+                is_output=False,
+                source_root=self.config.directory,
+            )
+
+        progress_bar.finish()
+        return to_delete
+
+    def cleanup_archive_size_limit(self) -> None:
+        """Comprehensive storage management with location-based priorities."""
+        if GracefulExit.should_exit():
+            return
+
+        # Ensure logger is set
+        if self.logger is None:
+            raise RuntimeError("Logger not initialized. Call setup_logging() first.")
+
+        base_dir = self.config.directory
+        trash_root = self.config.get_trash_root()
+
+        # Step 1: Complete system discovery
+        mp4s, mapping, trash_files = FileScanner.scan_files(
+            base_dir, include_trash=self.config.use_trash, trash_root=trash_root
         )
 
+        if self.config.dry_run:
+            self.logger.info("[DRY RUN] Would clean empty directories")
+            self.logger.info("[DRY RUN] Would enforce storage limits")
+            # Simulate the intelligent cleanup to show what would happen
+            all_file_infos = self.collect_file_info(mp4s)
+            _ = self.intelligent_cleanup(all_file_infos)
+            self.logger.info("[DRY RUN] Would clean up orphaned JPG files")
+            return
 
-def run_archiver(args) -> int:
-    """Main archiver logic with proper error handling."""
-    base_dir = args.directory if args.directory.exists() else Path("/camera")
-    if not base_dir.exists():
-        print(
-            f"Error: Directory {args.directory} does not exist and /camera is missing"
-        )
-        return 1
+        # Step 2: File-based cleanup
+        # Collect info for ALL files (not just old ones)
+        all_file_infos = self.collect_file_info(mp4s)
 
-    out_dir = args.output or (base_dir / "archived")
-    trash_root = (
-        args.trashdir
-        if args.trashdir
-        else (base_dir / ".deleted" if args.use_trash else None)
-    )
+        # Step 3: Apply intelligent cleanup
+        files_to_remove = self.intelligent_cleanup(all_file_infos)
 
-    if trash_root is not None:
-        trash_root.mkdir(parents=True, exist_ok=True)
+        # Step 4: Execute file removal
+        for file_info in files_to_remove:
+            FileCleaner.remove_one(
+                file_info.path,
+                self.logger,  # Type checker now knows logger is not None
+                dry_run=False,
+                use_trash=self.config.use_trash,
+                trash_root=trash_root,
+                is_output=file_info.is_archive,
+                source_root=base_dir
+                if not file_info.is_archive
+                else self.config.output,
+            )
 
-    # Always perform comprehensive discovery
-    mp4s, mapping, trash_files = scan_files(
-        base_dir, include_trash=args.use_trash, trash_root=trash_root
-    )
-
-    if not args.cleanup:
-        # Normal mode: transcoding files
-        cutoff = datetime.now() - timedelta(days=args.age)
-        old_list = [(p, t) for p, t in mp4s if t < cutoff]
-        bar = ProgressBar(
-            total_files=len(old_list), silent=args.dry_run, out=sys.stderr
-        )
-        logger = setup_logging(base_dir / "transcoding.log", progress_bar=bar)
-
-        # For backward compatibility in transcoding logic, keep the old process_files_intelligent
-        # but update it to not call intelligent_cleanup internally
-        _ = process_files_intelligent(
-            old_list=old_list,
-            out_dir=out_dir,
-            logger=logger,
-            dry_run=args.dry_run,
-            no_skip=args.no_skip,
-            mapping=mapping,
-            bar=bar,
-            trash_files=trash_files,
-            use_trash=args.use_trash,
-            trash_root=trash_root,
-            source_root=base_dir,
-            max_size_gb=args.max_size,
-            age_days=args.age,
-        )
-    else:
-        # Cleanup mode: no transcoding
-        bar = ProgressBar(total_files=0, silent=True, out=sys.stderr)
-        logger = setup_logging(base_dir / "transcoding.log", progress_bar=bar)
-        logger.info(
-            "Cleanup mode: skipping transcoding, only performing cleanup operations"
+        # Step 5: Clean up orphaned JPGs
+        FileCleaner.remove_orphaned_jpgs(
+            mapping, set(), self.logger, False, self.config.use_trash, trash_root
         )
 
-    for msg in [
-        "Starting camera archive process...",
-        f"Input: {base_dir}",
-        f"Output: {out_dir}",
-        f"Trash: {trash_root}",
-        f"Age threshold: {args.age} days",
-        f"Size limit: {args.max_size} GB",
-        f"Dry run: {args.dry_run}",
-        f"Cleanup only: {args.cleanup}",
-        f"Clean output files: {getattr(args, 'clean_output', False)}",
-    ]:
-        if not GracefulExit.should_exit():
-            logger.info(msg)
-
-    # Always perform comprehensive storage management
-    if not GracefulExit.should_exit():
-        cleanup_archive_size_limit(
+        # Step 6: Clean up empty directories AFTER all file operations are complete
+        FileCleaner.clean_empty_directories(
             base_dir,
-            out_dir,
-            logger,
-            args.max_size,
-            args.dry_run,
-            use_trash=args.use_trash,
-            trash_root=trash_root,
-            age_days=args.age,
-            clean_output=getattr(args, "clean_output", False),
+            self.logger,
+            self.config.use_trash,
+            trash_root,
+            is_output=False,
+            is_trash=False,
+        )
+        FileCleaner.clean_empty_directories(
+            self.config.output,
+            self.logger,
+            self.config.use_trash,
+            trash_root,
+            is_output=True,
+            is_trash=False,
+        )
+        if trash_root and trash_root.exists():
+            FileCleaner.clean_empty_directories(
+                trash_root,
+                self.logger,
+                use_trash=False,
+                trash_root=None,
+                is_output=False,
+                is_trash=True,
+            )
+
+    def run(self) -> int:
+        """Main archiver logic with proper error handling."""
+        base_dir = self.config.directory
+        if not base_dir.exists():
+            print(
+                f"Error: Directory {self.config.directory} does not exist and /camera is missing"
+            )
+            return 1
+
+        trash_root = self.config.get_trash_root()
+
+        if trash_root is not None:
+            trash_root.mkdir(parents=True, exist_ok=True)
+
+        # Always perform comprehensive discovery
+        mp4s, mapping, trash_files = FileScanner.scan_files(
+            base_dir, include_trash=self.config.use_trash, trash_root=trash_root
         )
 
-    if GracefulExit.should_exit():
-        logger.info("Archive process was cancelled")
-        return 1
-    elif args.dry_run:
-        logger.info("[DRY RUN] Done - no files were actually modified")
-        return 0
-    else:
-        logger.info("Archive process completed successfully")
-        return 0
+        if not self.config.cleanup:
+            # Normal mode: transcoding files
+            cutoff = datetime.now() - timedelta(days=self.config.age)
+            old_list = [(p, t) for p, t in mp4s if t < cutoff]
+            self.progress_bar = ProgressReporter(
+                total_files=len(old_list), silent=self.config.dry_run, out=sys.stderr
+            )
+            self.logger = Logger.setup(self.config.log_file, self.progress_bar)
+
+            # For backward compatibility in transcoding logic, keep the old process_files_intelligent
+            # but update it to not call intelligent_cleanup internally
+            _ = self.process_files_intelligent(
+                old_list=old_list,
+                mapping=mapping,
+                trash_files=trash_files,
+            )
+        else:
+            # Cleanup mode: no transcoding
+            self.progress_bar = ProgressReporter(
+                total_files=0, silent=True, out=sys.stderr
+            )
+            self.logger = Logger.setup(self.config.log_file, self.progress_bar)
+            self.logger.info(
+                "Cleanup mode: skipping transcoding, only performing cleanup operations"
+            )
+
+        for msg in [
+            "Starting camera archive process...",
+            f"Input: {base_dir}",
+            f"Output: {self.config.output}",
+            f"Trash: {trash_root}",
+            f"Age threshold: {self.config.age} days",
+            f"Size limit: {self.config.max_size} GB",
+            f"Dry run: {self.config.dry_run}",
+            f"Cleanup only: {self.config.cleanup}",
+            f"Clean output files: {self.config.clean_output}",
+        ]:
+            if not GracefulExit.should_exit():
+                self.logger.info(msg)
+
+        # Always perform comprehensive storage management
+        if not GracefulExit.should_exit():
+            self.cleanup_archive_size_limit()
+
+        if GracefulExit.should_exit():
+            self.logger.info("Archive process was cancelled")
+            return 1
+        elif self.config.dry_run:
+            self.logger.info("[DRY RUN] Done - no files were actually modified")
+            return 0
+        else:
+            self.logger.info("Archive process completed successfully")
+            return 0
 
 
 def main():
@@ -1197,9 +1293,9 @@ def main():
             help="Do not skip transcoding when archived copy exists",
         )
         parser.add_argument(
-            "--use-trash",
+            "--no-trash",
             action="store_true",
-            help="Move deleted items to trash instead of deleting",
+            help="Disable trash functionality (permanently delete files)",
         )
         parser.add_argument(
             "--trashdir", type=Path, help="Specify custom trash directory"
@@ -1215,12 +1311,18 @@ def main():
             help="Include output files in age-based cleanup (default: exclude output files)",
         )
         args = parser.parse_args()
+        # Handle the --no-trash flag
+        args.use_trash = not args.no_trash
         if len(sys.argv) == 1:
             parser.print_help()
             sys.exit(1)
 
-        exit_code = run_archiver(args)
+        # Create config and run archiver inside the same try block
+        config = Config.from_args(args)
+        archiver = Archiver(config)
+        exit_code = archiver.run()
         sys.exit(exit_code)
+
     except KeyboardInterrupt:
         GracefulExit.request_exit()
         print("\nReceived KeyboardInterrupt, shutting down gracefully...")
