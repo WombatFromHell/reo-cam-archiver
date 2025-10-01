@@ -534,19 +534,61 @@ class TestComprehensiveIntegration(TestBase):
         )
         all_files = [zero_file_info]
 
-        # Test intelligent_cleanup directly with new signature
+        # Test intelligent_cleanup with clean_output=False (default) - archive files should NOT be removed by age
         files_to_remove = archiver.intelligent_cleanup(
             all_files=all_files,
             logger=logger,
             dry_run=False,
             max_size_gb=500,
             age_days=30,
+            clean_output=False,  # Explicitly test default behavior
         )
-        self.assertEqual(len(files_to_remove), 1)
-        self.assertEqual(files_to_remove[0].path, zero_file)
+        self.assertEqual(
+            len(files_to_remove), 0
+        )  # Should not remove archive file when clean_output=False
+
+        # Test intelligent_cleanup with clean_output=True - archive files SHOULD be removed by age
+        logger2, log_stream2 = self.capture_logger()
+        files_to_remove_with_clean = archiver.intelligent_cleanup(
+            all_files=all_files,
+            logger=logger2,
+            dry_run=False,
+            max_size_gb=500,
+            age_days=30,
+            clean_output=True,  # Explicitly enable archive cleanup
+        )
+        self.assertEqual(len(files_to_remove_with_clean), 1)
+        self.assertEqual(files_to_remove_with_clean[0].path, zero_file)
+
+        # Test size-based cleanup (should work regardless of clean_output setting)
+        logger3, log_stream3 = self.capture_logger()
+        large_file = (
+            archive_dir / f"archived-{ts_old.strftime('%Y%m%d%H%M%S')}_large.mp4"
+        )
+        self.create_file(large_file, b"x" * (600 * 1024 * 1024))  # 600 MB
+        large_file_info = archiver.FileInfo(
+            path=large_file,
+            timestamp=ts_old,
+            size=600 * 1024 * 1024,
+            is_archive=True,
+            is_trash=False,
+        )
+
+        # Test size cleanup with clean_output=False - should still remove due to size limit
+        files_to_remove_size = archiver.intelligent_cleanup(
+            all_files=[large_file_info],
+            logger=logger3,
+            dry_run=False,
+            max_size_gb=0,  # Size limit of 0 GB to force size-based removal
+            age_days=30,
+            clean_output=False,
+        )
+        self.assertEqual(
+            len(files_to_remove_size), 1
+        )  # Size-based removal should work regardless of clean_output
 
         # Test error handling during stat (OSError)
-        logger2, log_stream2 = self.capture_logger()
+        logger4, log_stream4 = self.capture_logger()
         broken_file = archive_dir / "archived-20230101000000.mp4"
         self.create_file(broken_file, b"x" * 1000)
         broken_file_info = archiver.FileInfo(
@@ -564,17 +606,33 @@ class TestComprehensiveIntegration(TestBase):
             return original_stat(path_self, follow_symlinks=follow_symlinks)
 
         with patch.object(Path, "stat", mock_stat_raise_on_broken):
-            files_to_remove = archiver.intelligent_cleanup(
+            # Test with clean_output=True - should attempt to remove old archive file
+            files_to_remove_broken = archiver.intelligent_cleanup(
                 all_files=[broken_file_info],
-                logger=logger2,
+                logger=logger4,
                 dry_run=False,
                 max_size_gb=500,
                 age_days=30,
+                clean_output=True,
             )
-        # The file is old (2023) and under size limit → removed due to age
-        # This is correct behavior! Don't assert len == 0.
-        self.assertEqual(len(files_to_remove), 1)
-        self.assertIn("Current total size:", log_stream2.getvalue())
+        # The file is old (2023) and under size limit → removed due to age when clean_output=True
+        self.assertEqual(len(files_to_remove_broken), 1)
+        self.assertIn("Current total size:", log_stream4.getvalue())
+
+        # Test with clean_output=False - should NOT remove old archive file even with stat error
+        logger5, log_stream5 = self.capture_logger()
+        with patch.object(Path, "stat", mock_stat_raise_on_broken):
+            files_to_remove_broken_no_clean = archiver.intelligent_cleanup(
+                all_files=[broken_file_info],
+                logger=logger5,
+                dry_run=False,
+                max_size_gb=500,
+                age_days=30,
+                clean_output=False,
+            )
+        self.assertEqual(
+            len(files_to_remove_broken_no_clean), 0
+        )  # Should not remove when clean_output=False
 
     def test_directory_and_archive_management_integration(self):
         """Integration test for directory cleanup and archive size management"""
@@ -592,12 +650,17 @@ class TestComprehensiveIntegration(TestBase):
         self.assertTrue(non_empty_dir.exists())
         self.assertTrue(invalid_dir.exists())
 
-        # Test trash-based removal
+        # Test trash-based removal for source directories
         empty_dir2 = self.temp_dir / "2024" / "01" / "01"
         empty_dir2.mkdir(parents=True)
         trash_root = self.temp_dir / ".deleted"
         archiver.clean_empty_directories(
-            self.temp_dir, logger=None, use_trash=True, trash_root=trash_root
+            self.temp_dir,
+            logger=None,
+            use_trash=True,
+            trash_root=trash_root,
+            is_output=False,
+            is_trash=False,
         )
         trash_path = trash_root / "input" / "2024" / "01" / "01"
         self.assertTrue(trash_path.exists())
@@ -611,7 +674,7 @@ class TestComprehensiveIntegration(TestBase):
         outside_dir = self.temp_dir / "outside" / "2023" / "12" / "01"
         outside_dir.mkdir(parents=True)
         # This should trigger ValueError in relative_to
-        archiver.clean_empty_directories(root, logger=logger)
+        archiver.clean_empty_directories(root, logger=logger, is_trash=False)
         # Should not crash, outside_dir should remain
         self.assertTrue(outside_dir.exists())
 
@@ -624,10 +687,29 @@ class TestComprehensiveIntegration(TestBase):
         for invalid_dir in invalid_dirs:
             invalid_dir.mkdir(parents=True)
 
-        archiver.clean_empty_directories(self.temp_dir, logger=logger)
+        archiver.clean_empty_directories(self.temp_dir, logger=logger, is_trash=False)
         # All should remain due to ValueError in int() conversion
         for invalid_dir in invalid_dirs:
             self.assertTrue(invalid_dir.exists())
+
+        # Test trash directory cleanup (permanent removal of empty dirs in trash)
+        trash_empty_dir = trash_root / "input" / "2025" / "01" / "01"
+        trash_empty_dir.mkdir(parents=True)
+        trash_non_empty_dir = trash_root / "input" / "2025" / "01" / "02"
+        trash_non_empty_dir.mkdir(parents=True)
+        self.create_file(trash_non_empty_dir / "file.txt")
+
+        # Clean trash directories - should remove empty ones permanently
+        archiver.clean_empty_directories(
+            trash_root,
+            logger=logger,
+            use_trash=False,
+            trash_root=None,
+            is_output=False,
+            is_trash=True,
+        )
+        self.assertFalse(trash_empty_dir.exists())
+        self.assertTrue(trash_non_empty_dir.exists())
 
         # Test archive size cleanup scenarios
         logger, log_stream = self.capture_logger()

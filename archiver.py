@@ -635,10 +635,12 @@ def intelligent_cleanup(
     dry_run: bool,
     max_size_gb: int,
     age_days: int,
+    clean_output: bool = False,  # Renamed parameter
 ) -> List[FileInfo]:
     """
     Select files to remove based on location priority and size/age constraints.
     Priority order: Trash > Archive > Source (oldest first within each category).
+    Output/archive files are excluded from age-based removal unless clean_output=True.
     """
     if not all_files:
         return []
@@ -651,6 +653,8 @@ def intelligent_cleanup(
     logger.info(f"Current total size: {total_size / (1024**3):.1f} GB")
     logger.info(f"Size limit: {max_size_gb} GB")
     logger.info(f"Age cutoff: {age_cutoff.strftime('%Y-%m-%d %H:%M:%S')}")
+    if not clean_output:
+        logger.info("Output files excluded from age-based cleanup")
 
     # Categorize files by location priority (0 = highest priority for removal)
     categorized_files: Dict[int, List[FileInfo]] = {0: [], 1: [], 2: []}
@@ -718,6 +722,10 @@ def intelligent_cleanup(
             }
 
             for priority in range(3):
+                # Skip archive files (priority 1) if clean_output is False
+                if priority == 1 and not clean_output:
+                    continue
+
                 files_over_age_by_priority[priority] = [
                     f for f in categorized_files[priority] if f.timestamp < age_cutoff
                 ]
@@ -731,6 +739,10 @@ def intelligent_cleanup(
 
                 # Remove age-eligible files by priority order
                 for priority in range(3):
+                    # Skip archive files (priority 1) if clean_output is False
+                    if priority == 1 and not clean_output:
+                        continue
+
                     category_name = {0: "Trash", 1: "Archive", 2: "Source"}[priority]
                     age_files = files_over_age_by_priority[priority]
 
@@ -915,12 +927,16 @@ def clean_empty_directories(
     use_trash: bool = False,
     trash_root: Optional[Path] = None,
     is_output: bool = False,
+    is_trash: bool = False,
 ):
     """Remove empty date-structured directories."""
     if GracefulExit.should_exit():
         return
 
     root = Path(root_dir)
+    if not root.exists():
+        return
+
     for dirpath, dirs, files in os.walk(root, topdown=False):
         if GracefulExit.should_exit():
             break
@@ -929,11 +945,25 @@ def clean_empty_directories(
         if p == root:
             continue
 
+        # For trash directories, remove empty dirs permanently without validation
+        if is_trash:
+            if not files and not dirs:
+                try:
+                    p.rmdir()
+                    if logger:
+                        logger.info(f"Removed empty trash directory: {p}")
+                except Exception as e:
+                    if logger:
+                        logger.error(f"Failed to remove empty trash directory {p}: {e}")
+            continue
+
+        # For non-trash directories, apply date-structure validation
         try:
             rel_parts = p.relative_to(root).parts
         except ValueError:
             continue
 
+        # Only clean directories with exactly 3 parts (year/month/day structure)
         if len(rel_parts) != 3:
             continue
 
@@ -945,6 +975,7 @@ def clean_empty_directories(
         except Exception:
             continue
 
+        # Only remove if directory is actually empty
         if not files and not dirs:
             try:
                 if use_trash and trash_root:
@@ -953,8 +984,14 @@ def clean_empty_directories(
                     )
                     new_dest.parent.mkdir(parents=True, exist_ok=True)
                     shutil.move(str(p), str(new_dest))
+                    if logger:
+                        logger.info(
+                            f"Moved empty directory to trash: {p} -> {new_dest}"
+                        )
                 else:
                     p.rmdir()
+                    if logger:
+                        logger.info(f"Removed empty directory: {p}")
             except Exception as e:
                 if logger:
                     logger.error(f"Failed to remove empty directory {p}: {e}")
@@ -969,6 +1006,7 @@ def cleanup_archive_size_limit(
     use_trash: bool = False,
     trash_root: Optional[Path] = None,
     age_days: int = 30,
+    clean_output: bool = False,  # Renamed parameter
 ) -> None:
     """Comprehensive storage management with location-based priorities."""
     if GracefulExit.should_exit():
@@ -979,31 +1017,27 @@ def cleanup_archive_size_limit(
         base_dir, include_trash=use_trash, trash_root=trash_root
     )
 
-    # Step 2: Empty directory cleanup (highest priority)
-    if not dry_run:
-        clean_empty_directories(
-            base_dir, logger, use_trash, trash_root, is_output=False
-        )
-        clean_empty_directories(out_dir, logger, use_trash, trash_root, is_output=True)
-        if trash_root:
-            clean_empty_directories(
-                trash_root, logger, use_trash, trash_root, is_output=False
-            )
-
-    # Step 3: File-based cleanup
     if dry_run:
+        logger.info("[DRY RUN] Would clean empty directories")
         logger.info("[DRY RUN] Would enforce storage limits")
+        # Simulate the intelligent cleanup to show what would happen
+        all_file_infos = collect_file_info(mp4s, out_dir, trash_root)
+        _ = intelligent_cleanup(
+            all_file_infos, logger, dry_run, max_size_gb, age_days, clean_output
+        )
+        logger.info("[DRY RUN] Would clean up orphaned JPG files")
         return
 
+    # Step 2: File-based cleanup
     # Collect info for ALL files (not just old ones)
     all_file_infos = collect_file_info(mp4s, out_dir, trash_root)
 
-    # Step 4: Apply intelligent cleanup
+    # Step 3: Apply intelligent cleanup
     files_to_remove = intelligent_cleanup(
-        all_file_infos, logger, dry_run, max_size_gb, age_days
+        all_file_infos, logger, dry_run, max_size_gb, age_days, clean_output
     )
 
-    # Step 5: Execute file removal
+    # Step 4: Execute file removal
     for file_info in files_to_remove:
         remove_one(
             file_info.path,
@@ -1015,8 +1049,25 @@ def cleanup_archive_size_limit(
             source_root=base_dir if not file_info.is_archive else out_dir,
         )
 
-    # Step 6: Clean up orphaned JPGs
+    # Step 5: Clean up orphaned JPGs
     remove_orphaned_jpgs(mapping, set(), logger, False, use_trash, trash_root)
+
+    # Step 6: Clean up empty directories AFTER all file operations are complete
+    clean_empty_directories(
+        base_dir, logger, use_trash, trash_root, is_output=False, is_trash=False
+    )
+    clean_empty_directories(
+        out_dir, logger, use_trash, trash_root, is_output=True, is_trash=False
+    )
+    if trash_root and trash_root.exists():
+        clean_empty_directories(
+            trash_root,
+            logger,
+            use_trash=False,
+            trash_root=None,
+            is_output=False,
+            is_trash=True,
+        )
 
 
 def run_archiver(args) -> int:
@@ -1086,6 +1137,7 @@ def run_archiver(args) -> int:
         f"Size limit: {args.max_size} GB",
         f"Dry run: {args.dry_run}",
         f"Cleanup only: {args.cleanup}",
+        f"Clean output files: {getattr(args, 'clean_output', False)}",
     ]:
         if not GracefulExit.should_exit():
             logger.info(msg)
@@ -1101,6 +1153,7 @@ def run_archiver(args) -> int:
             use_trash=args.use_trash,
             trash_root=trash_root,
             age_days=args.age,
+            clean_output=getattr(args, "clean_output", False),
         )
 
     if GracefulExit.should_exit():
@@ -1155,6 +1208,11 @@ def main():
             "--cleanup",
             action="store_true",
             help="Skip transcoding and only perform cleanup (orphaned JPGs, empty dirs, size/age limits)",
+        )
+        parser.add_argument(
+            "--clean-output",
+            action="store_true",
+            help="Include output files in age-based cleanup (default: exclude output files)",
         )
         args = parser.parse_args()
         if len(sys.argv) == 1:
