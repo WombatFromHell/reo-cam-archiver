@@ -285,8 +285,15 @@ class Logger:
     ) -> logging.Logger:
         logger = logging.getLogger("camera_archiver")
         logger.setLevel(logging.INFO)
+
+        # Properly close and remove existing handlers
         for h in list(logger.handlers):
             logger.removeHandler(h)
+            try:
+                h.close()  # Close the handler to free resources
+            except Exception:
+                pass  # Ignore errors when closing
+
         fmt = "%(asctime)s - %(levelname)s - %(message)s"
         fh = (
             logging.FileHandler(log_file, encoding="utf-8")
@@ -442,21 +449,36 @@ class Transcoder:
         ]
         total_duration = Transcoder.get_video_duration(input_path)
 
-        proc = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
-        )
+        proc = None
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+            )
+        except OSError as e:
+            logger.error(f"Failed to start ffmpeg process: {e}")
+            return False
 
         log_lines = []
         prev_pct = -1.0
         cur_pct = 0.0
 
-        # Handle both file-like objects and iterables for stdout
-        stdout_iter = None
-        if proc.stdout:
+        try:
+            # Make sure proc.stdout is not None before proceeding
+            if proc.stdout is None:
+                logger.error("Failed to capture ffmpeg output")
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait()
+                return False
+
+            # Handle both file-like objects and iterables for stdout
+            stdout_iter = None
             if hasattr(proc.stdout, "readline"):
                 # File-like object with readline method
                 stdout_iter = iter(proc.stdout.readline, "")
@@ -466,14 +488,48 @@ class Transcoder:
             else:
                 logger.error(f"Unsupported stdout type: {type(proc.stdout)}")
                 proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait()
                 return False
-        else:
-            return False
 
-        if stdout_iter:
-            for line in stdout_iter:
-                if GracefulExit.should_exit():
-                    logger.info("Cancellation requested, terminating ffmpeg process...")
+            if stdout_iter:
+                try:
+                    for line in stdout_iter:
+                        if GracefulExit.should_exit():
+                            logger.info(
+                                "Cancellation requested, terminating ffmpeg process..."
+                            )
+                            proc.terminate()
+                            try:
+                                proc.wait(timeout=5)
+                            except subprocess.TimeoutExpired:
+                                proc.kill()
+                                proc.wait()
+                            return False
+
+                        if not line:
+                            break
+                        log_lines.append(line)
+
+                        if total_duration and total_duration > 0:
+                            m = re.search(r"time=([0-9:.]+)", line)
+                            if m:
+                                h, mn, s = map(float, m.group(1).split(":")[:3])
+                                cur_pct = min(
+                                    (h * 3600 + mn * 60 + s) / total_duration * 100,
+                                    100.0,
+                                )
+                        else:
+                            cur_pct = min(cur_pct + 1, 99.0)
+
+                        if progress_cb and cur_pct != prev_pct:
+                            progress_cb(cur_pct)
+                            prev_pct = cur_pct
+                except Exception as e:
+                    logger.error(f"Error reading ffmpeg output: {e}")
                     proc.terminate()
                     try:
                         proc.wait(timeout=5)
@@ -482,32 +538,37 @@ class Transcoder:
                         proc.wait()
                     return False
 
-                if not line:
-                    break
-                log_lines.append(line)
-
-                if total_duration and total_duration > 0:
-                    m = re.search(r"time=([0-9:.]+)", line)
-                    if m:
-                        h, mn, s = map(float, m.group(1).split(":")[:3])
-                        cur_pct = min(
-                            (h * 3600 + mn * 60 + s) / total_duration * 100, 100.0
-                        )
-                else:
-                    cur_pct = min(cur_pct + 1, 99.0)
-
-                if progress_cb and cur_pct != prev_pct:
-                    progress_cb(cur_pct)
-                    prev_pct = cur_pct
-
-        rc = proc.wait()
-        if rc != 0 and not GracefulExit.should_exit():
-            msg = (
-                f"FFmpeg failed (code {rc}) for {input_path} -> {output_path}\n"
-                + "".join(log_lines)
-            )
-            logger.error(msg)
-        return rc == 0 and not GracefulExit.should_exit()
+            rc = proc.wait()
+            if rc != 0 and not GracefulExit.should_exit():
+                msg = (
+                    f"FFmpeg failed (code {rc}) for {input_path} -> {output_path}\n"
+                    + "".join(log_lines)
+                )
+                logger.error(msg)
+            return rc == 0 and not GracefulExit.should_exit()
+        finally:
+            # Ensure the process is cleaned up in the finally block
+            if proc and proc.stdout:
+                try:
+                    proc.stdout.close()
+                except Exception:
+                    pass  # Ignore errors when closing
+            if proc:
+                try:
+                    proc.wait(
+                        timeout=0.1
+                    )  # Give a small timeout to check if already finished
+                except subprocess.TimeoutExpired:
+                    # If process is still running, terminate it
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                        proc.wait()
+                except Exception:
+                    # Process might already be finished
+                    pass
 
 
 class FileCleaner:
@@ -1263,59 +1324,63 @@ class Archiver:
             return 0
 
 
+def parse_arguments():
+    """Parse command line arguments."""
+    parser = argparse.ArgumentParser(
+        description="Archive and transcode camera files based on timestamp parsing"
+    )
+    parser.add_argument(
+        "--directory", "-d", type=Path, default="/camera", help="Input directory"
+    )
+    parser.add_argument(
+        "--output",
+        "-o",
+        type=Path,
+        default="/camera/archived",
+        help="Destination for archived MP4s",
+    )
+    parser.add_argument("--age", "-a", type=int, default=30, help="Age in days")
+    parser.add_argument(
+        "--dry-run", "-n", action="store_true", help="Show actions only"
+    )
+    parser.add_argument(
+        "--max-size", "-m", type=int, default=500, help="Maximum archive size in GB"
+    )
+    parser.add_argument(
+        "--no-skip",
+        "-s",
+        action="store_true",
+        help="Do not skip transcoding when archived copy exists",
+    )
+    parser.add_argument(
+        "--no-trash",
+        action="store_true",
+        help="Disable trash functionality (permanently delete files)",
+    )
+    parser.add_argument("--trashdir", type=Path, help="Specify custom trash directory")
+    parser.add_argument(
+        "--cleanup",
+        action="store_true",
+        help="Skip transcoding and only perform cleanup (orphaned JPGs, empty dirs, size/age limits)",
+    )
+    parser.add_argument(
+        "--clean-output",
+        action="store_true",
+        help="Include output files in age-based cleanup (default: exclude output files)",
+    )
+    args = parser.parse_args()
+    # Handle the --no-trash flag
+    args.use_trash = not args.no_trash
+    if len(sys.argv) == 1:
+        parser.print_help()
+        sys.exit(1)
+    return args
+
+
 def main():
     """Main entry point with argument parsing."""
     try:
-        parser = argparse.ArgumentParser(
-            description="Archive and transcode camera files based on timestamp parsing"
-        )
-        parser.add_argument(
-            "--directory", "-d", type=Path, default="/camera", help="Input directory"
-        )
-        parser.add_argument(
-            "--output",
-            "-o",
-            type=Path,
-            default="/camera/archived",
-            help="Destination for archived MP4s",
-        )
-        parser.add_argument("--age", "-a", type=int, default=30, help="Age in days")
-        parser.add_argument(
-            "--dry-run", "-n", action="store_true", help="Show actions only"
-        )
-        parser.add_argument(
-            "--max-size", "-m", type=int, default=500, help="Maximum archive size in GB"
-        )
-        parser.add_argument(
-            "--no-skip",
-            "-s",
-            action="store_true",
-            help="Do not skip transcoding when archived copy exists",
-        )
-        parser.add_argument(
-            "--no-trash",
-            action="store_true",
-            help="Disable trash functionality (permanently delete files)",
-        )
-        parser.add_argument(
-            "--trashdir", type=Path, help="Specify custom trash directory"
-        )
-        parser.add_argument(
-            "--cleanup",
-            action="store_true",
-            help="Skip transcoding and only perform cleanup (orphaned JPGs, empty dirs, size/age limits)",
-        )
-        parser.add_argument(
-            "--clean-output",
-            action="store_true",
-            help="Include output files in age-based cleanup (default: exclude output files)",
-        )
-        args = parser.parse_args()
-        # Handle the --no-trash flag
-        args.use_trash = not args.no_trash
-        if len(sys.argv) == 1:
-            parser.print_help()
-            sys.exit(1)
+        args = parse_arguments()
 
         # Create config and run archiver inside the same try block
         config = Config.from_args(args)
