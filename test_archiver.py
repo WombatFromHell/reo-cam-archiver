@@ -49,7 +49,6 @@ class BaseTest(TestCase):
     def tearDown(self) -> None:
         shutil.rmtree(self.temp_dir, ignore_errors=True)
         GuardedStreamHandler.emit = self._orig_emit
-        GracefulExit.exit_requested = False
 
     # ---------- file helpers ----------
     def create_file(
@@ -216,11 +215,14 @@ class TestTranscoder(BaseTest):
         # Simulate ffprobe returning a number
         proc = MagicMock()
         proc.stdout.strip.return_value = "12.34"
+        graceful_exit = GracefulExit()
         with (
             mock.patch("subprocess.run", return_value=proc),
             mock.patch("shutil.which", return_value="/usr/bin/ffprobe"),
         ):
-            self.assertEqual(Transcoder.get_video_duration(f), 12.34)
+            self.assertEqual(
+                Transcoder.get_video_duration(f, graceful_exit=graceful_exit), 12.34
+            )
 
     def test_transcode_graceful_exit(self):
         """Verify that transcode aborts if GracefulExit is requested."""
@@ -228,14 +230,16 @@ class TestTranscoder(BaseTest):
         dst = Path("/tmp/out.mp4")
 
         # Before start
-        GracefulExit.request_exit()
-        ok = Transcoder.transcode_file(src, dst, Logger.setup(None))
+        graceful_exit = GracefulExit()
+        graceful_exit.request_exit()
+        ok = Transcoder.transcode_file(
+            src, dst, Logger.setup(None), graceful_exit=graceful_exit
+        )
         self.assertFalse(ok)
-        GracefulExit.exit_requested = False
 
         # During run – mock Popen to have an iterable stdout that causes exit during processing
         def mock_stdout_generator():
-            GracefulExit.request_exit()  # Trigger exit on first iteration
+            graceful_exit.request_exit()  # Trigger exit on first iteration
             yield "frame=1 time=00:00:01.00\n"
             yield "frame=2 time=00:00:02.00\n"
 
@@ -246,10 +250,13 @@ class TestTranscoder(BaseTest):
 
         with mock.patch("subprocess.Popen", return_value=mock_proc):
             ok = Transcoder.transcode_file(
-                src, dst, Logger.setup(None), progress_cb=None
+                src,
+                dst,
+                Logger.setup(None),
+                progress_cb=None,
+                graceful_exit=graceful_exit,
             )
             self.assertFalse(ok)
-        GracefulExit.exit_requested = False
 
     def test_transcode_success_and_progress(self):
         """Ensure progress callback receives updates when duration is known."""
@@ -266,13 +273,18 @@ class TestTranscoder(BaseTest):
         )
         mp.wait.return_value = 0
 
+        graceful_exit = GracefulExit()
         with (
             mock.patch("subprocess.Popen", return_value=mp),
             mock.patch.object(Transcoder, "get_video_duration", return_value=60),
         ):
             progress_calls = []
             ok = Transcoder.transcode_file(
-                src, dst, Logger.setup(None), lambda p: progress_calls.append(p)
+                src,
+                dst,
+                Logger.setup(None),
+                progress_cb=lambda p: progress_calls.append(p),
+                graceful_exit=graceful_exit,
             )
             self.assertTrue(ok)
             self.assertGreater(len(progress_calls), 0)
@@ -331,7 +343,7 @@ class TestArchiverRun(BaseTest):
         src = self.create_file("2023/01/01/video.mp4", ts=ts_old)
 
         # Mock transcoder to simply create a dummy archive
-        def mock_transcode(inp, outp, logger, cb=None):
+        def mock_transcode(inp, outp, logger, progress_cb=None, *, graceful_exit=None):
             outp.parent.mkdir(parents=True, exist_ok=True)
             outp.write_bytes(b"x" * (MIN_ARCHIVE_SIZE_BYTES + 1))
             return True
@@ -343,7 +355,8 @@ class TestArchiverRun(BaseTest):
         cfg.age = 30
         cfg.dry_run = True
 
-        archiver = Archiver(cfg)
+        graceful_exit = GracefulExit()
+        archiver = Archiver(cfg, graceful_exit)
         with mock.patch.object(
             Transcoder, "transcode_file", side_effect=mock_transcode
         ):
@@ -462,7 +475,7 @@ class TestIntegration(BaseTest):
         # Call the signal handler to make sure it doesn't crash
         try:
             pr._signal_handler(signal.SIGINT, None)
-        except:
+        except Exception:
             pass  # Expected to handle exceptions gracefully
 
         # Restore original handler
@@ -539,10 +552,12 @@ class TestIntegration(BaseTest):
 
         # Test with graceful exit during transcoding - simulate this by setting exit flag
         # before calling transcode
-        GracefulExit.request_exit()
-        result = Transcoder.transcode_file(src, dst, Logger.setup(None))
+        graceful_exit = GracefulExit()
+        graceful_exit.request_exit()
+        result = Transcoder.transcode_file(
+            src, dst, Logger.setup(None), graceful_exit=graceful_exit
+        )
         self.assertFalse(result)
-        GracefulExit.exit_requested = False  # Reset for other tests
 
     def test_transcoder_error_scenarios(self):
         """Test additional transcoder error scenarios."""
@@ -600,6 +615,7 @@ class TestIntegration(BaseTest):
             f, self.input_dir / "nonexistent", self.trash_dir
         )
         # Should handle ValueError and create a path with just the filename
+        self.assertIsNotNone(new_dest)  # Verify that a destination path was returned
 
     def test_file_cleaner_remove_orphaned_jpgs(self):
         """Test orphaned JPG removal functionality."""
@@ -666,12 +682,16 @@ class TestIntegration(BaseTest):
 
         # Create a source file
         source_file = self.create_file("2023/01/01/source.mp4", ts=old_ts)
+
+        # Verify the timestamps are different
+        self.assertNotEqual(old_ts, new_ts)
         old_list = [(source_file, old_ts)]
 
         # Collect file info and test cleanup
         all_files = archiver.collect_file_info(old_list)
         result = archiver.intelligent_cleanup(all_files)
         # Result should contain the old file since it's over the age threshold
+        self.assertIsNotNone(result)  # Verify that a result was returned
 
         # Test with size-based cleanup
         cfg.max_size = 0  # 0 GB to force size cleanup
@@ -681,6 +701,7 @@ class TestIntegration(BaseTest):
         all_files_with_size = archiver_size.collect_file_info(old_list)
         result_size = archiver_size.intelligent_cleanup(all_files_with_size)
         # Should also have files removed due to size limit
+        self.assertIsNotNone(result_size)  # Verify that a result was returned
 
     def test_archiver_intelligent_cleanup_priority_logic(self):
         """Test the priority logic in intelligent cleanup (trash > archive > source)."""
@@ -762,10 +783,10 @@ class TestIntegration(BaseTest):
         archiver = Archiver(cfg)
 
         # Test graceful exit during processing
-        GracefulExit.request_exit()
-        result = archiver.run()
+        graceful_exit = GracefulExit()
+        graceful_exit.request_exit()
+        result = archiver.run(graceful_exit=graceful_exit)
         self.assertEqual(result, 1)
-        GracefulExit.exit_requested = False
 
     def test_file_cleaner_edge_cases_comprehensive(self):
         """Test comprehensive edge cases for FileCleaner."""
@@ -800,13 +821,15 @@ class TestIntegration(BaseTest):
     def test_file_scanner_edge_cases(self):
         """Test FileScanner edge cases."""
         # Test scanning with graceful exit set
-        GracefulExit.request_exit()
-        mp4s, mapping, trash_files = FileScanner.scan_files(self.input_dir)
+        graceful_exit = GracefulExit()
+        graceful_exit.request_exit()
+        mp4s, mapping, trash_files = FileScanner.scan_files(
+            self.input_dir, graceful_exit=graceful_exit
+        )
         # Should return empty results when exit is requested at start
         self.assertEqual(len(mp4s), 0)
         self.assertEqual(len(mapping), 0)
         self.assertEqual(len(trash_files), 0)
-        GracefulExit.exit_requested = False  # Reset
 
         # Create some test files with different timestamps
         ts_old = (datetime.now() - timedelta(days=10)).replace(
@@ -943,6 +966,7 @@ class TestIntegration(BaseTest):
             ts=old_ts,
             content=b"x" * (MIN_ARCHIVE_SIZE_BYTES + 1),
         )
+        self.assertTrue(src.exists())
 
         cfg = Config()
         cfg.directory = self.input_dir
@@ -971,6 +995,8 @@ class TestIntegration(BaseTest):
             archived_files = list(self.output_dir.rglob("archived-*.mp4"))
             # The test may fail if the file naming doesn't match expected format
             # Let's just verify the method completes without errors
+            # Verify that the list was created
+            self.assertIsInstance(archived_files, list)
 
         # Test with dry run - create a new file with proper naming
         src2 = self.create_file(
@@ -1032,6 +1058,10 @@ class TestIntegration(BaseTest):
             content=b"x" * (MIN_ARCHIVE_SIZE_BYTES + 500000),
         )  # 0.5MB+
 
+        # Verify the files were created
+        self.assertTrue(old_file.exists())
+        self.assertTrue(newer_file.exists())
+
         # Test normal run (transcode mode)
         cfg = Config()
         cfg.directory = self.input_dir
@@ -1043,7 +1073,8 @@ class TestIntegration(BaseTest):
         cfg.cleanup = False  # Not cleanup mode
         cfg.use_trash = True
 
-        archiver = Archiver(cfg)
+        graceful_exit = GracefulExit()
+        archiver = Archiver(cfg, graceful_exit)
 
         # Mock transcode to return True (success) to trigger file removal
         with mock.patch.object(Transcoder, "transcode_file", return_value=True):
@@ -1061,6 +1092,7 @@ class TestIntegration(BaseTest):
             ts=old_ts,
             content=b"x" * (MIN_ARCHIVE_SIZE_BYTES + 1000000),
         )
+        self.assertTrue(another_old_file.exists())
 
         cfg2 = Config()
         cfg2.directory = self.input_dir
@@ -1087,6 +1119,7 @@ class TestIntegration(BaseTest):
             ts=old_ts,
             content=b"x" * (MIN_ARCHIVE_SIZE_BYTES + 100000),
         )
+        self.assertTrue(old_file.exists())
 
         cfg = Config()
         cfg.directory = self.input_dir
@@ -1098,14 +1131,12 @@ class TestIntegration(BaseTest):
         archiver = Archiver(cfg)
 
         # Set graceful exit to be triggered during scanning
-        GracefulExit.request_exit()
+        graceful_exit = GracefulExit()
+        graceful_exit.request_exit()
 
-        result = archiver.run()
+        result = archiver.run(graceful_exit=graceful_exit)
         # Should return 1 to indicate interrupted execution
         self.assertEqual(result, 1)
-
-        # Reset for other tests
-        GracefulExit.exit_requested = False
 
     def test_argument_parsing_function(self):
         """Test the parse_arguments function directly."""
@@ -1179,7 +1210,7 @@ class TestIntegration(BaseTest):
                 archiver.main()
             except SystemExit as e:
                 # Accept any exit code as long as no exception is raised
-                pass
+                self.assertIsInstance(e.code, int)  # Verify code is an integer
 
     def test_main_function_with_exception_handling(self):
         """Test main function's exception handling."""
@@ -1240,7 +1271,8 @@ class TestIntegration(BaseTest):
         )
 
         # Test with an unexpected exception - but first trigger graceful exit to make sure it's handled
-        GracefulExit.request_exit()
+        graceful_exit = GracefulExit()
+        graceful_exit.request_exit()
 
         with patch.object(sys, "argv", test_args):
             with patch("archiver.Archiver.run", side_effect=RuntimeError("Test error")):
@@ -1250,21 +1282,22 @@ class TestIntegration(BaseTest):
                     # When graceful exit is requested and there's an exception, it should exit with 1
                     self.assertEqual(e.code, 1)
 
-        # Reset for other tests
-        GracefulExit.exit_requested = False
+        # Reset for other tests - nothing to reset for class-level variables
+        pass
 
     def test_graceful_exit_functionality(self):
         """Test the GracefulExit functionality directly."""
         # Test initial state
-        self.assertFalse(GracefulExit.should_exit())
+        graceful_exit = GracefulExit()
+        self.assertFalse(graceful_exit.should_exit())
 
         # Test requesting exit
-        GracefulExit.request_exit()
-        self.assertTrue(GracefulExit.should_exit())
+        graceful_exit.request_exit()
+        self.assertTrue(graceful_exit.should_exit())
 
         # Test thread safety by using the lock mechanism
         def set_exit():
-            GracefulExit.request_exit()
+            graceful_exit.request_exit()
 
         # Test concurrent access to the exit flag
         threads = [threading.Thread(target=set_exit) for _ in range(5)]
@@ -1274,10 +1307,7 @@ class TestIntegration(BaseTest):
             t.join()
 
         # Should still be True
-        self.assertTrue(GracefulExit.should_exit())
-
-        # Reset for other tests
-        GracefulExit.exit_requested = False
+        self.assertTrue(graceful_exit.should_exit())
 
     def test_archiver_collect_file_info_edge_cases(self):
         """Test edge cases in collect_file_info method."""
@@ -1301,6 +1331,7 @@ class TestIntegration(BaseTest):
 
         # Create a file in trash
         trash_file = self.create_trash_file(old_ts)
+        self.assertTrue(trash_file.exists())
 
         # Test collect_file_info with mixed file types
         all_files = archiver.collect_file_info(old_list)

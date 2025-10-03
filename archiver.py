@@ -26,20 +26,19 @@ PROGRESS_UPDATE_INTERVAL = 5  # seconds for non-TTY output
 
 
 class GracefulExit:
-    """Global flag for graceful exit handling"""
+    """Thread-safe flag for graceful exit handling"""
 
-    exit_requested = False
-    _lock = threading.Lock()
+    def __init__(self):
+        self._exit_requested = False
+        self._lock = threading.Lock()
 
-    @classmethod
-    def request_exit(cls):
-        with cls._lock:
-            cls.exit_requested = True
+    def request_exit(self):
+        with self._lock:
+            self._exit_requested = True
 
-    @classmethod
-    def should_exit(cls):
-        with cls._lock:
-            return cls.exit_requested
+    def should_exit(self):
+        with self._lock:
+            return self._exit_requested
 
 
 class Config:
@@ -139,11 +138,13 @@ class ProgressReporter:
     def __init__(
         self,
         total_files: int,
+        graceful_exit: Optional[GracefulExit] = None,
         width: int = DEFAULT_PROGRESS_WIDTH,
         silent: bool = False,
         out=sys.stderr,
     ):
         self.total = total_files
+        self.graceful_exit = graceful_exit or GracefulExit()
         self.width = max(10, width)
         self.blocks = self.width - 2
         self.silent = silent or out is None
@@ -178,7 +179,7 @@ class ProgressReporter:
         atexit.unregister(self._cleanup_progress_bar)
 
     def _signal_handler(self, signum, frame):
-        GracefulExit.request_exit()
+        self.graceful_exit.request_exit()
         self._cleanup_progress_bar()
 
         signal_name = {
@@ -219,7 +220,7 @@ class ProgressReporter:
             self.start_time = time.time()
 
     def update_progress(self, idx: int, pct: float = 0.0):
-        if self.silent or GracefulExit.should_exit():
+        if self.silent or self.graceful_exit.should_exit():
             return
         line = self._format_line(idx, pct)
         if line == self._progress_line:
@@ -228,7 +229,7 @@ class ProgressReporter:
         self._display(line)
 
     def finish_file(self, idx: int):
-        if not GracefulExit.should_exit():
+        if not self.graceful_exit.should_exit():
             self.update_progress(idx, 100.0)
 
     def _format_line(self, idx: int, pct: float) -> str:
@@ -246,7 +247,7 @@ class ProgressReporter:
         return f"Progress [{idx}/{self.total}]: {pct:.0f}% {bar} {elapsed_file} ({elapsed_total})"
 
     def redraw(self):
-        if self.silent or not self._progress_line or GracefulExit.should_exit():
+        if self.silent or not self._progress_line or self.graceful_exit.should_exit():
             return
         self._display(self._progress_line)
 
@@ -330,10 +331,16 @@ class FileScanner:
 
     @staticmethod
     def scan_files(
-        base_dir: Path, include_trash: bool = False, trash_root: Optional[Path] = None
+        base_dir: Path,
+        include_trash: bool = False,
+        trash_root: Optional[Path] = None,
+        *,
+        graceful_exit: Optional[GracefulExit] = None,
     ) -> Tuple[List[Tuple[Path, datetime]], Dict[str, Dict[str, Path]], Set[Path]]:
         """Scan for MP4 and JPG files with valid timestamps."""
-        if GracefulExit.should_exit():
+        if graceful_exit is None:
+            graceful_exit = GracefulExit()
+        if graceful_exit.should_exit():
             return [], {}, set()
 
         mp4s = []
@@ -342,7 +349,7 @@ class FileScanner:
 
         # Scan base directory
         for p in base_dir.rglob("*.*"):
-            if GracefulExit.should_exit():
+            if graceful_exit.should_exit():
                 break
 
             if not p.is_file():
@@ -367,7 +374,7 @@ class FileScanner:
                 trash_dir = trash_root / trash_type
                 if trash_dir.exists():
                     for p in trash_dir.rglob("*.*"):
-                        if GracefulExit.should_exit():
+                        if graceful_exit.should_exit():
                             break
 
                         if not p.is_file():
@@ -391,21 +398,30 @@ class Transcoder:
     """Handles video transcoding operations"""
 
     @staticmethod
-    def get_video_duration(file_path: Path) -> Optional[float]:
+    def _build_ffprobe_command(file_path: Path) -> List[str]:
+        """Build the ffprobe command to get video duration."""
+        return [
+            "ffprobe",
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+            str(file_path),
+        ]
+
+    @staticmethod
+    def get_video_duration(
+        file_path: Path, *, graceful_exit: Optional[GracefulExit] = None
+    ) -> Optional[float]:
         """Get video duration using ffprobe."""
-        if GracefulExit.should_exit() or not shutil.which("ffprobe"):
+        if graceful_exit is None:
+            graceful_exit = GracefulExit()
+        if graceful_exit.should_exit() or not shutil.which("ffprobe"):
             return None
         try:
-            cmd = [
-                "ffprobe",
-                "-v",
-                "error",
-                "-show_entries",
-                "format=duration",
-                "-of",
-                "default=noprint_wrappers=1:nokey=1",
-                str(file_path),
-            ]
+            cmd = Transcoder._build_ffprobe_command(file_path)
             result = subprocess.run(cmd, capture_output=True, text=True, check=True)
             duration_str = result.stdout.strip()
             if duration_str and duration_str != "N/A":
@@ -420,9 +436,13 @@ class Transcoder:
         output_path: Path,
         logger: logging.Logger,
         progress_cb: Optional[Callable[[float], None]] = None,
+        *,
+        graceful_exit: Optional[GracefulExit] = None,
     ) -> bool:
         """Transcode a video file using ffmpeg with QSV hardware acceleration."""
-        if GracefulExit.should_exit():
+        if graceful_exit is None:
+            graceful_exit = GracefulExit()
+        if graceful_exit.should_exit():
             return False
 
         # Ensure output directory exists
@@ -447,7 +467,9 @@ class Transcoder:
             "-an",
             str(output_path),
         ]
-        total_duration = Transcoder.get_video_duration(input_path)
+        total_duration = Transcoder.get_video_duration(
+            input_path, graceful_exit=graceful_exit
+        )
 
         proc = None
         try:
@@ -498,7 +520,7 @@ class Transcoder:
             if stdout_iter:
                 try:
                     for line in stdout_iter:
-                        if GracefulExit.should_exit():
+                        if graceful_exit.should_exit():
                             logger.info(
                                 "Cancellation requested, terminating ffmpeg process..."
                             )
@@ -539,13 +561,13 @@ class Transcoder:
                     return False
 
             rc = proc.wait()
-            if rc != 0 and not GracefulExit.should_exit():
+            if rc != 0 and not graceful_exit.should_exit():
                 msg = (
                     f"FFmpeg failed (code {rc}) for {input_path} -> {output_path}\n"
                     + "".join(log_lines)
                 )
                 logger.error(msg)
-            return rc == 0 and not GracefulExit.should_exit()
+            return rc == 0 and not graceful_exit.should_exit()
         finally:
             # Ensure the process is cleaned up in the finally block
             if proc and proc.stdout:
@@ -630,14 +652,18 @@ class FileCleaner:
     def safe_remove(
         file_path: Path,
         logger: logging.Logger,
-        dry_run: bool,
+        dry_run: bool = False,
         use_trash: bool = False,
         trash_root: Optional[Path] = None,
         is_output: bool = False,
         source_root: Optional[Path] = None,
+        *,
+        graceful_exit: Optional[GracefulExit] = None,
     ):
         """Safely remove a file, optionally moving to trash."""
-        if GracefulExit.should_exit():
+        if graceful_exit is None:
+            graceful_exit = GracefulExit()
+        if graceful_exit.should_exit():
             return
 
         if dry_run:
@@ -674,14 +700,18 @@ class FileCleaner:
         dry_run: bool = False,
         use_trash: bool = False,
         trash_root: Optional[Path] = None,
+        *,
+        graceful_exit: Optional[GracefulExit] = None,
     ) -> None:
         """Remove JPG files without corresponding MP4 files."""
-        if GracefulExit.should_exit():
+        if graceful_exit is None:
+            graceful_exit = GracefulExit()
+        if graceful_exit.should_exit():
             return
 
         count = 0
         for key, files in mapping.items():
-            if GracefulExit.should_exit():
+            if graceful_exit.should_exit():
                 break
             jpg = files.get(".jpg")
             mp4 = files.get(".mp4")
@@ -704,7 +734,7 @@ class FileCleaner:
             )
             count += 1
 
-        if not GracefulExit.should_exit():
+        if not graceful_exit.should_exit():
             logger.info(
                 "%s %d orphaned JPG files",
                 "[DRY RUN] Would remove" if dry_run else "Removed",
@@ -719,9 +749,13 @@ class FileCleaner:
         trash_root: Optional[Path] = None,
         is_output: bool = False,
         is_trash: bool = False,
+        *,
+        graceful_exit: Optional[GracefulExit] = None,
     ):
         """Remove empty date-structured directories."""
-        if GracefulExit.should_exit():
+        if graceful_exit is None:
+            graceful_exit = GracefulExit()
+        if graceful_exit.should_exit():
             return
 
         root = Path(root_dir)
@@ -729,7 +763,7 @@ class FileCleaner:
             return
 
         for dirpath, dirs, files in os.walk(root, topdown=False):
-            if GracefulExit.should_exit():
+            if graceful_exit.should_exit():
                 break
 
             p = Path(dirpath)
@@ -793,15 +827,21 @@ class FileCleaner:
 class Archiver:
     """Main archiver class that orchestrates the entire process"""
 
-    def __init__(self, config: Config):
+    def __init__(self, config: Config, graceful_exit: Optional[GracefulExit] = None):
         self.config = config
+        self.graceful_exit = graceful_exit or GracefulExit()
         self.logger: Optional[logging.Logger] = None
         self.progress_bar: Optional[ProgressReporter] = None
 
-    def setup_logging(self):
+    def setup_logging(self, graceful_exit: Optional[GracefulExit] = None):
         """Setup logging with optional progress bar"""
+        if graceful_exit is None:
+            graceful_exit = GracefulExit()
         self.progress_bar = ProgressReporter(
-            total_files=0, silent=self.config.dry_run, out=sys.stderr
+            total_files=0,
+            graceful_exit=graceful_exit,
+            silent=self.config.dry_run,
+            out=sys.stderr,
         )
         self.logger = Logger.setup(self.config.log_file, self.progress_bar)
 
@@ -914,6 +954,147 @@ class Archiver:
 
         return all_files
 
+    def _categorize_files(self, all_files: List[FileInfo]) -> Dict[int, List[FileInfo]]:
+        """Categorize files by location priority (0 = trash, 1 = archive, 2 = source)."""
+        categorized_files: Dict[int, List[FileInfo]] = {0: [], 1: [], 2: []}
+
+        for file_info in all_files:
+            if file_info.is_trash:
+                categorized_files[0].append(file_info)
+            elif file_info.is_archive:
+                categorized_files[1].append(file_info)
+            else:
+                categorized_files[2].append(file_info)
+
+        # Sort each category by timestamp (oldest first)
+        for category in categorized_files.values():
+            category.sort(key=lambda x: x.timestamp)
+
+        return categorized_files
+
+    def _apply_size_cleanup(
+        self,
+        categorized_files: Dict[int, List[FileInfo]],
+        total_size: int,
+        size_limit: int,
+    ) -> Tuple[List[FileInfo], int]:
+        """Apply size-based cleanup based on priority."""
+        files_to_remove = []
+        remaining_size = total_size
+
+        # Ensure logger is not None
+        if self.logger is None:
+            raise RuntimeError("Logger not initialized. Call setup_logging() first.")
+
+        self.logger.info("Archive size exceeds limit")
+        self.logger.info(
+            f"Size threshold exceeded, removing files by priority to reach {self.config.max_size} GB..."
+        )
+        self.logger.info(
+            "Priority order: Trash > Archive > Source (oldest first within each)"
+        )
+
+        # Remove files starting from highest priority (0) to lowest (2)
+        for priority in range(3):
+            if remaining_size <= size_limit:
+                break
+
+            category_name = {0: "Trash", 1: "Archive", 2: "Source"}[priority]
+            category_files = categorized_files[priority]
+
+            if category_files:
+                self.logger.info(
+                    f"Processing {category_name} files for size cleanup..."
+                )
+
+                for file_info in category_files:
+                    if remaining_size <= size_limit:
+                        break
+
+                    files_to_remove.append(file_info)
+                    remaining_size -= file_info.size
+
+                    if self.config.dry_run:
+                        self.logger.info(
+                            f"[DRY RUN] Would remove {category_name} file for size: {file_info.path} "
+                            f"({file_info.size / (1024**2):.1f} MB, {file_info.timestamp})"
+                        )
+
+        self.logger.info(
+            f"After size cleanup: {remaining_size / (1024**3):.1f} GB "
+            f"({len(files_to_remove)} files marked for removal)"
+        )
+
+        return files_to_remove, remaining_size
+
+    def _apply_age_cleanup(
+        self,
+        categorized_files: Dict[int, List[FileInfo]],
+        age_cutoff: datetime,
+        total_size: int,
+    ) -> Tuple[List[FileInfo], int]:
+        """Apply age-based cleanup respecting clean_output setting."""
+        files_to_remove = []
+        remaining_size = total_size
+
+        # Ensure logger is not None
+        if self.logger is None:
+            raise RuntimeError("Logger not initialized. Call setup_logging() first.")
+
+        files_over_age_by_priority: Dict[int, List[FileInfo]] = {
+            0: [],
+            1: [],
+            2: [],
+        }
+
+        for priority in range(3):
+            # Skip archive files (priority 1) if clean_output is False
+            if priority == 1 and not self.config.clean_output:
+                continue
+
+            files_over_age_by_priority[priority] = [
+                f for f in categorized_files[priority] if f.timestamp < age_cutoff
+            ]
+
+        total_over_age = sum(
+            len(files) for files in files_over_age_by_priority.values()
+        )
+
+        if total_over_age > 0:
+            self.logger.info(
+                f"Found {total_over_age} files older than {self.config.age} days"
+            )
+
+            # Remove age-eligible files by priority order
+            for priority in range(3):
+                # Skip archive files (priority 1) if clean_output is False
+                if priority == 1 and not self.config.clean_output:
+                    continue
+
+                category_name = {0: "Trash", 1: "Archive", 2: "Source"}[priority]
+                age_files = files_over_age_by_priority[priority]
+
+                if age_files:
+                    self.logger.info(
+                        f"Processing {category_name} files for age cleanup..."
+                    )
+
+                    for file_info in age_files:
+                        files_to_remove.append(file_info)
+                        remaining_size -= file_info.size
+
+                        if self.config.dry_run:
+                            self.logger.info(
+                                f"[DRY RUN] Would remove {category_name} file for age: {file_info.path} "
+                                f"({file_info.size / (1024**2):.1f} MB, {file_info.timestamp})"
+                            )
+
+            self.logger.info(f"Added {total_over_age} files for age-based removal")
+        else:
+            self.logger.info(f"No files older than {self.config.age} days found")
+
+        return files_to_remove, remaining_size
+
     def intelligent_cleanup(self, all_files: List[FileInfo]) -> List[FileInfo]:
         """
         Select files to remove based on location priority and size/age constraints.
@@ -938,126 +1119,23 @@ class Archiver:
         if not self.config.clean_output:
             self.logger.info("Output files excluded from age-based cleanup")
 
-        # Categorize files by location priority (0 = highest priority for removal)
-        categorized_files: Dict[int, List[FileInfo]] = {0: [], 1: [], 2: []}
-
-        for file_info in all_files:
-            if file_info.is_trash:
-                categorized_files[0].append(file_info)
-            elif file_info.is_archive:
-                categorized_files[1].append(file_info)
-            else:
-                categorized_files[2].append(file_info)
-
-        # Sort each category by timestamp (oldest first)
-        for category in categorized_files.values():
-            category.sort(key=lambda x: x.timestamp)
+        # Categorize files by location priority
+        categorized_files = self._categorize_files(all_files)
 
         files_to_remove = []
         remaining_size = total_size
 
         # PHASE 1: Enforce size limit (if over limit)
         if remaining_size > size_limit:
-            self.logger.info("Archive size exceeds limit")
-            self.logger.info(
-                f"Size threshold exceeded, removing files by priority to reach {self.config.max_size} GB..."
-            )
-            self.logger.info(
-                "Priority order: Trash > Archive > Source (oldest first within each)"
-            )
-
-            # Remove files starting from highest priority (0) to lowest (2)
-            for priority in range(3):
-                if remaining_size <= size_limit:
-                    break
-
-                category_name = {0: "Trash", 1: "Archive", 2: "Source"}[priority]
-                category_files = categorized_files[priority]
-
-                if category_files:
-                    self.logger.info(
-                        f"Processing {category_name} files for size cleanup..."
-                    )
-
-                    for file_info in category_files:
-                        if remaining_size <= size_limit:
-                            break
-
-                        files_to_remove.append(file_info)
-                        remaining_size -= file_info.size
-
-                        if self.config.dry_run:
-                            self.logger.info(
-                                f"[DRY RUN] Would remove {category_name} file for size: {file_info.path} "
-                                f"({file_info.size / (1024**2):.1f} MB, {file_info.timestamp})"
-                            )
-
-            self.logger.info(
-                f"After size cleanup: {remaining_size / (1024**3):.1f} GB "
-                f"({len(files_to_remove)} files marked for removal)"
+            files_to_remove, remaining_size = self._apply_size_cleanup(
+                categorized_files, total_size, size_limit
             )
         else:
             # PHASE 2: Enforce age limit (only if under size limit AND age_days > 0)
             if self.config.age > 0:
-                files_over_age_by_priority: Dict[int, List[FileInfo]] = {
-                    0: [],
-                    1: [],
-                    2: [],
-                }
-
-                for priority in range(3):
-                    # Skip archive files (priority 1) if clean_output is False
-                    if priority == 1 and not self.config.clean_output:
-                        continue
-
-                    files_over_age_by_priority[priority] = [
-                        f
-                        for f in categorized_files[priority]
-                        if f.timestamp < age_cutoff
-                    ]
-
-                total_over_age = sum(
-                    len(files) for files in files_over_age_by_priority.values()
+                files_to_remove, remaining_size = self._apply_age_cleanup(
+                    categorized_files, age_cutoff, total_size
                 )
-
-                if total_over_age > 0:
-                    self.logger.info(
-                        f"Found {total_over_age} files older than {self.config.age} days"
-                    )
-
-                    # Remove age-eligible files by priority order
-                    for priority in range(3):
-                        # Skip archive files (priority 1) if clean_output is False
-                        if priority == 1 and not self.config.clean_output:
-                            continue
-
-                        category_name = {0: "Trash", 1: "Archive", 2: "Source"}[
-                            priority
-                        ]
-                        age_files = files_over_age_by_priority[priority]
-
-                        if age_files:
-                            self.logger.info(
-                                f"Processing {category_name} files for age cleanup..."
-                            )
-
-                            for file_info in age_files:
-                                files_to_remove.append(file_info)
-                                remaining_size -= file_info.size
-
-                                if self.config.dry_run:
-                                    self.logger.info(
-                                        f"[DRY RUN] Would remove {category_name} file for age: {file_info.path} "
-                                        f"({file_info.size / (1024**2):.1f} MB, {file_info.timestamp})"
-                                    )
-
-                    self.logger.info(
-                        f"Added {total_over_age} files for age-based removal"
-                    )
-                else:
-                    self.logger.info(
-                        f"No files older than {self.config.age} days found"
-                    )
             else:
                 self.logger.info("Age-based cleanup disabled (age_days <= 0)")
 
@@ -1087,10 +1165,13 @@ class Archiver:
         self,
         old_list: List[Tuple[Path, datetime]],
         mapping: Dict[str, Dict[str, Path]],
+        graceful_exit: Optional[GracefulExit] = None,
         trash_files: Optional[Set[Path]] = None,
     ) -> Set[Path]:
         """Process (transcode) files and return the set of *all* paths that were
         finally removed (source MP4s + paired JPGs)."""
+        if graceful_exit is None:
+            graceful_exit = GracefulExit()
         if trash_files is None:
             trash_files = set()
 
@@ -1105,13 +1186,13 @@ class Archiver:
         progress_bar = self.progress_bar
 
         logger.info(f"Found {len(old_list)} files to process")
-        if not old_list or GracefulExit.should_exit():
+        if not old_list or graceful_exit.should_exit():
             logger.info("No files to process or cancellation requested")
             return set()
 
         to_delete: Set[Path] = set()
         for fp, ts in old_list:
-            if GracefulExit.should_exit():
+            if graceful_exit.should_exit():
                 break
             if fp in trash_files:  # already in trash
                 continue
@@ -1145,6 +1226,7 @@ class Archiver:
                 lambda pct: progress_bar.update_progress(
                     old_list.index((fp, ts)) + 1, pct
                 ),
+                graceful_exit=graceful_exit,
             )
             if ok:
                 progress_bar.finish_file(old_list.index((fp, ts)) + 1)
@@ -1171,9 +1253,13 @@ class Archiver:
         progress_bar.finish()
         return to_delete
 
-    def cleanup_archive_size_limit(self) -> None:
+    def cleanup_archive_size_limit(
+        self, graceful_exit: Optional[GracefulExit] = None
+    ) -> None:
+        if graceful_exit is None:
+            graceful_exit = GracefulExit()
         """Comprehensive storage management with location-based priorities."""
-        if GracefulExit.should_exit():
+        if graceful_exit.should_exit():
             return
 
         # Ensure logger is set
@@ -1185,7 +1271,10 @@ class Archiver:
 
         # Step 1: Complete system discovery
         mp4s, mapping, trash_files = FileScanner.scan_files(
-            base_dir, include_trash=self.config.use_trash, trash_root=trash_root
+            base_dir,
+            include_trash=self.config.use_trash,
+            trash_root=trash_root,
+            graceful_exit=graceful_exit,
         )
 
         if self.config.dry_run:
@@ -1220,7 +1309,13 @@ class Archiver:
 
         # Step 5: Clean up orphaned JPGs
         FileCleaner.remove_orphaned_jpgs(
-            mapping, set(), self.logger, False, self.config.use_trash, trash_root
+            mapping,
+            set(),
+            self.logger,
+            False,
+            self.config.use_trash,
+            trash_root,
+            graceful_exit=graceful_exit,
         )
 
         # Step 6: Clean up empty directories AFTER all file operations are complete
@@ -1231,6 +1326,7 @@ class Archiver:
             trash_root,
             is_output=False,
             is_trash=False,
+            graceful_exit=graceful_exit,
         )
         FileCleaner.clean_empty_directories(
             self.config.output,
@@ -1239,6 +1335,7 @@ class Archiver:
             trash_root,
             is_output=True,
             is_trash=False,
+            graceful_exit=graceful_exit,
         )
         if trash_root and trash_root.exists():
             FileCleaner.clean_empty_directories(
@@ -1248,10 +1345,13 @@ class Archiver:
                 trash_root=None,
                 is_output=False,
                 is_trash=True,
+                graceful_exit=graceful_exit,
             )
 
-    def run(self) -> int:
+    def run(self, graceful_exit: Optional[GracefulExit] = None) -> int:
         """Main archiver logic with proper error handling."""
+        if graceful_exit is None:
+            graceful_exit = GracefulExit()
         base_dir = self.config.directory
         if not base_dir.exists():
             print(
@@ -1266,7 +1366,10 @@ class Archiver:
 
         # Always perform comprehensive discovery
         mp4s, mapping, trash_files = FileScanner.scan_files(
-            base_dir, include_trash=self.config.use_trash, trash_root=trash_root
+            base_dir,
+            include_trash=self.config.use_trash,
+            trash_root=trash_root,
+            graceful_exit=graceful_exit,
         )
 
         if not self.config.cleanup:
@@ -1274,7 +1377,10 @@ class Archiver:
             cutoff = datetime.now() - timedelta(days=self.config.age)
             old_list = [(p, t) for p, t in mp4s if t < cutoff]
             self.progress_bar = ProgressReporter(
-                total_files=len(old_list), silent=self.config.dry_run, out=sys.stderr
+                total_files=len(old_list),
+                graceful_exit=graceful_exit,
+                silent=self.config.dry_run,
+                out=sys.stderr,
             )
             self.logger = Logger.setup(self.config.log_file, self.progress_bar)
 
@@ -1283,12 +1389,13 @@ class Archiver:
             _ = self.process_files_intelligent(
                 old_list=old_list,
                 mapping=mapping,
+                graceful_exit=graceful_exit,
                 trash_files=trash_files,
             )
         else:
             # Cleanup mode: no transcoding
             self.progress_bar = ProgressReporter(
-                total_files=0, silent=True, out=sys.stderr
+                total_files=0, graceful_exit=graceful_exit, silent=True, out=sys.stderr
             )
             self.logger = Logger.setup(self.config.log_file, self.progress_bar)
             self.logger.info(
@@ -1306,14 +1413,14 @@ class Archiver:
             f"Cleanup only: {self.config.cleanup}",
             f"Clean output files: {self.config.clean_output}",
         ]:
-            if not GracefulExit.should_exit():
+            if not graceful_exit.should_exit():
                 self.logger.info(msg)
 
         # Always perform comprehensive storage management
-        if not GracefulExit.should_exit():
-            self.cleanup_archive_size_limit()
+        if not graceful_exit.should_exit():
+            self.cleanup_archive_size_limit(graceful_exit)
 
-        if GracefulExit.should_exit():
+        if graceful_exit.should_exit():
             self.logger.info("Archive process was cancelled")
             return 1
         elif self.config.dry_run:
@@ -1379,23 +1486,24 @@ def parse_arguments():
 
 def main():
     """Main entry point with argument parsing."""
+    graceful_exit = GracefulExit()
     try:
         args = parse_arguments()
 
         # Create config and run archiver inside the same try block
         config = Config.from_args(args)
         archiver = Archiver(config)
-        exit_code = archiver.run()
+        exit_code = archiver.run(graceful_exit)
         sys.exit(exit_code)
 
     except KeyboardInterrupt:
-        GracefulExit.request_exit()
+        graceful_exit.request_exit()
         print("\nReceived KeyboardInterrupt, shutting down gracefully...")
         sys.exit(1)
     except Exception as e:
-        if not GracefulExit.should_exit():
+        if not graceful_exit.should_exit():
             logging.getLogger("camera_archiver").error(f"Unexpected error: {e}")
-            raise
+            sys.exit(1)  # Exit with error code instead of re-raising
         else:
             print("Process was cancelled")
             sys.exit(1)
