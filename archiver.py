@@ -154,6 +154,7 @@ class ProgressReporter:
         self.file_start = None
         self._progress_line = ""
         self._last_print_time = time.time()
+        self._finished = False  # Track if the progress bar has been finished
         self._original_signal_handlers = {}
         self._register_cleanup_handlers()
 
@@ -205,22 +206,27 @@ class ProgressReporter:
     def finish(self):
         self._cleanup_progress_bar()
         self._unregister_cleanup_handlers()
+        self._finished = True  # Mark that this progress bar is finished
 
     @property
     def has_progress(self) -> bool:
         return bool(self._progress_line)
 
     def start_processing(self):
+        if self._finished:
+            return
         if self.start_time is None:
             self.start_time = time.time()
 
     def start_file(self):
+        if self._finished:
+            return
         self.file_start = time.time()
         if self.start_time is None:
             self.start_time = time.time()
 
     def update_progress(self, idx: int, pct: float = 0.0):
-        if self.silent or self.graceful_exit.should_exit():
+        if self.silent or self.graceful_exit.should_exit() or self._finished:
             return
         line = self._format_line(idx, pct)
         if line == self._progress_line:
@@ -229,7 +235,7 @@ class ProgressReporter:
         self._display(line)
 
     def finish_file(self, idx: int):
-        if not self.graceful_exit.should_exit():
+        if not self.graceful_exit.should_exit() and not self._finished:
             self.update_progress(idx, 100.0)
 
     def _format_line(self, idx: int, pct: float) -> str:
@@ -247,7 +253,7 @@ class ProgressReporter:
         return f"Progress [{idx}/{self.total}]: {pct:.0f}% {bar} {elapsed_file} ({elapsed_total})"
 
     def redraw(self):
-        if self.silent or not self._progress_line or self.graceful_exit.should_exit():
+        if self.silent or not self._progress_line or self.graceful_exit.should_exit() or self._finished:
             return
         self._display(self._progress_line)
 
