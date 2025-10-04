@@ -1244,17 +1244,21 @@ class Archiver:
 
         progress_bar.start_processing()
 
-        # Actually remove everything once
-        for p in sorted(to_delete, key=lambda _p: _p.name):
-            FileCleaner.remove_one(
-                p,
-                logger,  # Type checker now knows logger is not None
-                self.config.dry_run,
-                self.config.use_trash,
-                self.config.get_trash_root(),
-                is_output=False,
-                source_root=self.config.directory,
-            )
+        # Only remove files if not cancelled during transcoding
+        if not graceful_exit.should_exit():
+            # Actually remove everything once
+            for p in sorted(to_delete, key=lambda _p: _p.name):
+                FileCleaner.remove_one(
+                    p,
+                    logger,  # Type checker now knows logger is not None
+                    self.config.dry_run,
+                    self.config.use_trash,
+                    self.config.get_trash_root(),
+                    is_output=False,
+                    source_root=self.config.directory,
+                )
+        else:
+            logger.info("Transcoding was cancelled - skipping removal of successfully transcoded source files")
 
         progress_bar.finish()
         return to_delete
