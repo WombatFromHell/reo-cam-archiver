@@ -253,7 +253,12 @@ class ProgressReporter:
         return f"Progress [{idx}/{self.total}]: {pct:.0f}% {bar} {elapsed_file} ({elapsed_total})"
 
     def redraw(self):
-        if self.silent or not self._progress_line or self.graceful_exit.should_exit() or self._finished:
+        if (
+            self.silent
+            or not self._progress_line
+            or self.graceful_exit.should_exit()
+            or self._finished
+        ):
             return
         self._display(self._progress_line)
 
@@ -1258,7 +1263,9 @@ class Archiver:
                     source_root=self.config.directory,
                 )
         else:
-            logger.info("Transcoding was cancelled - skipping removal of successfully transcoded source files")
+            logger.info(
+                "Transcoding was cancelled - skipping removal of successfully transcoded source files"
+            )
 
         progress_bar.finish()
         return to_delete
@@ -1382,36 +1389,36 @@ class Archiver:
             graceful_exit=graceful_exit,
         )
 
+        # Set up logger and log initial configuration
         if not self.config.cleanup:
             # Normal mode: transcoding files
             cutoff = datetime.now() - timedelta(days=self.config.age)
             old_list = [(p, t) for p, t in mp4s if t < cutoff]
+        else:
+            # Cleanup mode: no transcoding
+            old_list = []  # Define old_list even in cleanup mode to avoid unbound variable
+
+        if not self.config.cleanup:
             self.progress_bar = ProgressReporter(
                 total_files=len(old_list),
                 graceful_exit=graceful_exit,
                 silent=self.config.dry_run,
                 out=sys.stderr,
             )
-            self.logger = Logger.setup(self.config.log_file, self.progress_bar)
-
-            # For backward compatibility in transcoding logic, keep the old process_files_intelligent
-            # but update it to not call intelligent_cleanup internally
-            _ = self.process_files_intelligent(
-                old_list=old_list,
-                mapping=mapping,
-                graceful_exit=graceful_exit,
-                trash_files=trash_files,
-            )
         else:
             # Cleanup mode: no transcoding
             self.progress_bar = ProgressReporter(
                 total_files=0, graceful_exit=graceful_exit, silent=True, out=sys.stderr
             )
-            self.logger = Logger.setup(self.config.log_file, self.progress_bar)
+
+        self.logger = Logger.setup(self.config.log_file, self.progress_bar)
+
+        if self.config.cleanup:
             self.logger.info(
                 "Cleanup mode: skipping transcoding, only performing cleanup operations"
             )
 
+        # Log initial configuration messages
         for msg in [
             "Starting camera archive process...",
             f"Input: {base_dir}",
@@ -1425,6 +1432,17 @@ class Archiver:
         ]:
             if not graceful_exit.should_exit():
                 self.logger.info(msg)
+
+        # Now perform the main operations
+        if not self.config.cleanup:
+            # For backward compatibility in transcoding logic, keep the old process_files_intelligent
+            # but update it to not call intelligent_cleanup internally
+            _ = self.process_files_intelligent(
+                old_list=old_list,
+                mapping=mapping,
+                graceful_exit=graceful_exit,
+                trash_files=trash_files,
+            )
 
         # Always perform comprehensive storage management
         if not graceful_exit.should_exit():

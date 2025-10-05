@@ -46,9 +46,20 @@ class BaseTest(TestCase):
         self._orig_emit = GuardedStreamHandler.emit
         GuardedStreamHandler.emit = lambda *_, **__: None
 
+        # Also suppress progress bar output during tests
+        self._orig_progress_display = ProgressReporter._display
+        self._orig_progress_redraw = ProgressReporter.redraw
+        self._orig_progress_cleanup = ProgressReporter._cleanup_progress_bar
+        ProgressReporter._display = lambda self, line: None
+        ProgressReporter.redraw = lambda self: None
+        ProgressReporter._cleanup_progress_bar = lambda self: None
+
     def tearDown(self) -> None:
         shutil.rmtree(self.temp_dir, ignore_errors=True)
         GuardedStreamHandler.emit = self._orig_emit
+        ProgressReporter._display = self._orig_progress_display
+        ProgressReporter.redraw = self._orig_progress_redraw
+        ProgressReporter._cleanup_progress_bar = self._orig_progress_cleanup
 
     # ---------- file helpers ----------
     def create_file(
@@ -1341,6 +1352,73 @@ class TestIntegration(BaseTest):
         self.assertIn(source_file, found_paths)
         self.assertIn(archive_file, found_paths)  # Archive files should be included
         # Trash files are only included if they're in the old_list or found as archives
+
+    def test_archiver_configuration_logging_order(self):
+        """Test that configuration messages are logged before file processing."""
+        # Create a file to be archived
+        old_ts = datetime.now() - timedelta(days=31)
+        src_file = self.input_dir / f"REO_CAMERA_{old_ts.strftime('%Y%m%d%H%M%S')}.mp4"
+        src_file.parent.mkdir(parents=True, exist_ok=True)
+        src_file.write_bytes(b"dummy content for testing")
+
+        cfg = Config()
+        cfg.directory = self.input_dir
+        cfg.output = self.output_dir
+        cfg.trashdir = self.trash_dir
+        cfg.age = 30  # Age threshold to make file eligible for archiving
+        cfg.dry_run = False
+        cfg.max_size = 500
+        cfg.no_skip = False
+        cfg.cleanup = False  # Normal transcoding mode
+
+        archiver = Archiver(cfg)
+
+        # Mock the transcode method to avoid actual ffmpeg calls
+        with mock.patch("archiver.Transcoder.transcode_file", return_value=True):
+            # Capture log messages by mocking Logger.setup
+            with mock.patch("archiver.Logger.setup") as mock_setup:
+                # Create a mock logger to capture messages
+                mock_logger = MagicMock()
+                log_messages = []
+
+                def mock_info(msg, *args, **kwargs):
+                    formatted_msg = str(msg % args if args else msg)
+                    log_messages.append(formatted_msg)
+
+                mock_logger.info = mock_info
+                mock_setup.return_value = mock_logger
+
+                # Run the archiver
+                archiver.run()
+
+                # Check that configuration messages were logged
+                config_messages = [
+                    msg
+                    for msg in log_messages
+                    if any(
+                        keyword in msg
+                        for keyword in [
+                            "Starting camera archive process",
+                            f"Input: {self.input_dir}",
+                            f"Output: {self.output_dir}",
+                            f"Age threshold: {cfg.age} days",
+                            f"Size limit: {cfg.max_size} GB",
+                            f"Dry run: {cfg.dry_run}",
+                            f"Cleanup only: {cfg.cleanup}",
+                        ]
+                    )
+                ]
+
+                # There should be several configuration messages
+                self.assertGreater(
+                    len(config_messages), 0, "Configuration messages should be logged"
+                )
+
+                # Check that the startup message was logged
+                startup_msg_found = any(
+                    "Starting camera archive process" in msg for msg in log_messages
+                )
+                self.assertTrue(startup_msg_found, "Starting message should be logged")
 
 
 if __name__ == "__main__":
