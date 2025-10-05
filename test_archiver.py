@@ -54,12 +54,21 @@ class BaseTest(TestCase):
         ProgressReporter.redraw = lambda self: None
         ProgressReporter._cleanup_progress_bar = lambda self: None
 
+        # Patch ask_confirmation to return True by default to prevent hanging
+        self.ask_confirmation_patcher = mock.patch(
+            "archiver.ask_confirmation", return_value=True
+        )
+        self.mock_ask_confirmation = self.ask_confirmation_patcher.start()
+
     def tearDown(self) -> None:
         shutil.rmtree(self.temp_dir, ignore_errors=True)
         GuardedStreamHandler.emit = self._orig_emit
         ProgressReporter._display = self._orig_progress_display
         ProgressReporter.redraw = self._orig_progress_redraw
         ProgressReporter._cleanup_progress_bar = self._orig_progress_cleanup
+        # Stop the ask_confirmation patcher if it exists
+        if hasattr(self, "ask_confirmation_patcher"):
+            self.ask_confirmation_patcher.stop()
 
     # ---------- file helpers ----------
     def create_file(
@@ -1419,6 +1428,372 @@ class TestIntegration(BaseTest):
                     "Starting camera archive process" in msg for msg in log_messages
                 )
                 self.assertTrue(startup_msg_found, "Starting message should be logged")
+
+
+class TestConfirmationBehavior(BaseTest):
+    """Test the confirmation behavior for transcoding and file removal."""
+
+    def test_config_no_confirm_flag(self):
+        """Test that the no_confirm flag is properly set in config."""
+        # Test default value (should be False)
+        args = mock.Mock(
+            directory=Path("/camera"),
+            output=Path("/camera/archived"),
+            age=30,
+            dry_run=False,
+            max_size=500,
+            no_skip=False,
+            use_trash=True,
+            cleanup=False,
+            clean_output=False,
+            trashdir=None,
+            no_confirm=False,  # Default value
+        )
+        cfg = Config.from_args(args)
+        self.assertFalse(cfg.no_confirm)
+
+        # Test with --no-confirm flag set
+        args.no_confirm = True
+        cfg = Config.from_args(args)
+        self.assertTrue(cfg.no_confirm)
+
+    def test_generate_action_plan(self):
+        """Test that action plan generation works correctly."""
+        # Create test files
+        old_ts = datetime.now() - timedelta(days=31)
+        src_file = self.create_file("test_video.mp4", ts=old_ts)
+        jpg_file = self.create_file("test_image.jpg", ts=old_ts)
+
+        # Create archiver
+        cfg = Config()
+        cfg.directory = self.input_dir
+        cfg.output = self.output_dir
+        archiver = Archiver(cfg)
+        archiver.setup_logging()
+
+        old_list = [(src_file, old_ts)]
+        mapping = {
+            old_ts.strftime("%Y%m%d%H%M%S"): {".mp4": src_file, ".jpg": jpg_file}
+        }
+        trash_files = set()
+
+        # Generate plan
+        plan = archiver.generate_action_plan(old_list, mapping, trash_files)
+
+        # Check that plan contains expected actions
+        self.assertEqual(len(plan["transcoding"]), 1)
+        self.assertEqual(len(plan["removals"]), 1)  # JPG removal after transcode
+        self.assertEqual(len(plan["cleanup_removals"]), 0)
+
+        # Verify the transcoding action
+        transcode_action = plan["transcoding"][0]
+        self.assertEqual(transcode_action["input"], src_file)
+        self.assertEqual(transcode_action["jpg_to_remove"], jpg_file)
+
+        # Verify the removal action
+        removal_action = plan["removals"][0]
+        self.assertEqual(removal_action["file"], jpg_file)
+        self.assertEqual(removal_action["type"], "jpg_removal_after_transcode")
+
+    def test_action_plan_with_skip_logic(self):
+        """Test action plan when skip logic applies."""
+        old_ts = datetime.now() - timedelta(days=31)
+        src_file = self.create_file("test_video.mp4", ts=old_ts)
+
+        # Create an archive file that already exists to trigger skip logic
+        existing_archive = self.create_archive(old_ts)
+        self.assertTrue(existing_archive.exists())
+
+        cfg = Config()
+        cfg.directory = self.input_dir
+        cfg.output = self.output_dir
+        cfg.no_skip = False  # Allow skipping
+        archiver = Archiver(cfg)
+        archiver.setup_logging()
+
+        old_list = [(src_file, old_ts)]
+        mapping = {old_ts.strftime("%Y%m%d%H%M%S"): {".mp4": src_file}}
+        trash_files = set()
+
+        # Generate plan
+        plan = archiver.generate_action_plan(old_list, mapping, trash_files)
+
+        # Should have removals but no transcoding (since archive exists)
+        self.assertEqual(len(plan["transcoding"]), 0)
+        self.assertEqual(len(plan["removals"]), 1)  # Source file removal after skip
+        self.assertEqual(len(plan["cleanup_removals"]), 0)
+
+        # Verify the removal action is for source removal after skip
+        removal_action = plan["removals"][0]
+        self.assertEqual(removal_action["type"], "source_removal_after_skip")
+        self.assertEqual(removal_action["file"], src_file)
+
+    def test_display_action_plan(self):
+        """Test that display_action_plan doesn't crash and logs info."""
+        old_ts = datetime.now() - timedelta(days=31)
+        src_file = self.create_file("test_video.mp4", ts=old_ts)
+        jpg_file = self.create_file("test_image.jpg", ts=old_ts)
+
+        cfg = Config()
+        cfg.directory = self.input_dir
+        cfg.output = self.output_dir
+        archiver = Archiver(cfg)
+        archiver.setup_logging()
+
+        # Create a sample plan
+        plan = {
+            "transcoding": [
+                {
+                    "type": "transcode",
+                    "input": src_file,
+                    "output": self.output_dir / "output.mp4",
+                    "size": 1024000,  # 1MB
+                    "jpg_to_remove": jpg_file,
+                }
+            ],
+            "removals": [
+                {
+                    "type": "jpg_removal_after_transcode",
+                    "file": jpg_file,
+                    "size": 102400,  # 100KB
+                    "reason": "Paired with transcoded MP4",
+                }
+            ],
+            "cleanup_removals": [],
+        }
+
+        # This should run without crashing
+        archiver.display_action_plan(plan)
+
+        # Test with cleanup removals
+        plan_with_cleanup = {
+            "transcoding": [],
+            "removals": [],
+            "cleanup_removals": [
+                {
+                    "type": "cleanup_removal",
+                    "file": src_file,
+                    "size": 1024000,
+                    "is_archive": False,
+                    "is_trash": False,
+                    "timestamp": old_ts,
+                }
+            ],
+        }
+
+        archiver.display_action_plan(plan_with_cleanup)
+
+    def test_process_files_intelligent_with_confirmation(self):
+        """Test that process_files_intelligent respects no_confirm flag and confirmation."""
+        import archiver
+
+        old_ts = datetime.now() - timedelta(days=31)
+        src_file = self.create_file("test_video.mp4", ts=old_ts)
+
+        # Temporarily replace ask_confirmation for this test
+        calls_made = []
+
+        def track_calls(prompt, default=False):
+            calls_made.append(prompt)
+            return True  # Always return True to continue execution
+
+        original_func = archiver.ask_confirmation
+
+        try:
+            # Test with no_confirm=True (should skip confirmation)
+            archiver.ask_confirmation = track_calls
+            cfg = Config()
+            cfg.directory = self.input_dir
+            cfg.output = self.output_dir
+            cfg.no_confirm = True  # No confirmation needed
+            cfg.dry_run = True  # Use dry run to avoid actual transcoding
+            cfg.no_skip = True  # Ensure the file gets processed (not skipped)
+
+            archiver_instance = Archiver(cfg)
+            archiver_instance.setup_logging()
+
+            old_list = [(src_file, old_ts)]
+            mapping = {old_ts.strftime("%Y%m%d%H%M%S"): {".mp4": src_file}}
+            trash_files = set()
+
+            # Mock transcoder to avoid actual transcoding
+            with mock.patch.object(Transcoder, "transcode_file", return_value=True):
+                _ = archiver_instance.process_files_intelligent(
+                    old_list, mapping, trash_files=trash_files
+                )
+                # Should proceed without asking for confirmation since no_confirm=True
+                self.assertEqual(
+                    len(calls_made),
+                    0,
+                    f"ask_confirmation was called {len(calls_made)} times when it should not have been called",
+                )
+
+            # Reset for next test
+            calls_made.clear()
+
+            # Test with no_confirm=False
+            archiver.ask_confirmation = track_calls
+            cfg2 = Config()
+            cfg2.directory = self.input_dir
+            cfg2.output = self.output_dir
+            cfg2.no_confirm = False  # Require confirmation
+            cfg2.dry_run = True  # Use dry run to avoid actual transcoding
+            cfg2.no_skip = True  # Ensure the file gets processed (not skipped)
+
+            archiver_instance2 = Archiver(cfg2)
+            archiver_instance2.setup_logging()
+
+            with mock.patch.object(Transcoder, "transcode_file", return_value=True):
+                _ = archiver_instance2.process_files_intelligent(
+                    old_list, mapping, trash_files=trash_files
+                )
+                # Should ask for confirmation when no_confirm=False
+                self.assertGreater(
+                    len(calls_made),
+                    0,
+                    "ask_confirmation was not called when it should have been",
+                )
+        finally:
+            archiver.ask_confirmation = original_func
+
+    @mock.patch("archiver.ask_confirmation")
+    def test_cleanup_archive_size_limit_with_confirmation(self, mock_ask_confirmation):
+        """Test that cleanup_archive_size_limit respects no_confirm flag and confirmation."""
+        old_ts = datetime.now() - timedelta(days=31)
+        src_file = self.create_file("test_video.mp4", ts=old_ts)
+
+        # Create an archiver in cleanup mode
+        cfg = Config()
+        cfg.directory = self.input_dir
+        cfg.output = self.output_dir
+        cfg.trashdir = self.trash_dir
+        cfg.max_size = 0  # Force size cleanup
+        cfg.age = 30  # Set age threshold
+        cfg.cleanup = True
+        cfg.no_confirm = False  # Require confirmation
+
+        archiver = Archiver(cfg)
+        archiver.setup_logging()
+
+        # Mock the intelligent_cleanup to return some files to remove
+        with mock.patch.object(archiver, "intelligent_cleanup") as mock_intel_cleanup:
+            mock_file_info = mock.Mock()
+            mock_file_info.path = src_file
+            mock_file_info.size = 1024000
+            mock_file_info.is_archive = False
+            mock_file_info.is_trash = False
+            mock_file_info.timestamp = old_ts
+
+            mock_intel_cleanup.return_value = [mock_file_info]
+
+            # Set mock to return True (user confirms cleanup)
+            mock_ask_confirmation.return_value = True
+
+            # Mock FileCleaner.remove_one to avoid actual removal
+            with mock.patch("archiver.FileCleaner.remove_one") as mock_remove_one:
+                archiver.cleanup_archive_size_limit()
+                # Should ask for confirmation for the main cleanup
+                mock_ask_confirmation.assert_called_once()
+                # Should call remove_one for each file in the returned list
+                mock_remove_one.assert_called_once()
+
+        # Test with no_confirm=True (should skip confirmation)
+        cfg2 = Config()
+        cfg2.directory = self.input_dir
+        cfg2.output = self.output_dir
+        cfg2.trashdir = self.trash_dir
+        cfg2.max_size = 0  # Force size cleanup
+        cfg2.age = 30  # Set age threshold
+        cfg2.cleanup = True
+        cfg2.no_confirm = True  # Skip confirmation
+
+        archiver2 = Archiver(cfg2)
+        archiver2.setup_logging()
+
+        with mock.patch.object(archiver2, "intelligent_cleanup") as mock_intel_cleanup:
+            mock_intel_cleanup.return_value = [mock_file_info]
+
+            with mock.patch("archiver.FileCleaner.remove_one") as mock_remove_one:
+                # Record the call count before the second scenario to verify
+                # no additional calls are made when no_confirm=True
+                calls_before = mock_ask_confirmation.call_count
+                archiver2.cleanup_archive_size_limit()
+                calls_after = mock_ask_confirmation.call_count
+                # Should NOT make any additional calls since no_confirm=True
+                self.assertEqual(
+                    calls_after,
+                    calls_before,
+                    "ask_confirmation was called when no_confirm=True",
+                )
+                # Should still call remove_one for each file in the returned list
+                mock_remove_one.assert_called_once()
+
+    def test_integration_dry_run_and_confirm_flags(self):
+        """Test integration of dry-run and confirm flags."""
+        # Create a test file
+        old_ts = datetime.now() - timedelta(days=31)
+        src_file = self.create_file("test_video.mp4", ts=old_ts)
+
+        # Test with dry_run=True and no_confirm=False (should show plan but not execute)
+        cfg = Config()
+        cfg.directory = self.input_dir
+        cfg.output = self.output_dir
+        cfg.dry_run = True  # Dry run - should not execute actions
+        cfg.no_confirm = False  # Would normally ask for confirmation
+        cfg.age = 30  # Age threshold to make file eligible
+        cfg.cleanup = False  # Transcode mode
+
+        archiver = Archiver(cfg)
+        archiver.setup_logging()
+
+        # Mock transcoder to avoid actual transcoding
+        with mock.patch.object(Transcoder, "transcode_file", return_value=True):
+            # Since this is dry run, no confirmation should be needed, and no files should be modified
+            result = archiver.run()
+            self.assertEqual(result, 0)
+
+            # The source file should still exist in dry-run mode
+            self.assertTrue(src_file.exists())
+
+        # Test with both dry_run=True and no_confirm=True
+        cfg2 = Config()
+        cfg2.directory = self.input_dir
+        cfg2.output = self.output_dir
+        cfg2.dry_run = True
+        cfg2.no_confirm = True
+        cfg2.age = 30
+        cfg2.cleanup = False
+
+        archiver2 = Archiver(cfg2)
+        archiver2.setup_logging()
+
+        with mock.patch.object(Transcoder, "transcode_file", return_value=True):
+            result2 = archiver2.run()
+            self.assertEqual(result2, 0)
+
+            # The source file should still exist in dry-run mode regardless of no_confirm
+            self.assertTrue(src_file.exists())
+
+        # Test in cleanup mode with dry run
+        big_archive = self.create_archive(old_ts, size=1024 * 1024 * 1024)  # 1GB file
+        self.assertTrue(big_archive.exists())
+
+        cfg3 = Config()
+        cfg3.directory = self.input_dir
+        cfg3.output = self.output_dir
+        cfg3.dry_run = True  # Dry run in cleanup mode
+        cfg3.no_confirm = False
+        cfg3.max_size = 0  # Force size cleanup
+        cfg3.cleanup = True
+
+        archiver3 = Archiver(cfg3)
+        archiver3.setup_logging()
+
+        result3 = archiver3.run()
+        self.assertEqual(result3, 0)
+
+        # The big archive should still exist in dry-run mode
+        self.assertTrue(big_archive.exists())
 
 
 if __name__ == "__main__":

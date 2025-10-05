@@ -25,6 +25,28 @@ DEFAULT_PROGRESS_WIDTH = 30
 PROGRESS_UPDATE_INTERVAL = 5  # seconds for non-TTY output
 
 
+def ask_confirmation(prompt: str, default: bool = True) -> bool:
+    """Ask the user for confirmation with a prompt."""
+    if default:
+        choice_str = "Y/n"
+    else:
+        choice_str = "y/N"
+
+    while True:
+        try:
+            response = input(f"{prompt} [{choice_str}] ").strip().lower()
+            if not response:
+                return default
+            if response in ["y", "yes"]:
+                return True
+            if response in ["n", "no"]:
+                return False
+            print("Please answer 'y' or 'n'.")
+        except (EOFError, KeyboardInterrupt):
+            print("\nOperation cancelled.")
+            return False
+
+
 class GracefulExit:
     """Thread-safe flag for graceful exit handling"""
 
@@ -55,6 +77,7 @@ class Config:
         self.no_skip = False
         self.cleanup = False
         self.clean_output = False
+        self.no_confirm = False  # Add the no_confirm flag to Config class
         self.log_file: Optional[Path] = None
 
     @classmethod
@@ -73,6 +96,7 @@ class Config:
         config.no_skip = args.no_skip
         config.cleanup = args.cleanup
         config.clean_output = getattr(args, "clean_output", False)
+        config.no_confirm = getattr(args, "no_confirm", False)
         config.log_file = config.directory / "transcoding.log"
         return config
 
@@ -1172,6 +1196,147 @@ class Archiver:
 
         return files_to_remove
 
+    def generate_action_plan(
+        self,
+        old_list: List[Tuple[Path, datetime]],
+        mapping: Dict[str, Dict[str, Path]],
+        trash_files: Set[Path],
+    ) -> Dict[str, List]:
+        """Generate a plan of all actions to be performed (transcoding and removals)"""
+        transcoding_actions = []
+        removal_actions = []
+
+        for fp, ts in old_list:
+            if fp in trash_files:  # already in trash
+                continue
+
+            outp = self.output_path(fp, ts)
+            jpg = mapping.get(ts.strftime("%Y%m%d%H%M%S"), {}).get(".jpg")
+
+            # Check skip logic
+            if (
+                not self.config.no_skip
+                and outp.exists()
+                and outp.stat().st_size > MIN_ARCHIVE_SIZE_BYTES
+            ):
+                # Will skip transcoding but remove source files
+                size = 0
+                if fp.exists():
+                    try:
+                        size = fp.stat().st_size
+                    except OSError:
+                        size = 0
+                removal_actions.append(
+                    {
+                        "type": "source_removal_after_skip",
+                        "file": fp,
+                        "reason": f"Skipping transcoding: archive exists at {outp}",
+                        "size": size,
+                    }
+                )
+                if jpg:
+                    size = 0
+                    if jpg.exists():
+                        try:
+                            size = jpg.stat().st_size
+                        except OSError:
+                            size = 0
+                    removal_actions.append(
+                        {
+                            "type": "jpg_removal_after_skip",
+                            "file": jpg,
+                            "reason": "Skipping transcoding: archive exists for paired MP4",
+                            "size": size,
+                        }
+                    )
+            else:
+                # Will transcode the file
+                size = 0
+                if fp.exists():
+                    try:
+                        size = fp.stat().st_size
+                    except OSError:
+                        size = 0
+                transcoding_actions.append(
+                    {
+                        "type": "transcode",
+                        "input": fp,
+                        "output": outp,
+                        "size": size,
+                        "jpg_to_remove": jpg,
+                    }
+                )
+                if jpg:
+                    size = 0
+                    if jpg.exists():
+                        try:
+                            size = jpg.stat().st_size
+                        except OSError:
+                            size = 0
+                    removal_actions.append(
+                        {
+                            "type": "jpg_removal_after_transcode",
+                            "file": jpg,
+                            "reason": "Paired with transcoded MP4",
+                            "size": size,
+                        }
+                    )
+
+        # Also get cleanup plan for existing archives if in cleanup mode
+        cleanup_removals = []
+        if self.config.cleanup:
+            all_file_infos = self.collect_file_info(old_list)
+            files_to_remove = self.intelligent_cleanup(all_file_infos)
+            for file_info in files_to_remove:
+                cleanup_removals.append(
+                    {
+                        "type": "cleanup_removal",
+                        "file": file_info.path,
+                        "size": file_info.size,
+                        "is_archive": file_info.is_archive,
+                        "is_trash": file_info.is_trash,
+                        "timestamp": file_info.timestamp,
+                    }
+                )
+
+        return {
+            "transcoding": transcoding_actions,
+            "removals": removal_actions,
+            "cleanup_removals": cleanup_removals,
+        }
+
+    def display_action_plan(self, plan: Dict[str, List]) -> None:
+        """Display the action plan to the user"""
+        logger = self.logger
+        if logger:
+            logger.info("=== ACTION PLAN ===")
+            logger.info(f"Transcoding {len(plan['transcoding'])} files:")
+            for i, action in enumerate(plan["transcoding"], 1):
+                logger.info(
+                    f"  {i}. {action['input']} -> {action['output']} "
+                    f"({action['size'] / (1024**2):.1f} MB)"
+                )
+                if action["jpg_to_remove"]:
+                    logger.info(
+                        f"      + Removing paired JPG: {action['jpg_to_remove']}"
+                    )
+
+            logger.info(f"Removing {len(plan['removals'])} files:")
+            for i, action in enumerate(plan["removals"], 1):
+                logger.info(
+                    f"  {i}. {action['file']} "
+                    f"({action['size'] / (1024**2):.1f} MB) - {action['reason']}"
+                )
+
+            logger.info(f"Cleanup removing {len(plan['cleanup_removals'])} files:")
+            for i, action in enumerate(plan["cleanup_removals"], 1):
+                logger.info(
+                    f"  {i}. {action['file']} "
+                    f"({action['size'] / (1024**2):.1f} MB) - Priority: {'Trash' if action['is_trash'] else 'Archive' if action['is_archive'] else 'Source'}"
+                )
+
+            logger.info("=== END PLAN ===")
+
     def process_files_intelligent(
         self,
         old_list: List[Tuple[Path, datetime]],
@@ -1200,6 +1365,19 @@ class Archiver:
         if not old_list or graceful_exit.should_exit():
             logger.info("No files to process or cancellation requested")
             return set()
+
+        # Generate action plan and ask for confirmation if needed
+        plan = self.generate_action_plan(old_list, mapping, trash_files)
+        self.display_action_plan(plan)
+
+        if not self.config.no_confirm:
+            # Ask for confirmation before proceeding
+            confirm = ask_confirmation(
+                "Proceed with transcoding and file removals?", default=False
+            )
+            if not confirm:
+                logger.info("Operation cancelled by user")
+                return set()
 
         removed_files: Set[Path] = set()
         for fp, ts in old_list:
@@ -1233,7 +1411,9 @@ class Archiver:
                     is_output=False,
                     source_root=self.config.directory,
                 )
-                if not self.config.dry_run:  # Only add to removed_files if not in dry run
+                if (
+                    not self.config.dry_run
+                ):  # Only add to removed_files if not in dry run
                     removed_files.add(fp)
                 if jpg:
                     FileCleaner.remove_one(
@@ -1245,7 +1425,9 @@ class Archiver:
                         is_output=False,
                         source_root=self.config.directory,
                     )
-                    if not self.config.dry_run:  # Only add to removed_files if not in dry run
+                    if (
+                        not self.config.dry_run
+                    ):  # Only add to removed_files if not in dry run
                         removed_files.add(jpg)
                 continue
 
@@ -1272,7 +1454,9 @@ class Archiver:
                     is_output=False,
                     source_root=self.config.directory,
                 )
-                if not self.config.dry_run:  # Only add to removed_files if not in dry run
+                if (
+                    not self.config.dry_run
+                ):  # Only add to removed_files if not in dry run
                     removed_files.add(fp)
                 if jpg:
                     FileCleaner.remove_one(
@@ -1284,7 +1468,9 @@ class Archiver:
                         is_output=False,
                         source_root=self.config.directory,
                     )
-                    if not self.config.dry_run:  # Only add to removed_files if not in dry run
+                    if (
+                        not self.config.dry_run
+                    ):  # Only add to removed_files if not in dry run
                         removed_files.add(jpg)
             else:
                 logger.error("Transcoding failed for %s – keeping source", fp)
@@ -1328,16 +1514,43 @@ class Archiver:
             self.logger.info("[DRY RUN] Would enforce storage limits")
             # Simulate the intelligent cleanup to show what would happen
             all_file_infos = self.collect_file_info(mp4s)
-            _ = self.intelligent_cleanup(all_file_infos)
+            files_to_remove = self.intelligent_cleanup(all_file_infos)
+            # Show what would be removed but don't remove
+            self.logger.info(
+                f"[DRY RUN] Would remove {len(files_to_remove)} files based on size/age limits"
+            )
             self.logger.info("[DRY RUN] Would clean up orphaned JPG files")
             return
 
-        # Step 2: File-based cleanup
-        # Collect info for ALL files (not just old ones)
+        # Step 2: Generate action plan for cleanup
         all_file_infos = self.collect_file_info(mp4s)
-
-        # Step 3: Apply intelligent cleanup
         files_to_remove = self.intelligent_cleanup(all_file_infos)
+
+        # Create cleanup plan to display
+        cleanup_plan = {
+            "transcoding": [],  # No transcoding in cleanup mode
+            "removals": [],  # No regular removals in cleanup mode
+            "cleanup_removals": [
+                {
+                    "type": "cleanup_removal",
+                    "file": file_info.path,
+                    "size": file_info.size,
+                    "is_archive": file_info.is_archive,
+                    "is_trash": file_info.is_trash,
+                    "timestamp": file_info.timestamp,
+                }
+                for file_info in files_to_remove
+            ],
+        }
+
+        self.display_action_plan(cleanup_plan)
+
+        # Step 3: Ask for confirmation if needed
+        if not self.config.dry_run and not self.config.no_confirm:
+            confirm = ask_confirmation("Proceed with cleanup removals?", default=False)
+            if not confirm:
+                self.logger.info("Cleanup operation cancelled by user")
+                return
 
         # Step 4: Execute file removal
         for file_info in files_to_remove:
@@ -1354,15 +1567,66 @@ class Archiver:
             )
 
         # Step 5: Clean up orphaned JPGs
-        FileCleaner.remove_orphaned_jpgs(
-            mapping,
-            set(),
-            self.logger,
-            False,
-            self.config.use_trash,
-            trash_root,
-            graceful_exit=graceful_exit,
-        )
+        # Generate a separate plan for orphaned JPG removal
+        orphaned_jpgs = []
+        for key, files in mapping.items():
+            jpg = files.get(".jpg")
+            mp4 = files.get(".mp4")
+            if jpg and mp4 is None:  # orphaned JPG
+                size = 0
+                try:
+                    if jpg.exists():
+                        size = jpg.stat().st_size
+                except (OSError, IOError):
+                    pass
+                orphaned_jpgs.append(
+                    {
+                        "type": "orphaned_jpg_removal",
+                        "file": jpg,
+                        "reason": "No corresponding MP4 file",
+                        "size": size,
+                    }
+                )
+
+        # Display orphaned JPG plan
+        if orphaned_jpgs:
+            self.logger.info(
+                f"Found {len(orphaned_jpgs)} orphaned JPG files to remove:"
+            )
+            for i, jpg_info in enumerate(orphaned_jpgs, 1):
+                self.logger.info(
+                    f"  {i}. {jpg_info['file']} "
+                    f"({jpg_info['size'] / (1024**2):.1f} MB) - {jpg_info['reason']}"
+                )
+
+        # Ask for confirmation for orphaned JPGs if needed
+        if orphaned_jpgs and not self.config.dry_run and not self.config.no_confirm:
+            confirm = ask_confirmation(
+                f"Remove {len(orphaned_jpgs)} orphaned JPG files?", default=False
+            )
+            if not confirm:
+                self.logger.info("Orphaned JPG removal cancelled by user")
+            else:
+                FileCleaner.remove_orphaned_jpgs(
+                    mapping,
+                    set(),
+                    self.logger,
+                    False,  # Not dry run, user confirmed
+                    self.config.use_trash,
+                    trash_root,
+                    graceful_exit=graceful_exit,
+                )
+        elif orphaned_jpgs:
+            # No confirmation needed, proceed with removal
+            FileCleaner.remove_orphaned_jpgs(
+                mapping,
+                set(),
+                self.logger,
+                False,  # Not dry run
+                self.config.use_trash,
+                trash_root,
+                graceful_exit=graceful_exit,
+            )
 
         # Step 6: Clean up empty directories AFTER all file operations are complete
         FileCleaner.clean_empty_directories(
@@ -1463,18 +1727,23 @@ class Archiver:
                 self.logger.info(msg)
 
         # Now perform the main operations
+        user_cancelled = False
         if not self.config.cleanup:
             # For backward compatibility in transcoding logic, keep the old process_files_intelligent
             # but update it to not call intelligent_cleanup internally
-            _ = self.process_files_intelligent(
+            result = self.process_files_intelligent(
                 old_list=old_list,
                 mapping=mapping,
                 graceful_exit=graceful_exit,
                 trash_files=trash_files,
             )
+            # If the user cancelled during transcoding, we should skip cleanup too
+            if result == set() and not graceful_exit.should_exit() and old_list:
+                # Operation was cancelled during transcoding (empty result set with non-empty input list)
+                user_cancelled = True
 
-        # Always perform comprehensive storage management
-        if not graceful_exit.should_exit():
+        # Perform comprehensive storage management unless user cancelled during previous operation
+        if not graceful_exit.should_exit() and not user_cancelled:
             self.cleanup_archive_size_limit(graceful_exit)
 
         if graceful_exit.should_exit():
@@ -1531,6 +1800,12 @@ def parse_arguments():
         "--clean-output",
         action="store_true",
         help="Include output files in age-based cleanup (default: exclude output files)",
+    )
+    parser.add_argument(
+        "-y",
+        "--no-confirm",
+        action="store_true",
+        help="Skip confirmation prompts for transcoding and file removal (default: ask for confirmation)",
     )
     args = parser.parse_args()
     # Handle the --no-trash flag
