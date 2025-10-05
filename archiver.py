@@ -1201,7 +1201,7 @@ class Archiver:
             logger.info("No files to process or cancellation requested")
             return set()
 
-        to_delete: Set[Path] = set()
+        removed_files: Set[Path] = set()
         for fp, ts in old_list:
             if graceful_exit.should_exit():
                 break
@@ -1223,9 +1223,30 @@ class Archiver:
                 and outp.stat().st_size > MIN_ARCHIVE_SIZE_BYTES
             ):
                 logger.info("[SKIP] Archive exists and is large enough: %s", outp)
-                to_delete.add(fp)
+                # Remove source files immediately for skipped files too
+                FileCleaner.remove_one(
+                    fp,
+                    logger,
+                    self.config.dry_run,
+                    self.config.use_trash,
+                    self.config.get_trash_root(),
+                    is_output=False,
+                    source_root=self.config.directory,
+                )
+                if not self.config.dry_run:  # Only add to removed_files if not in dry run
+                    removed_files.add(fp)
                 if jpg:
-                    to_delete.add(jpg)
+                    FileCleaner.remove_one(
+                        jpg,
+                        logger,
+                        self.config.dry_run,
+                        self.config.use_trash,
+                        self.config.get_trash_root(),
+                        is_output=False,
+                        source_root=self.config.directory,
+                    )
+                    if not self.config.dry_run:  # Only add to removed_files if not in dry run
+                        removed_files.add(jpg)
                 continue
 
             progress_bar.start_file()
@@ -1241,34 +1262,42 @@ class Archiver:
             )
             if ok:
                 progress_bar.finish_file(old_list.index((fp, ts)) + 1)
-                to_delete.add(fp)
-                if jpg:
-                    to_delete.add(jpg)
-            else:
-                logger.error("Transcoding failed for %s – keeping source", fp)
-
-        progress_bar.start_processing()
-
-        # Only remove files if not cancelled during transcoding
-        if not graceful_exit.should_exit():
-            # Actually remove everything once
-            for p in sorted(to_delete, key=lambda _p: _p.name):
+                # Remove source files immediately after successful transcoding
                 FileCleaner.remove_one(
-                    p,
-                    logger,  # Type checker now knows logger is not None
+                    fp,
+                    logger,
                     self.config.dry_run,
                     self.config.use_trash,
                     self.config.get_trash_root(),
                     is_output=False,
                     source_root=self.config.directory,
                 )
-        else:
+                if not self.config.dry_run:  # Only add to removed_files if not in dry run
+                    removed_files.add(fp)
+                if jpg:
+                    FileCleaner.remove_one(
+                        jpg,
+                        logger,
+                        self.config.dry_run,
+                        self.config.use_trash,
+                        self.config.get_trash_root(),
+                        is_output=False,
+                        source_root=self.config.directory,
+                    )
+                    if not self.config.dry_run:  # Only add to removed_files if not in dry run
+                        removed_files.add(jpg)
+            else:
+                logger.error("Transcoding failed for %s – keeping source", fp)
+
+        progress_bar.start_processing()
+
+        if graceful_exit.should_exit():
             logger.info(
-                "Transcoding was cancelled - skipping removal of successfully transcoded source files"
+                "Transcoding was cancelled - some source files may have been removed if transcoding completed before cancellation"
             )
 
         progress_bar.finish()
-        return to_delete
+        return removed_files
 
     def cleanup_archive_size_limit(
         self, graceful_exit: Optional[GracefulExit] = None
