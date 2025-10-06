@@ -17,34 +17,15 @@ import threading
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+
+from abc import ABC, abstractmethod
+from enum import Enum
 
 # Constants
 MIN_ARCHIVE_SIZE_BYTES = 1_048_576  # 1MB
 DEFAULT_PROGRESS_WIDTH = 30
 PROGRESS_UPDATE_INTERVAL = 5  # seconds for non-TTY output
-
-
-def ask_confirmation(prompt: str, default: bool = True) -> bool:
-    """Ask the user for confirmation with a prompt."""
-    if default:
-        choice_str = "Y/n"
-    else:
-        choice_str = "y/N"
-
-    while True:
-        try:
-            response = input(f"{prompt} [{choice_str}] ").strip().lower()
-            if not response:
-                return default
-            if response in ["y", "yes"]:
-                return True
-            if response in ["n", "no"]:
-                return False
-            print("Please answer 'y' or 'n'.")
-        except (EOFError, KeyboardInterrupt):
-            print("\nOperation cancelled.")
-            return False
 
 
 class GracefulExit:
@@ -1755,6 +1736,1211 @@ class Archiver:
         else:
             self.logger.info("Archive process completed successfully")
             return 0
+
+
+class State(Enum):
+    """Enumeration of possible states in the archiver workflow"""
+
+    INITIALIZATION = "initialization"
+    DISCOVERY = "discovery"
+    PLANNING = "planning"
+    EXECUTION = "execution"
+    CLEANUP = "cleanup"
+    TERMINATION = "termination"
+
+
+class BaseState(ABC):
+    """Base class for all state implementations"""
+
+    def __init__(self, context: "ArchiveStateMachine"):
+        self.context = context
+
+    @abstractmethod
+    def execute(self) -> State:
+        """Execute the current state and return the next state"""
+        pass
+
+
+# Utility functions to simplify common operations
+def execute_with_service_check(
+    service_getter: Callable, error_msg: str, action: Callable
+):
+    """
+    Helper function to execute an action with service availability check
+    """
+    service = service_getter()
+    if service is None:
+        print(error_msg)
+        return State.TERMINATION
+    return action(service)
+
+
+def safe_get_data(data_dict: Dict, key: str, default=None):
+    """Safely get data from the context's data dictionary"""
+    return data_dict.get(key, default)
+
+
+# Utility functions to eliminate code duplication
+def construct_output_path(
+    output_dir: Path, input_file: Path, timestamp: datetime
+) -> Path:
+    """Get output path for transcoded file based on timestamp"""
+    # Check if parent directories match YYYY/MM/DD pattern
+    if len(input_file.parts) >= 4:
+        y, m, d = input_file.parts[-4:-1]
+        try:
+            int(y)
+            int(m)
+            int(d)
+            # Valid date structure → reuse it
+            return (
+                output_dir
+                / y
+                / m
+                / d
+                / f"archived-{timestamp.strftime('%Y%m%d%H%M%S')}.mp4"
+            )
+        except ValueError:
+            pass  # Not a valid date structure → fall through
+    # Use timestamp-based structure
+    return (
+        output_dir
+        / str(timestamp.year)
+        / f"{timestamp.month:02d}"
+        / f"{timestamp.day:02d}"
+        / f"archived-{timestamp.strftime('%Y%m%d%H%M%S')}.mp4"
+    )
+
+
+# Service Classes for better modularity and testability
+class FileOperationsService:
+    """Service class for handling file operations"""
+
+    def __init__(self, logger: logging.Logger, graceful_exit: GracefulExit):
+        self.logger = logger
+        self.graceful_exit = graceful_exit
+
+    def scan_files(
+        self, base_dir: Path, include_trash: bool, trash_root: Optional[Path]
+    ) -> Tuple[List[Tuple[Path, datetime]], Dict[str, Dict[str, Path]], Set[Path]]:
+        """Scan files using the existing FileScanner"""
+        return FileScanner.scan_files(
+            base_dir,
+            include_trash=include_trash,
+            trash_root=trash_root,
+            graceful_exit=self.graceful_exit,
+        )
+
+    def remove_one(
+        self,
+        path: Path,
+        dry_run: bool,
+        use_trash: bool,
+        trash_root: Optional[Path],
+        is_output: bool,
+        source_root: Path,
+    ) -> None:
+        """Remove a single file using the existing FileCleaner"""
+        FileCleaner.remove_one(
+            path, self.logger, dry_run, use_trash, trash_root, is_output, source_root
+        )
+
+    def remove_orphaned_jpgs(
+        self,
+        mapping: Dict[str, Dict[str, Path]],
+        processed: Set[Path],
+        dry_run: bool,
+        use_trash: bool,
+        trash_root: Optional[Path],
+    ) -> None:
+        """Remove orphaned JPG files"""
+        FileCleaner.remove_orphaned_jpgs(
+            mapping,
+            processed,
+            self.logger,
+            dry_run,
+            use_trash,
+            trash_root,
+            graceful_exit=self.graceful_exit,
+        )
+
+    def clean_empty_directories(
+        self,
+        root_dir: Path,
+        use_trash: bool,
+        trash_root: Optional[Path],
+        is_output: bool,
+        is_trash: bool,
+    ) -> None:
+        """Clean empty directories"""
+        FileCleaner.clean_empty_directories(
+            root_dir,
+            self.logger,
+            use_trash,
+            trash_root,
+            is_output,
+            is_trash,
+            graceful_exit=self.graceful_exit,
+        )
+
+
+class TranscodingService:
+    """Service class for handling transcoding operations"""
+
+    def __init__(self, logger: logging.Logger, graceful_exit: GracefulExit):
+        self.logger = logger
+        self.graceful_exit = graceful_exit
+
+    def transcode_file(
+        self,
+        input_path: Path,
+        output_path: Path,
+        progress_cb: Optional[Callable[[float], None]] = None,
+    ) -> bool:
+        """Transcode a file using the existing Transcoder"""
+        return Transcoder.transcode_file(
+            input_path,
+            output_path,
+            self.logger,
+            progress_cb,
+            graceful_exit=self.graceful_exit,
+        )
+
+    def get_video_duration(self, file_path: Path) -> Optional[float]:
+        """Get video duration using the existing Transcoder"""
+        return Transcoder.get_video_duration(
+            file_path, graceful_exit=self.graceful_exit
+        )
+
+
+class ActionPlanner:
+    """Service class for planning operations"""
+
+    def __init__(self, config: Config, logger: logging.Logger):
+        self.config = config
+        self.logger = logger
+
+    def generate_action_plan(
+        self,
+        old_list: List[Tuple[Path, datetime]],
+        mapping: Dict[str, Dict[str, Path]],
+        trash_files: Set[Path],
+    ) -> Dict[str, List]:
+        """Generate action plan for operations"""
+        # Create a temporary archiver instance just for planning
+        archiver = _ActionPlanGenerator(self.config)
+        return archiver.generate_action_plan(old_list, mapping, trash_files)
+
+    def display_action_plan(self, plan: Dict[str, List]) -> None:
+        """Display the action plan"""
+        archiver = _ActionPlanGenerator(self.config)
+        archiver.logger = self.logger
+        archiver.display_action_plan(plan)
+
+    def collect_file_info(
+        self, old_list: List[Tuple[Path, datetime]]
+    ) -> List[FileInfo]:
+        """Collect file info for cleanup"""
+        archiver = _ActionPlanGenerator(self.config)
+        return archiver.collect_file_info(old_list)
+
+    def intelligent_cleanup(self, all_files: List[FileInfo]) -> List[FileInfo]:
+        """Perform intelligent cleanup"""
+        archiver = _ActionPlanGenerator(self.config)
+        archiver.logger = self.logger
+        return archiver.intelligent_cleanup(all_files)
+
+
+class _ActionPlanGenerator:
+    """
+    Internal utility class containing only the methods needed for planning and info collection
+    This eliminates the circular dependency between ActionPlanner and Archiver
+    """
+
+    def __init__(self, config: Config):
+        self.config = config
+        self.logger: Optional[logging.Logger] = None
+
+    def _ensure_logger(self) -> logging.Logger:
+        """Ensure logger is initialized, raise error if not"""
+        if self.logger is None:
+            raise RuntimeError("Logger not initialized.")
+        return self.logger
+
+    def output_path(self, input_file: Path, timestamp: datetime) -> Path:
+        out_dir = self.config.output
+        # Check if parent directories match YYYY/MM/DD pattern
+        if len(input_file.parts) >= 4:
+            y, m, d = input_file.parts[-4:-1]
+            try:
+                int(y)
+                int(m)
+                int(d)
+                # Valid date structure → reuse it
+                return (
+                    out_dir
+                    / y
+                    / m
+                    / d
+                    / f"archived-{timestamp.strftime('%Y%m%d%H%M%S')}.mp4"
+                )
+            except ValueError:
+                pass  # Not a valid date structure → fall through
+        # Use timestamp-based structure
+        return (
+            out_dir
+            / str(timestamp.year)
+            / f"{timestamp.month:02d}"
+            / f"{timestamp.day:02d}"
+            / f"archived-{timestamp.strftime('%Y%m%d%H%M%S')}.mp4"
+        )
+
+    def get_all_archive_files(self) -> List[Path]:
+        """Get all archive files including trash if enabled."""
+        out_dir = self.config.output
+        trash_root = self.config.get_trash_root()
+        archive_files = (
+            list(out_dir.rglob("archived-*.mp4")) if out_dir.exists() else []
+        )
+
+        if trash_root:
+            trash_output_dir = trash_root / "output"
+            if trash_output_dir.exists():
+                archive_files.extend(list(trash_output_dir.rglob("archived-*.mp4")))
+
+        return archive_files
+
+    def collect_file_info(
+        self, old_list: List[Tuple[Path, datetime]]
+    ) -> List[FileInfo]:
+        """Collect file information for all relevant files."""
+        all_files = []
+        seen_paths = set()
+        trash_root = self.config.get_trash_root()
+
+        # Get all archive files
+        archive_files = self.get_all_archive_files()
+
+        # Process archive files - mark them as archives and skip if in old_list (source)
+        for archive_file in archive_files:
+            try:
+                if not archive_file.is_file():
+                    continue
+                size = archive_file.stat().st_size
+            except (OSError, IOError):
+                continue
+
+            ts_match = re.search(r"archived-(\d{14})\.mp4$", archive_file.name)
+            if ts_match:
+                try:
+                    ts = datetime.strptime(ts_match.group(1), "%Y%m%d%H%M%S")
+                    is_trash = trash_root is not None and any(
+                        p in archive_file.parents
+                        for p in [trash_root, trash_root / "output"]
+                    )
+                    if archive_file not in seen_paths:
+                        all_files.append(
+                            FileInfo(
+                                archive_file,
+                                ts,
+                                size,
+                                is_archive=True,
+                                is_trash=is_trash,
+                            )
+                        )
+                        seen_paths.add(archive_file)
+                except ValueError:
+                    pass
+
+        # Process source files from old_list - skip if already processed as archives
+        for fp, ts in old_list:
+            if (
+                fp in seen_paths
+            ):  # Skip if this is an archive file we've already processed
+                continue
+
+            try:
+                if not fp.is_file():
+                    continue
+                size = fp.stat().st_size
+            except (OSError, IOError):
+                continue
+
+            is_trash = trash_root is not None and any(
+                p in fp.parents for p in [trash_root, trash_root / "input"]
+            )
+            all_files.append(
+                FileInfo(fp, ts, size, is_archive=False, is_trash=is_trash)
+            )
+            seen_paths.add(fp)
+
+        return all_files
+
+    def _categorize_files(self, all_files: List[FileInfo]) -> Dict[int, List[FileInfo]]:
+        """Categorize files by location priority (0 = trash, 1 = archive, 2 = source)."""
+        categorized_files: Dict[int, List[FileInfo]] = {0: [], 1: [], 2: []}
+
+        for file_info in all_files:
+            if file_info.is_trash:
+                categorized_files[0].append(file_info)
+            elif file_info.is_archive:
+                categorized_files[1].append(file_info)
+            else:
+                categorized_files[2].append(file_info)
+
+        # Sort each category by timestamp (oldest first)
+        for category in categorized_files.values():
+            category.sort(key=lambda x: x.timestamp)
+
+        return categorized_files
+
+    def _apply_size_cleanup(
+        self,
+        categorized_files: Dict[int, List[FileInfo]],
+        total_size: int,
+        size_limit: int,
+    ) -> Tuple[List[FileInfo], int]:
+        """Apply size-based cleanup based on priority."""
+        files_to_remove = []
+        remaining_size = total_size
+
+        logger = self._ensure_logger()
+
+        logger.info("Archive size exceeds limit")
+        logger.info(
+            f"Size threshold exceeded, removing files by priority to reach {self.config.max_size} GB..."
+        )
+        logger.info(
+            "Priority order: Trash > Archive > Source (oldest first within each)"
+        )
+
+        # Remove files starting from highest priority (0) to lowest (2)
+        for priority in range(3):
+            if remaining_size <= size_limit:
+                break
+
+            category_name = {0: "Trash", 1: "Archive", 2: "Source"}[priority]
+            category_files = categorized_files[priority]
+
+            if category_files:
+                logger.info(f"Processing {category_name} files for size cleanup...")
+
+                for file_info in category_files:
+                    if remaining_size <= size_limit:
+                        break
+
+                    files_to_remove.append(file_info)
+                    remaining_size -= file_info.size
+
+                    if self.config.dry_run:
+                        logger.info(
+                            f"[DRY RUN] Would remove {category_name} file for size: {file_info.path} "
+                            f"({file_info.size / (1024**2):.1f} MB, {file_info.timestamp})"
+                        )
+
+        logger.info(
+            f"After size cleanup: {remaining_size / (1024**3):.1f} GB "
+            f"({len(files_to_remove)} files marked for removal)"
+        )
+
+        return files_to_remove, remaining_size
+
+    def _apply_age_cleanup(
+        self,
+        categorized_files: Dict[int, List[FileInfo]],
+        age_cutoff: datetime,
+        total_size: int,
+    ) -> Tuple[List[FileInfo], int]:
+        """Apply age-based cleanup respecting clean_output setting."""
+        files_to_remove = []
+        remaining_size = total_size
+
+        logger = self._ensure_logger()
+
+        files_over_age_by_priority: Dict[int, List[FileInfo]] = {
+            0: [],
+            1: [],
+            2: [],
+        }
+
+        for priority in range(3):
+            # Skip archive files (priority 1) if clean_output is False
+            if priority == 1 and not self.config.clean_output:
+                continue
+
+            files_over_age_by_priority[priority] = [
+                f for f in categorized_files[priority] if f.timestamp < age_cutoff
+            ]
+
+        total_over_age = sum(
+            len(files) for files in files_over_age_by_priority.values()
+        )
+
+        if total_over_age > 0:
+            logger.info(
+                f"Found {total_over_age} files older than {self.config.age} days"
+            )
+
+            # Remove age-eligible files by priority order
+            for priority in range(3):
+                # Skip archive files (priority 1) if clean_output is False
+                if priority == 1 and not self.config.clean_output:
+                    continue
+
+                category_name = {0: "Trash", 1: "Archive", 2: "Source"}[priority]
+                age_files = files_over_age_by_priority[priority]
+
+                if age_files:
+                    logger.info(f"Processing {category_name} files for age cleanup...")
+
+                    for file_info in age_files:
+                        files_to_remove.append(file_info)
+                        remaining_size -= file_info.size
+
+                        if self.config.dry_run:
+                            logger.info(
+                                f"[DRY RUN] Would remove {category_name} file for age: {file_info.path} "
+                                f"({file_info.size / (1024**2):.1f} MB, {file_info.timestamp})"
+                            )
+
+            logger.info(f"Added {total_over_age} files for age-based removal")
+        else:
+            logger.info(f"No files older than {self.config.age} days found")
+
+        return files_to_remove, remaining_size
+
+    def intelligent_cleanup(self, all_files: List[FileInfo]) -> List[FileInfo]:
+        """
+        Select files to remove based on location priority and size/age constraints.
+        Priority order: Trash > Archive > Source (oldest first within each category).
+        Output/archive files are excluded from age-based removal unless clean_output=True.
+        """
+        if not all_files:
+            return []
+
+        logger = self._ensure_logger()
+
+        # Calculate totals
+        total_size = sum(f.size for f in all_files)
+        size_limit = self.config.max_size * (1024**3)
+        age_cutoff = datetime.now() - timedelta(days=self.config.age)
+
+        logger.info(f"Current total size: {total_size / (1024**3):.1f} GB")
+        logger.info(f"Size limit: {self.config.max_size} GB")
+        logger.info(f"Age cutoff: {age_cutoff.strftime('%Y-%m-%d %H:%M:%S')}")
+        if not self.config.clean_output:
+            logger.info("Output files excluded from age-based cleanup")
+
+        # Categorize files by location priority
+        categorized_files = self._categorize_files(all_files)
+
+        files_to_remove = []
+        remaining_size = total_size
+
+        # PHASE 1: Enforce size limit (if over limit)
+        if remaining_size > size_limit:
+            files_to_remove, remaining_size = self._apply_size_cleanup(
+                categorized_files, total_size, size_limit
+            )
+        else:
+            # PHASE 2: Enforce age limit (only if under size limit AND age_days > 0)
+            if self.config.age > 0:
+                files_to_remove, remaining_size = self._apply_age_cleanup(
+                    categorized_files, age_cutoff, total_size
+                )
+            else:
+                logger.info("Age-based cleanup disabled (age_days <= 0)")
+
+        # Remove duplicates and sort by priority then timestamp
+        unique_files = {f.path: f for f in files_to_remove}
+        files_to_remove = list(unique_files.values())
+
+        def sort_key(file_info: FileInfo):
+            if file_info.is_trash:
+                priority = 0
+            elif file_info.is_archive:
+                priority = 1
+            else:
+                priority = 2
+            return (priority, file_info.timestamp)
+
+        files_to_remove.sort(key=sort_key)
+
+        logger.info(
+            f"Final removal plan: {len(files_to_remove)} files, "
+            f"final size: {remaining_size / (1024**3):.1f} GB"
+        )
+
+        return files_to_remove
+
+    def generate_action_plan(
+        self,
+        old_list: List[Tuple[Path, datetime]],
+        mapping: Dict[str, Dict[str, Path]],
+        trash_files: Set[Path],
+    ) -> Dict[str, List]:
+        """Generate a plan of all actions to be performed (transcoding and removals)"""
+        transcoding_actions = []
+        removal_actions = []
+
+        for fp, ts in old_list:
+            if fp in trash_files:  # already in trash
+                continue
+
+            outp = self.output_path(fp, ts)
+            jpg = mapping.get(ts.strftime("%Y%m%d%H%M%S"), {}).get(".jpg")
+
+            # Check skip logic
+            if (
+                not self.config.no_skip
+                and outp.exists()
+                and outp.stat().st_size > MIN_ARCHIVE_SIZE_BYTES
+            ):
+                # Will skip transcoding but remove source files
+                size = 0
+                if fp.exists():
+                    try:
+                        size = fp.stat().st_size
+                    except OSError:
+                        size = 0
+                removal_actions.append(
+                    {
+                        "type": "source_removal_after_skip",
+                        "file": fp,
+                        "reason": f"Skipping transcoding: archive exists at {outp}",
+                        "size": size,
+                    }
+                )
+                if jpg:
+                    size = 0
+                    if jpg.exists():
+                        try:
+                            size = jpg.stat().st_size
+                        except OSError:
+                            size = 0
+                    removal_actions.append(
+                        {
+                            "type": "jpg_removal_after_skip",
+                            "file": jpg,
+                            "reason": "Skipping transcoding: archive exists for paired MP4",
+                            "size": size,
+                        }
+                    )
+            else:
+                # Will transcode the file
+                size = 0
+                if fp.exists():
+                    try:
+                        size = fp.stat().st_size
+                    except OSError:
+                        size = 0
+                transcoding_actions.append(
+                    {
+                        "type": "transcode",
+                        "input": fp,
+                        "output": outp,
+                        "size": size,
+                        "jpg_to_remove": jpg,
+                    }
+                )
+                if jpg:
+                    size = 0
+                    if jpg.exists():
+                        try:
+                            size = jpg.stat().st_size
+                        except OSError:
+                            size = 0
+                    removal_actions.append(
+                        {
+                            "type": "jpg_removal_after_transcode",
+                            "file": jpg,
+                            "reason": "Paired with transcoded MP4",
+                            "size": size,
+                        }
+                    )
+
+        # Also get cleanup plan for existing archives if in cleanup mode
+        cleanup_removals = []
+        if self.config.cleanup:
+            all_file_infos = self.collect_file_info(old_list)
+            files_to_remove = self.intelligent_cleanup(all_file_infos)
+            for file_info in files_to_remove:
+                cleanup_removals.append(
+                    {
+                        "type": "cleanup_removal",
+                        "file": file_info.path,
+                        "size": file_info.size,
+                        "is_archive": file_info.is_archive,
+                        "is_trash": file_info.is_trash,
+                        "timestamp": file_info.timestamp,
+                    }
+                )
+
+        return {
+            "transcoding": transcoding_actions,
+            "removals": removal_actions,
+            "cleanup_removals": cleanup_removals,
+        }
+
+    def display_action_plan(self, plan: Dict[str, List]) -> None:
+        """Display the action plan to the user"""
+        logger = self.logger
+        if logger:
+            logger.info("=== ACTION PLAN ===")
+            logger.info(f"Transcoding {len(plan['transcoding'])} files:")
+            for i, action in enumerate(plan["transcoding"], 1):
+                logger.info(
+                    f"  {i}. {action['input']} -> {action['output']} "
+                    f"({action['size'] / (1024**2):.1f} MB)"
+                )
+                if action["jpg_to_remove"]:
+                    logger.info(
+                        f"      + Removing paired JPG: {action['jpg_to_remove']}"
+                    )
+
+            logger.info(f"Removing {len(plan['removals'])} files:")
+            for i, action in enumerate(plan["removals"], 1):
+                logger.info(
+                    f"  {i}. {action['file']} "
+                    f"({action['size'] / (1024**2):.1f} MB) - {action['reason']}"
+                )
+
+            logger.info(f"Cleanup removing {len(plan['cleanup_removals'])} files:")
+            for i, action in enumerate(
+                plan["cleanup_removals"], 1
+            ):  # Fixed typo: cleanup_removals
+                logger.info(
+                    f"  {i}. {action['file']} "
+                    f"({action['size'] / (1024**2):.1f} MB) - Priority: {'Trash' if action['is_trash'] else 'Archive' if action['is_archive'] else 'Source'}"
+                )
+
+            logger.info("=== END PLAN ===")
+
+
+class ArchiveStateMachine:
+    """Main state machine that manages the archiver workflow"""
+
+    def __init__(self, config: Config, graceful_exit: GracefulExit):
+        self.config = config
+        self.graceful_exit = graceful_exit
+        self.state: Optional[BaseState] = None
+        self.data: Dict[str, Any] = {}  # Shared data between states
+        self.error_occurred = False  # Track if any error occurred
+        self._exit_code: int = 0  # Track exit code for proper termination
+
+        # Initialize service classes as None, will be set in InitializationState
+        self.file_ops_service: Optional[FileOperationsService] = None
+        self.transcoding_service: Optional[TranscodingService] = None
+        self.action_planner: Optional[ActionPlanner] = None
+
+        # Initialize all states
+        self._states = {
+            State.INITIALIZATION: InitializationState(self),
+            State.DISCOVERY: DiscoveryState(self),
+            State.PLANNING: PlanningState(self),
+            State.EXECUTION: ExecutionState(self),
+            State.CLEANUP: CleanupState(self),
+            State.TERMINATION: TerminationState(self),
+        }
+
+    def run(self) -> int:
+        """Run the state machine starting from initialization"""
+        # Start with initialization state
+        self.state = self._states[State.INITIALIZATION]
+
+        # Continue executing until we reach termination
+        while self.state:
+            # Check for graceful exit
+            if self.graceful_exit.should_exit():
+                # Go directly to termination if exit requested
+                self.state = self._states[State.TERMINATION]
+
+            try:
+                # At this point, self.state is guaranteed not to be None due to the while condition
+                assert self.state is not None
+                next_state = self.state.execute()
+                if next_state == State.TERMINATION:
+                    # When we reach termination, the context holds the exit code info
+                    # Return appropriate exit code based on context
+                    if self.graceful_exit.should_exit():
+                        return 1
+                    elif self.error_occurred:
+                        return 1  # Return error code if any error occurred during processing
+                    else:
+                        # Check if this was due to dry run completion or normal completion
+                        config = self.config
+                        if hasattr(self, "_exit_code"):
+                            return self._exit_code
+                        else:
+                            # Default based on dry run status
+                            return 0 if config.dry_run else 0
+                elif next_state in self._states:
+                    self.state = self._states[next_state]
+                else:
+                    # Invalid state transition, terminate
+                    self.state = self._states[State.TERMINATION]
+            except Exception as e:
+                # On error, transition to termination
+                print(
+                    f"Error in state {self.state.__class__.__name__ if self.state else 'None'}: {e}"
+                )
+                # Return error code
+                return 1
+
+        return 0
+
+
+class InitializationState(BaseState):
+    """State responsible for initializing the archiver"""
+
+    def execute(self) -> State:
+        """Execute initialization and return the next state"""
+        config = self.context.config
+        graceful_exit = self.context.graceful_exit
+
+        # Validate input directory exists
+        base_dir = config.directory
+        if not base_dir.exists():
+            print(
+                f"Error: Directory {config.directory} does not exist and /camera is missing"
+            )
+            self.context.error_occurred = True
+            return State.TERMINATION
+
+        trash_root = config.get_trash_root()
+        if trash_root is not None:
+            trash_root.mkdir(parents=True, exist_ok=True)
+
+        # Set up logging
+        if not config.cleanup:
+            # Normal mode: transcoding files - count old files for progress bar
+            cutoff = datetime.now() - timedelta(days=config.age)
+            mp4s, _, _ = FileScanner.scan_files(
+                base_dir,
+                include_trash=config.use_trash,
+                trash_root=trash_root,
+                graceful_exit=graceful_exit,
+            )
+            old_list = [(p, t) for p, t in mp4s if t < cutoff]
+            total_files = len(old_list)
+        else:
+            # Cleanup mode: no transcoding
+            total_files = 0
+
+        # Create progress reporter
+        progress_bar = ProgressReporter(
+            total_files=total_files,
+            graceful_exit=graceful_exit,
+            silent=config.dry_run,
+            out=sys.stderr,
+        )
+        self.context.data["progress_bar"] = progress_bar
+
+        # Setup logger
+        logger = Logger.setup(config.log_file, progress_bar)
+        self.context.data["logger"] = logger
+
+        # Initialize service classes
+        self.context.file_ops_service = FileOperationsService(logger, graceful_exit)
+        self.context.transcoding_service = TranscodingService(logger, graceful_exit)
+        self.context.action_planner = ActionPlanner(config, logger)
+
+        if config.cleanup:
+            logger.info(
+                "Cleanup mode: skipping transcoding, only performing cleanup operations"
+            )
+
+        # Log initial configuration
+        for msg in [
+            "Starting camera archive process...",
+            f"Input: {base_dir}",
+            f"Output: {config.output}",
+            f"Trash: {trash_root}",
+            f"Age threshold: {config.age} days",
+            f"Size limit: {config.max_size} GB",
+            f"Dry run: {config.dry_run}",
+            f"Cleanup only: {config.cleanup}",
+            f"Clean output files: {config.clean_output}",
+        ]:
+            if not graceful_exit.should_exit():
+                logger.info(msg)
+
+        # Return the next state based on configuration
+        return State.DISCOVERY
+
+
+class DiscoveryState(BaseState):
+    """State responsible for discovering and scanning files"""
+
+    def execute(self) -> State:
+        """Execute file discovery and return the next state"""
+        config = self.context.config
+        logger = self.context.data.get("logger")
+
+        if logger is None:
+            print("Error: Logger not available in DiscoveryState")
+            return State.TERMINATION
+
+        base_dir = config.directory
+        trash_root = config.get_trash_root()
+
+        # Perform file scanning using the service class
+        file_ops_service = self.context.file_ops_service
+        if file_ops_service is None:
+            print("Error: FileOperationsService not available in DiscoveryState")
+            return State.TERMINATION
+
+        mp4s, mapping, trash_files = file_ops_service.scan_files(
+            base_dir, include_trash=config.use_trash, trash_root=trash_root
+        )
+
+        # Store discovered data for later use
+        self.context.data["mp4s"] = mp4s
+        self.context.data["mapping"] = mapping
+        self.context.data["trash_files"] = trash_files
+
+        logger.info(f"Discovered {len(mp4s)} MP4 files, {len(mapping)} file groups")
+
+        return State.PLANNING
+
+
+class PlanningState(BaseState):
+    """State responsible for generating action plans"""
+
+    def execute(self) -> State:
+        """Execute planning and return the next state"""
+        config = self.context.config
+        logger = self.context.data.get("logger")
+
+        if logger is None:
+            print("Error: Logger not available in PlanningState")
+            return State.TERMINATION
+
+        # Get data from discovery
+        mp4s = self.context.data.get("mp4s", [])
+        mapping = self.context.data.get("mapping", {})
+        trash_files = self.context.data.get("trash_files", set())
+
+        if not config.cleanup:
+            # For normal mode, find files that are old enough to process
+            cutoff = datetime.now() - timedelta(days=config.age)
+            old_list = [(p, t) for p, t in mp4s if t < cutoff]
+            self.context.data["old_list"] = old_list
+        else:
+            # For cleanup mode, no transcoding to plan
+            self.context.data["old_list"] = []
+
+        logger.info(
+            f"Planning operations for {len(self.context.data['old_list'])} files"
+        )
+
+        # Use the action planner service to generate action plan based on configuration
+        action_planner = self.context.action_planner
+        if action_planner is None:
+            print("Error: ActionPlanner not available in PlanningState")
+            return State.TERMINATION
+
+        if not config.cleanup:
+            # Generate plan for transcoding operations
+            plan = action_planner.generate_action_plan(
+                self.context.data["old_list"], mapping, trash_files
+            )
+            self.context.data["action_plan"] = plan
+        else:
+            # Generate plan for cleanup operations
+            all_file_infos = action_planner.collect_file_info(mp4s)
+            files_to_remove = action_planner.intelligent_cleanup(all_file_infos)
+            cleanup_plan = {
+                "transcoding": [],  # No transcoding in cleanup mode
+                "removals": [],  # No regular removals in cleanup mode
+                "cleanup_removals": [
+                    {
+                        "type": "cleanup_removal",
+                        "file": file_info.path,
+                        "size": file_info.size,
+                        "is_archive": file_info.is_archive,
+                        "is_trash": file_info.is_trash,
+                        "timestamp": file_info.timestamp,
+                    }
+                    for file_info in files_to_remove
+                ],
+            }
+            self.context.data["action_plan"] = cleanup_plan
+
+        # Display plan to user if confirmation is required
+        if not config.no_confirm:
+            action_planner.display_action_plan(self.context.data["action_plan"])
+            confirm = ask_confirmation(
+                "Proceed with planned operations?", default=False
+            )
+            if not confirm:
+                logger.info("Operation cancelled by user")
+                return State.TERMINATION
+
+        return State.EXECUTION
+
+
+class ExecutionState(BaseState):
+    """State responsible for executing planned actions"""
+
+    def execute(self) -> State:
+        """Execute planned actions and return the next state"""
+        config = self.context.config
+        graceful_exit = self.context.graceful_exit
+        logger = self.context.data.get("logger")
+
+        if logger is None:
+            print("Error: Logger not available in ExecutionState")
+            return State.TERMINATION
+
+        # Get plan and data
+        plan = self.context.data.get("action_plan", {})
+        old_list = self.context.data.get("old_list", [])
+        mapping = self.context.data.get("mapping", {})
+        trash_files = self.context.data.get("trash_files", set())
+        progress_bar = self.context.data.get("progress_bar")
+
+        # Get service classes
+        file_ops_service = self.context.file_ops_service
+        transcoding_service = self.context.transcoding_service
+
+        if file_ops_service is None or transcoding_service is None:
+            print("Error: Service classes not available in ExecutionState")
+            return State.TERMINATION
+
+        if not config.cleanup:
+            # Execute transcoding operations
+            logger.info(f"Starting transcoding of {len(old_list)} files")
+
+            processed_files = set()
+            for i, (fp, ts) in enumerate(old_list):
+                if graceful_exit.should_exit():
+                    logger.info("Execution cancelled by user")
+                    break
+
+                if fp in trash_files:  # already in trash
+                    continue
+
+                outp = construct_output_path(config.output, fp, ts)
+                jpg = mapping.get(ts.strftime("%Y%m%d%H%M%S"), {}).get(".jpg")
+
+                # Check if we should skip transcoding
+                if (
+                    not config.no_skip
+                    and outp.exists()
+                    and outp.stat().st_size > MIN_ARCHIVE_SIZE_BYTES
+                ):
+                    logger.info("[SKIP] Archive exists and is large enough: %s", outp)
+                    # Remove source files immediately for skipped files too
+                    file_ops_service.remove_one(
+                        fp,
+                        config.dry_run,
+                        config.use_trash,
+                        config.get_trash_root(),
+                        is_output=False,
+                        source_root=config.directory,
+                    )
+                    if not config.dry_run:
+                        processed_files.add(fp)
+                    if jpg:
+                        file_ops_service.remove_one(
+                            jpg,
+                            config.dry_run,
+                            config.use_trash,
+                            config.get_trash_root(),
+                            is_output=False,
+                            source_root=config.directory,
+                        )
+                        if not config.dry_run:
+                            processed_files.add(jpg)
+                    continue
+
+                # Transcode the file
+                if not config.dry_run:
+                    if progress_bar:
+                        progress_bar.start_file()
+                    logger.info("Transcoding %s -> %s", fp, outp)
+
+                    ok = transcoding_service.transcode_file(
+                        fp,
+                        outp,
+                        lambda pct: progress_bar.update_progress(i + 1, pct)
+                        if progress_bar
+                        else None,
+                    )
+
+                    if ok:
+                        if progress_bar:
+                            progress_bar.finish_file(i + 1)
+                        # Remove source files after successful transcoding
+                        file_ops_service.remove_one(
+                            fp,
+                            config.dry_run,
+                            config.use_trash,
+                            config.get_trash_root(),
+                            is_output=False,
+                            source_root=config.directory,
+                        )
+                        processed_files.add(fp)
+                        if jpg:
+                            file_ops_service.remove_one(
+                                jpg,
+                                config.dry_run,
+                                config.use_trash,
+                                config.get_trash_root(),
+                                is_output=False,
+                                source_root=config.directory,
+                            )
+                            processed_files.add(jpg)
+                    else:
+                        logger.error("Transcoding failed for %s – keeping source", fp)
+                else:
+                    logger.info("[DRY RUN] Would transcode %s -> %s", fp, outp)
+                    if jpg:
+                        logger.info("[DRY RUN] Would remove paired JPG %s", jpg)
+
+            if graceful_exit.should_exit():
+                logger.info("Transcoding was cancelled")
+
+        else:
+            # Execute cleanup operations
+            logger.info("Starting cleanup operations")
+
+            # Execute cleanup removals from plan
+            for item in plan.get("cleanup_removals", []):
+                if graceful_exit.should_exit():
+                    logger.info("Cleanup cancelled by user")
+                    break
+
+                file_path = item["file"]
+                file_ops_service.remove_one(
+                    file_path,
+                    config.dry_run,
+                    config.use_trash,
+                    config.get_trash_root(),
+                    is_output=item["is_archive"],
+                    source_root=config.directory
+                    if not item["is_archive"]
+                    else config.output,
+                )
+
+            if not config.dry_run and graceful_exit.should_exit():
+                logger.info("Cleanup was cancelled")
+
+        return State.CLEANUP
+
+
+class CleanupState(BaseState):
+    """State responsible for final cleanup operations"""
+
+    def execute(self) -> State:
+        """Execute cleanup operations and return the next state"""
+        config = self.context.config
+        logger = self.context.data.get("logger")
+
+        if logger is None:
+            print("Error: Logger not available in CleanupState")
+            return State.TERMINATION
+
+        # Get data from previous states
+        mapping = self.context.data.get("mapping", {})
+        base_dir = config.directory
+        trash_root = config.get_trash_root()
+
+        logger.info("Starting final cleanup operations")
+
+        # Get service classes
+        file_ops_service = self.context.file_ops_service
+        if file_ops_service is None:
+            print("Error: FileOperationsService not available in CleanupState")
+            return State.TERMINATION
+
+        if not config.cleanup:
+            # In normal mode, also remove orphaned JPGs
+            logger.info("Removing orphaned JPG files")
+            file_ops_service.remove_orphaned_jpgs(
+                mapping,
+                set(),
+                config.dry_run,
+                config.use_trash,
+                trash_root,
+            )
+
+        # Always clean empty directories
+        logger.info("Cleaning empty directories")
+        file_ops_service.clean_empty_directories(
+            base_dir,
+            config.use_trash,
+            trash_root,
+            is_output=False,
+            is_trash=False,
+        )
+        file_ops_service.clean_empty_directories(
+            config.output,
+            config.use_trash,
+            trash_root,
+            is_output=True,
+            is_trash=False,
+        )
+        if trash_root and trash_root.exists():
+            file_ops_service.clean_empty_directories(
+                trash_root,
+                False,  # use_trash=False
+                None,  # trash_root for this operation
+                is_output=False,
+                is_trash=True,
+            )
+
+        return State.TERMINATION
+
+
+class TerminationState(BaseState):
+    """State responsible for proper shutdown and resource cleanup"""
+
+    def execute(self) -> State:
+        """Execute termination and return State.TERMINATION to indicate completion"""
+        logger = self.context.data.get("logger")
+        progress_bar = self.context.data.get("progress_bar")
+
+        graceful_exit = self.context.graceful_exit
+        config = self.context.config
+
+        if logger:
+            if graceful_exit.should_exit():
+                logger.info("Archive process was cancelled")
+            elif config.dry_run:
+                logger.info("[DRY RUN] Done - no files were actually modified")
+            else:
+                logger.info("Archive process completed successfully")
+
+        # Clean up progress bar
+        if progress_bar:
+            progress_bar.finish()
+
+        # The exit code will be handled by the state machine run method based on context
+        return State.TERMINATION
+
+
+def ask_confirmation(prompt: str, default: bool = True) -> bool:
+    """Ask the user for confirmation with a prompt."""
+    if default:
+        choice_str = "Y/n"
+    else:
+        choice_str = "y/N"
+
+    while True:
+        try:
+            response = input(f"{prompt} [{choice_str}] ").strip().lower()
+            if not response:
+                return default
+            if response in ["y", "yes"]:
+                return True
+            if response in ["n", "no"]:
+                return False
+            print("Please answer 'y' or 'n'.")
+        except (EOFError, KeyboardInterrupt):
+            print("\nOperation cancelled.")
+            return False
 
 
 def parse_arguments():
