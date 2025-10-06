@@ -928,6 +928,22 @@ class PlanningHandler:
         for i, action in enumerate(plan["removals"], 1):
             logger.info(f"  {i}. {action['file']} - {action['reason']}")
 
+        # Display age cutoff information if cleanup is enabled
+        if context.config.get("cleanup", False):
+            age_days = context.config.get("age", 30)
+            age_cutoff = datetime.now() - timedelta(days=age_days)
+            logger.info(
+                f"Cleanup enabled: Files older than {age_cutoff.strftime('%Y-%m-%d %H:%M:%S')} will be removed based on age threshold of {age_days} days"
+            )
+            if context.config.get("clean_output", False):
+                logger.info(
+                    "Cleanup scope: Source files, archive files, and trash files"
+                )
+            else:
+                logger.info(
+                    "Cleanup scope: Source files and trash files (archive files excluded)"
+                )
+
         logger.info("=== END PLAN ===")
 
     def _ask_confirmation(self, message: str, default: bool = False) -> bool:
