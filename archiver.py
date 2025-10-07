@@ -24,6 +24,43 @@ from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Protocol
 MIN_ARCHIVE_SIZE_BYTES = 1_048_576  # 1MB
 DEFAULT_PROGRESS_WIDTH = 30
 PROGRESS_UPDATE_INTERVAL = 5  # seconds for non-TTY output
+LOG_ROTATION_SIZE = 4_194_304  # 4MB (4096KB) in bytes
+
+
+def rotate_log_file(log_file_path: Path) -> None:
+    """
+    Rotate the log file if it exceeds the maximum size.
+    Creates backup files with .1, .2, etc. extensions.
+    """
+    # Only rotate if the file exists and exceeds the maximum size
+    if log_file_path.exists() and log_file_path.stat().st_size > LOG_ROTATION_SIZE:
+        # Find existing backup files and rename them in reverse order
+        # First, determine the highest backup number
+        max_backup_num = 0
+        for backup_path in log_file_path.parent.glob(f"{log_file_path.name}.*"):
+            if backup_path.is_file():
+                try:
+                    backup_num = int(backup_path.suffix[1:])  # Remove the dot
+                    max_backup_num = max(max_backup_num, backup_num)
+                except ValueError:
+                    continue  # Skip files with non-integer suffixes
+
+        # Rename existing backup files to increment their numbers (in reverse order to avoid overwriting)
+        for i in range(max_backup_num, 0, -1):
+            old_path = log_file_path.with_suffix(f"{log_file_path.suffix}.{i}")
+            new_path = log_file_path.with_suffix(f"{log_file_path.suffix}.{i + 1}")
+            if old_path.exists():
+                shutil.move(str(old_path), str(new_path))
+
+        # Move the current log file to .1
+        backup_path = log_file_path.with_suffix(f"{log_file_path.suffix}.1")
+        shutil.move(str(log_file_path), str(backup_path))
+
+        # Create a new empty log file
+        log_file_path.touch()
+    elif not log_file_path.exists():
+        # If the log file doesn't exist, create an empty one
+        log_file_path.touch()
 
 
 # 1. State Enum
@@ -279,6 +316,8 @@ class LoggingService:
         # File handler
         log_file = self.config.get("log_file")
         if log_file:
+            # Rotate log file if it exceeds the maximum size
+            rotate_log_file(log_file)
             fh = logging.FileHandler(log_file, encoding="utf-8")
             fh.setFormatter(logging.Formatter(fmt))
             logger.addHandler(fh)

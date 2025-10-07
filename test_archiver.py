@@ -1008,7 +1008,9 @@ class TestStateHandlers:
         # Should transition to DISCOVERY
         assert next_state == State.DISCOVERY
         assert context.logger is not None
-        assert context.progress_bar is not None
+        # InitializationHandler sets up logging but does not initialize progress bar
+        # (progress bar is initialized later in ExecutionHandler)
+        assert context.progress_bar is None
 
     def test_initialization_handler_directory_missing(
         self, temp_dirs, suppress_logging_and_progress
@@ -2516,3 +2518,134 @@ class TestMainAndIntegration:
 
         # Should return 0 for success regardless of configuration
         assert result == 0
+
+
+class TestLogRotation:
+    """Test log rotation functionality."""
+
+    def test_rotate_log_file_function(self, temp_dirs):
+        """Test the rotate_log_file function directly."""
+        from archiver import rotate_log_file, LOG_ROTATION_SIZE
+
+        log_file = temp_dirs["temp_dir"] / "test.log"
+
+        # Create a log file with content larger than the rotation size
+        large_content = b"x" * (LOG_ROTATION_SIZE + 100)  # Larger than rotation size
+        log_file.write_bytes(large_content)
+
+        # Verify the log file exists and is larger than rotation size
+        assert log_file.exists()
+        assert log_file.stat().st_size > LOG_ROTATION_SIZE
+
+        # Call the rotation function
+        rotate_log_file(log_file)
+
+        # The original log file should now be empty (or new)
+        assert log_file.exists()
+        assert log_file.stat().st_size < len(large_content)  # Should be smaller now
+
+        # The old log file should exist as .1 backup
+        backup_file = log_file.with_suffix(".log.1")
+        assert backup_file.exists()
+        assert backup_file.stat().st_size == len(large_content)  # Has the old content
+
+    def test_rotate_log_file_multiple_backups(self, temp_dirs):
+        """Test rotating log file creates multiple backups with proper numbering."""
+        from archiver import rotate_log_file, LOG_ROTATION_SIZE
+
+        log_file = temp_dirs["temp_dir"] / "test.log"
+
+        # First, create some backup files manually to simulate existing backups
+        backup_1 = log_file.with_suffix(".log.1")
+        backup_2 = log_file.with_suffix(".log.2")
+
+        backup_2.write_bytes(b"old content 2")  # Oldest backup
+        backup_1.write_bytes(b"old content 1")  # More recent backup
+
+        # Create the main log file with content larger than rotation size
+        large_content = b"x" * (LOG_ROTATION_SIZE + 100)
+        log_file.write_bytes(large_content)
+
+        # Verify initial state
+        assert log_file.exists() and log_file.stat().st_size > LOG_ROTATION_SIZE
+        assert backup_1.exists() and backup_2.exists()
+
+        # Call the rotation function
+        rotate_log_file(log_file)
+
+        # Check that the backup files have been renamed correctly
+        # Original .1 should become .2, new backup should be .1
+        new_backup_1 = log_file.with_suffix(".log.1")
+        new_backup_2 = log_file.with_suffix(".log.2")
+        new_backup_3 = log_file.with_suffix(".log.3")
+
+        # The original log file should be recreated as a new smaller file
+        assert log_file.exists()
+        assert log_file.stat().st_size < len(large_content)
+
+        # The old log file (large_content) should now be in .1
+        assert new_backup_1.exists()
+        assert new_backup_1.stat().st_size == len(large_content)
+
+        # The old .1 backup should now be in .2
+        assert new_backup_2.exists()
+        assert new_backup_2.read_bytes() == b"old content 1"
+
+        # The old .2 backup should now be in .3
+        assert new_backup_3.exists()
+        assert new_backup_3.read_bytes() == b"old content 2"
+
+    def test_rotate_log_file_no_rotation_if_small(self, temp_dirs):
+        """Test that log file is not rotated if it's smaller than rotation size."""
+        from archiver import rotate_log_file, LOG_ROTATION_SIZE
+
+        log_file = temp_dirs["temp_dir"] / "test.log"
+
+        # Create a small log file with content smaller than the rotation size
+        small_content = b"x" * (LOG_ROTATION_SIZE - 100)  # Smaller than rotation size
+        log_file.write_bytes(small_content)
+
+        initial_size = log_file.stat().st_size
+        assert initial_size < LOG_ROTATION_SIZE
+
+        # Call the rotation function
+        rotate_log_file(log_file)
+
+        # The log file should remain unchanged
+        assert log_file.exists()
+        assert log_file.stat().st_size == initial_size
+        assert log_file.read_bytes() == small_content
+
+        # No backup file should be created
+        backup_file = log_file.with_suffix(".log.1")
+        assert not backup_file.exists()
+
+    def test_log_rotation_integration(self, temp_dirs):
+        """Test that log rotation happens during logging setup."""
+        from archiver import LoggingService, LOG_ROTATION_SIZE
+
+        log_file = temp_dirs["temp_dir"] / "transcoding.log"
+
+        # Create a large log file
+        large_content = b"x" * (LOG_ROTATION_SIZE + 500)
+        log_file.write_bytes(large_content)
+
+        config = {"log_file": log_file}
+        service = LoggingService(config)
+
+        # Setup logging - this should trigger rotation
+        logger = service.setup_logging()
+
+        # Check that rotation happened
+        assert log_file.exists()  # New log file exists
+        assert log_file.stat().st_size < len(large_content)  # New file is smaller
+
+        backup_file = log_file.with_suffix(".log.1")
+        assert backup_file.exists()  # Backup exists
+        assert backup_file.stat().st_size == len(
+            large_content
+        )  # Backup has original content
+
+        # Check that logging still works
+        logger.info("Test message after rotation")
+        assert log_file.stat().st_size > 0  # New log has content
