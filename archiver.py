@@ -92,11 +92,13 @@ class ProgressReporter:
         self.silent: bool = silent
         self.current: int = 0
         self.start_time: float = time.time()
+        self.current_file_start_time: float = time.time()
         self._lock: threading.Lock = threading.Lock()
 
     def start_file(self) -> None:
         with self._lock:
             self.current += 1
+            self.current_file_start_time = time.time()
 
     def update_progress(self, pct: float) -> None:
         if self.silent or self.graceful_exit.should_exit():
@@ -104,8 +106,21 @@ class ProgressReporter:
 
         with OUTPUT_LOCK:  # Use global lock to coordinate with logging
             with self._lock:
-                elapsed = time.time() - self.start_time
-                elapsed_str = f"{int(elapsed // 60):02}:{int(elapsed % 60):02}"
+                total_elapsed = time.time() - self.start_time
+                file_elapsed = time.time() - self.current_file_start_time
+
+                # Format time with hours only when needed
+                def format_time(elapsed):
+                    hours = int(elapsed // 3600)
+                    minutes = int((elapsed % 3600) // 60)
+                    seconds = int(elapsed % 60)
+                    if hours > 0:
+                        return f"{hours:02}:{minutes:02}:{seconds:02}"
+                    else:
+                        return f"{minutes:02}:{seconds:02}"
+
+                total_elapsed_str = format_time(total_elapsed)
+                file_elapsed_str = format_time(file_elapsed)
                 bar_length = 20
                 filled = int(bar_length * pct / 100)
                 bar = "|" * filled + "-" * (bar_length - filled)
@@ -113,12 +128,12 @@ class ProgressReporter:
                 # If this is 100%, add a newline to separate from subsequent logs
                 if pct >= 100.0:
                     sys.stderr.write(
-                        f"\rProgress [{self.current}/{self.total}]: {pct:.0f}% [{bar}] {elapsed_str}\n"
+                        f"\rProgress [{self.current}/{self.total}]: {pct:.0f}% [{bar}] {file_elapsed_str} ({total_elapsed_str})\n"
                     )
                     sys.stderr.flush()
                 else:
                     sys.stderr.write(
-                        f"\rProgress [{self.current}/{self.total}]: {pct:.0f}% [{bar}] {elapsed_str}"
+                        f"\rProgress [{self.current}/{self.total}]: {pct:.0f}% [{bar}] {file_elapsed_str} ({total_elapsed_str})"
                     )
                     sys.stderr.flush()
 

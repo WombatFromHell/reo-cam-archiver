@@ -172,8 +172,17 @@ class TestProgressReporter:
         reporter.start_file()
         assert reporter.current == 2
 
-    def test_update_progress(self, mocker):
-        """Test progress update with mocked stderr"""
+    @pytest.mark.parametrize(
+        "elapsed_time,expected_file_time,expected_total_time",
+        [
+            (100.0, "01:40", "(01:40)"),  # 100 seconds = 1 minute 40 seconds
+            (3661.0, "01:01", "(01:01:01)"),  # 3661 seconds = 1 hour 1 minute 1 second
+        ],
+    )
+    def test_update_progress(
+        self, mocker, elapsed_time, expected_file_time, expected_total_time
+    ):
+        """Test progress update with mocked stderr for different elapsed times"""
         graceful_exit = archiver.GracefulExit()
 
         # Mock time.time before creating the reporter to set start_time
@@ -183,8 +192,8 @@ class TestProgressReporter:
         reporter = archiver.ProgressReporter(10, graceful_exit, silent=False)
         mock_stderr = mocker.patch("sys.stderr")
 
-        # Now set the time to 100 seconds elapsed
-        mock_time.return_value = 100.0
+        # Set the elapsed time
+        mock_time.return_value = elapsed_time
 
         reporter.start_file()
         reporter.update_progress(50.0)
@@ -194,7 +203,8 @@ class TestProgressReporter:
         call_args = mock_stderr.write.call_args[0][0]
         assert "Progress [1/10]: 50%" in call_args
         assert "|" in call_args  # Progress bar
-        assert "01:40" in call_args  # Elapsed time (100 seconds = 1:40)
+        assert expected_file_time in call_args  # File elapsed time
+        assert expected_total_time in call_args  # Total elapsed time
 
     def test_silent_mode(self, mocker):
         """Test that silent mode doesn't write to stderr"""
@@ -1481,7 +1491,7 @@ class TestLoggingProgressInteraction:
         graceful_exit = archiver.GracefulExit()
 
         # Create a mock logger to avoid actual file writes
-        mock_logger = mocker.MagicMock()
+        _ = mocker.MagicMock()
 
         # Test the global OUTPUT_LOCK coordination
         reporter = archiver.ProgressReporter(5, graceful_exit, silent=False)
