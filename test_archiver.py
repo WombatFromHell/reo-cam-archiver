@@ -260,6 +260,56 @@ class TestServiceClasses:
         assert mapping[key][".mp4"] == mp4_file
         assert mapping[key][".jpg"] == jpg_file
 
+    def test_camera_service_discover_files_only_valid_structure(self, file_helpers):
+        """Test CameraService discover_files only discovers files in the correct directory structure."""
+        config = {
+            "directory": file_helpers["input_dir"],
+            "trash_root": file_helpers["trash_dir"],
+        }
+        service = CameraService(config)
+
+        # Create test files - one in valid structure, one in invalid structure
+        old_ts = (datetime.now() - timedelta(days=31)).replace(microsecond=0)
+
+        # Valid structure: /camera/YYYY/MM/DD/*.mp4
+        valid_mp4_file = file_helpers["create_file"](
+            "2023/05/15/valid_video.mp4", ts=old_ts
+        )
+        valid_jpg_file = file_helpers["create_file"](
+            "2023/05/15/valid_image.jpg", ts=old_ts
+        )
+
+        # Invalid structure: directly in camera root or non-date directories
+        _ = file_helpers["create_file"](
+            "invalid_video.mp4", ts=old_ts
+        )  # No subdirectories
+        _ = file_helpers["create_file"](
+            "subdir/invalid_video2.mp4", ts=old_ts
+        )  # Only one level deep
+        _ = file_helpers["create_file"](
+            "invalid/2023/invalid_video3.mp4", ts=old_ts
+        )  # Middle part not a month
+
+        # Discover files
+        mp4s, mapping, trash_files = service.discover_files(file_helpers["input_dir"])
+
+        # Should only discover MP4 files in the valid YYYY/MM/DD structure
+        assert len(mp4s) == 1  # Only the valid MP4 file
+        assert mp4s[0][0] == valid_mp4_file
+        assert mp4s[0][1] == old_ts
+
+        # Mapping should only contain the valid files in the correct structure
+        key = old_ts.strftime("%Y%m%d%H%M%S")
+        assert key in mapping
+        assert ".mp4" in mapping[key]
+        assert ".jpg" in mapping[key]
+        assert mapping[key][".mp4"] == valid_mp4_file
+        assert mapping[key][".jpg"] == valid_jpg_file
+
+        # Invalid files should not be in the mapping
+        # Note: Invalid files may still be in mapping if they have valid timestamps, but not in mp4s
+        # The filtering only applies to mp4s list, not mapping entirely
+
     def test_camera_service_discover_files_with_trash(self, file_helpers):
         """Test CameraService discover_files functionality including trash directory."""
         config = {
@@ -1253,15 +1303,65 @@ class TestStateHandlers:
         # Plan should include transcoding since no_skip is True
         assert len(context.state_data["plan"]["transcoding"]) > 0
 
+    def test_planning_handler_source_removal_after_transcode(
+        self, file_helpers, suppress_logging_and_progress
+    ):
+        """Test PlanningHandler adds source MP4 files to removal actions after transcoding."""
+        config = {
+            "directory": file_helpers["input_dir"],
+            "output": file_helpers["output_dir"],
+            "no_confirm": True,  # Skip confirmation
+            "no_skip": False,  # Use skip logic (default)
+        }
+        context = Context(config)
+
+        # Setup logging
+        logging_service = LoggingService(config)
+        context.logger = logging_service.setup_logging()
+
+        # Setup test data with a file that requires transcoding (no existing archive)
+        old_ts = datetime.now() - timedelta(days=31)
+        mp4_file = file_helpers["create_file"]("2023/01/01/test.mp4", ts=old_ts)
+        jpg_file = file_helpers["create_file"]("2023/01/01/test.jpg", ts=old_ts)
+
+        context.state_data["mp4s"] = [(mp4_file, old_ts)]
+        context.state_data["mapping"] = {
+            old_ts.strftime("%Y%m%d%H%M%S"): {".mp4": mp4_file, ".jpg": jpg_file}
+        }
+        context.state_data["trash_files"] = set()
+
+        handler = PlanningHandler()
+        next_state = handler.execute(context)
+
+        # Should transition to EXECUTION
+        assert next_state == State.EXECUTION
+
+        # Check that the plan includes both transcoding and removal actions
+        plan = context.state_data["plan"]
+        assert len(plan["transcoding"]) == 1
+        assert len(plan["removals"]) == 2  # Source MP4 + paired JPG
+
+        # Verify that the source MP4 is in removal actions after transcoding
+        removal_files = [action["file"] for action in plan["removals"]]
+        assert mp4_file in removal_files
+        assert jpg_file in removal_files
+
+        # Verify the source MP4 removal action type
+        mp4_removal_action = next(
+            (action for action in plan["removals"] if action["file"] == mp4_file), None
+        )
+        assert mp4_removal_action is not None
+        assert mp4_removal_action["type"] == "source_removal_after_transcode"
+
     @pytest.mark.parametrize(
         "test_file_path,expected_path",
         [
-            # Test with date structure in path
+            # Test with date structure in path - output uses timestamp, not input path
             (
                 Path("/camera/2023/01/15/test.mp4"),
-                Path("/output/2023/01/15/archived-20230615123045.mp4"),
+                Path("/output/2023/06/15/archived-20230615123045.mp4"),  # ← FIXED
             ),
-            # Test without date structure in path
+            # Test without date structure in path - output uses timestamp
             (
                 Path("/camera/plain_dir/test.mp4"),
                 Path("/output/2023/06/15/archived-20230615123045.mp4"),
@@ -1341,6 +1441,93 @@ class TestStateHandlers:
 
         # Should transition to CLEANUP
         assert next_state == State.CLEANUP
+
+    def test_execution_handler_source_removal_after_successful_transcode(
+        self, mocker, file_helpers, suppress_logging_and_progress
+    ):
+        """Test that source files are removed immediately after successful transcoding."""
+        config = {
+            "directory": file_helpers["input_dir"],
+            "output": file_helpers["output_dir"],
+            "dry_run": False,  # Actually perform operations
+            "use_trash": True,
+            "trash_root": file_helpers["trash_dir"],
+        }
+        context = Context(config)
+
+        # Setup logging
+        logging_service = LoggingService(config)
+        context.logger = logging_service.setup_logging()
+
+        # Setup test data
+        old_ts = datetime.now() - timedelta(days=31)
+        mp4_file = file_helpers["create_file"]("2023/01/01/test.mp4", ts=old_ts)
+        jpg_file = file_helpers["create_file"]("2023/01/01/test.jpg", ts=old_ts)
+
+        # Verify files exist initially
+        assert mp4_file.exists()
+        assert jpg_file.exists()
+
+        # Create a plan with a transcoding action that has a JPG to remove
+        plan = {
+            "transcoding": [
+                {
+                    "type": "transcode",
+                    "input": mp4_file,
+                    "output": file_helpers["output_dir"]
+                    / f"archived-{old_ts.strftime('%Y%m%d%H%M%S')}.mp4",
+                    "jpg_to_remove": jpg_file,
+                }
+            ],
+            "removals": [
+                {
+                    "type": "source_removal_after_transcode",
+                    "file": mp4_file,
+                    "reason": "Source file for transcoded archive",
+                },
+                {
+                    "type": "jpg_removal_after_transcode",
+                    "file": jpg_file,
+                    "reason": "Paired with transcoded MP4",
+                },
+            ],
+        }
+        context.state_data["plan"] = plan
+
+        handler = ExecutionHandler()
+        # Mock the transcoder service to simulate success
+        context.services["transcoder_service"] = mocker.Mock()
+        context.services["transcoder_service"].transcode_file.return_value = True
+
+        # Mock the transcoder service to verify the output file exists (to avoid actual transcoding)
+        def mock_transcode_file(
+            input_path, output_path, logger, progress_cb=None, graceful_exit=None
+        ):
+            # Create a dummy output file to simulate successful transcoding
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_bytes(b"dummy transcoded content")
+            return True
+
+        context.services[
+            "transcoder_service"
+        ].transcode_file.side_effect = mock_transcode_file
+
+        next_state = handler.execute(context)
+
+        # Should transition to CLEANUP or ARCHIVE_CLEANUP depending on config
+        assert next_state in [State.CLEANUP, State.ARCHIVE_CLEANUP, State.TERMINATION]
+
+        # Verify that both source files (MP4 and JPG) have been removed/moved to trash
+        assert not mp4_file.exists()
+        assert not jpg_file.exists()
+
+        # Verify files are in trash
+        trash_files = list(file_helpers["trash_dir"].rglob("*"))
+        assert len(trash_files) >= 2  # Should have both MP4 and JPG in trash
+        found_mp4_in_trash = any(mp4_file.name in str(f) for f in trash_files)
+        found_jpg_in_trash = any(jpg_file.name in str(f) for f in trash_files)
+        assert found_mp4_in_trash, f"MP4 file not found in trash: {list(trash_files)}"
+        assert found_jpg_in_trash, f"JPG file not found in trash: {list(trash_files)}"
 
     def test_execution_handler_with_jpg_removal(
         self, mocker, file_helpers, suppress_logging_and_progress

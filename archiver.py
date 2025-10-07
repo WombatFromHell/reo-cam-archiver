@@ -89,6 +89,9 @@ class Context:
         self.current_state = State.INITIALIZATION
         self.state_data: Dict[str, Any] = {}
         self.graceful_exit = GracefulExit()
+        self.orchestrator = (
+            ConsoleOrchestrator()
+        )  # Shared orchestrator for coordination
         self.services = self._initialize_services()
         self.logger: Optional[logging.Logger] = None
         self.progress_bar: Optional["ProgressReporter"] = None
@@ -124,7 +127,7 @@ class CameraService:
     def discover_files(
         self, directory: Path
     ) -> Tuple[List[Tuple[Path, datetime]], Dict[str, Dict[str, Path]], Set[Path]]:
-        """Discover camera files with valid timestamps"""
+        """Discover camera files with valid timestamps in the correct directory structure"""
         mp4s: List[Tuple[Path, datetime]] = []
         mapping: Dict[str, Dict[str, Path]] = {}
         trash_files: Set[Path] = set()
@@ -138,6 +141,39 @@ class CameraService:
             # Skip files in trash directory when scanning base directory
             if trash_root and trash_root in p.parents:
                 continue
+
+            # Check if the file is in the correct directory structure: /camera/<YYYY>/<MM>/<DD>/*.*
+            # We need at least 4 parts: YYYY/MM/DD/filename from the base directory
+            try:
+                # Get the path relative to the base directory
+                rel_parts = p.relative_to(directory).parts
+                if len(rel_parts) >= 4:
+                    y, m, d = (
+                        rel_parts[-4],
+                        rel_parts[-3],
+                        rel_parts[-2],
+                    )  # YYYY/MM/DD are the 4th, 3rd, and 2nd to last parts
+                    # Check if the parent directories match YYYY/MM/DD pattern
+                    int(y)
+                    int(m)
+                    int(d)
+                    # Validate these are valid date components
+                    y_int = int(y)
+                    m_int = int(m)
+                    d_int = int(d)
+                    if (
+                        y_int < 1000
+                        or y_int > 9999
+                        or m_int < 1
+                        or m_int > 12
+                        or d_int < 1
+                        or d_int > 31
+                    ):
+                        continue  # Not a valid date structure
+                else:
+                    continue  # Not deep enough in the directory structure
+            except (ValueError, AttributeError):
+                continue  # Not a valid date structure
 
             try:
                 ts = self._parse_timestamp(p.name)
@@ -222,7 +258,9 @@ class LoggingService:
         self.config = config
 
     def setup_logging(
-        self, progress_bar: Optional["ProgressReporter"] = None
+        self,
+        progress_bar: Optional["ProgressReporter"] = None,
+        orchestrator: Optional["ConsoleOrchestrator"] = None,
     ) -> logging.Logger:
         """Setup logging with optional progress bar"""
         logger = logging.getLogger("camera_archiver")
@@ -246,8 +284,11 @@ class LoggingService:
             logger.addHandler(fh)
 
         # Stream handler
-        stream = progress_bar.out if progress_bar else sys.stdout
-        orch = progress_bar.orchestrator if progress_bar else ConsoleOrchestrator()
+        stream = sys.stderr  # Use stderr consistently for logging and progress
+        # Use provided orchestrator, or the one from progress bar, or create a new one
+        orch = orchestrator or (
+            progress_bar.orchestrator if progress_bar else ConsoleOrchestrator()
+        )
         sh = GuardedStreamHandler(orch, stream=stream, progress_bar=progress_bar)
         sh.setFormatter(logging.Formatter(fmt))
         sh.setLevel(logging.INFO)
@@ -558,12 +599,32 @@ class GuardedStreamHandler(logging.StreamHandler):
 
         with self.orchestrator.guard():
             if self.progress_bar and self.progress_bar._progress_line:
-                # Clear the current line and write the log message
-                self.stream.write(f"\r\x1b[2K{msg}")
-                # Ensure the message is flushed
-                self.stream.flush()
-                # Redraw the progress bar
-                self.progress_bar.redraw()
+                # Wait for any ongoing progress updates to complete to avoid clobbering
+                import time
+
+                max_wait = 0.1  # 100ms max wait
+                start_time = time.time()
+                while self.progress_bar._is_updating and (
+                    time.time() - start_time < max_wait
+                ):
+                    time.sleep(0.001)  # 1ms sleep
+
+                # Clear the current progress line, write the log message, and don't redraw immediately
+                try:
+                    # Clear the current progress line
+                    self.stream.write("\r\x1b[2K")  # Clear current line
+                    # Write the log message
+                    self.stream.write(msg)
+                    # Add a newline to separate from progress bar if the message didn't end with one
+                    if not msg.endswith("\n"):
+                        self.stream.write("\n")
+                    self.stream.flush()
+                    # The progress bar will update naturally via progress updates,
+                    # so we don't redraw it here to avoid interference
+                except Exception:
+                    # Fallback: just write the message
+                    self.stream.write(msg)
+                    self.stream.flush()
             else:
                 self.stream.write(msg)
                 self.stream.flush()
@@ -592,6 +653,9 @@ class ProgressReporter:
         self._progress_line = ""
         self._last_print_time = time.time()
         self._finished = False
+        self._is_updating = (
+            False  # Flag to indicate if we're currently updating the progress
+        )
         self._original_signal_handlers: Dict[int, Any] = {}
         self._register_cleanup_handlers()
 
@@ -666,12 +730,17 @@ class ProgressReporter:
         if self.silent or self.graceful_exit.should_exit() or self._finished:
             return
 
-        line = self._format_line(idx, pct)
-        if line == self._progress_line:
-            return
+        # Set the updating flag to coordinate with logging
+        self._is_updating = True
+        try:
+            line = self._format_line(idx, pct)
+            if line == self._progress_line:
+                return
 
-        self._progress_line = line
-        self._display(line)
+            self._progress_line = line
+            self._display(line)
+        finally:
+            self._is_updating = False
 
     def finish_file(self, idx: int):
         if not self.graceful_exit.should_exit() and not self._finished:
@@ -701,6 +770,16 @@ class ProgressReporter:
             return
 
         self._display(self._progress_line)
+
+    def finish_current_line(self):
+        """Finish the current progress line with a newline so logs can appear cleanly"""
+        if self._progress_line and not self.silent:
+            try:
+                # Add a newline after clearing the line to move to the next line
+                self.out.write("\r\x1b[2K\n")
+                self.out.flush()
+            except Exception:
+                pass
 
     def _display(self, line: str):
         if not self._is_tty():
@@ -743,15 +822,10 @@ class InitializationHandler:
             context.logger.info("Entering initialization state")
 
     def execute(self, context: Context) -> State:
-        # Setup logging
-        context.progress_bar = ProgressReporter(
-            total_files=0,
-            graceful_exit=context.graceful_exit,
-            silent=context.config.get("dry_run", False),
-            out=sys.stderr,
-        )
+        # Setup logging with shared orchestrator but no progress bar initially
+        context.progress_bar = None
         context.logger = context.services["logging_service"].setup_logging(
-            context.progress_bar
+            context.progress_bar, context.orchestrator
         )
 
         # Check storage
@@ -865,6 +939,13 @@ class PlanningHandler:
         transcoding_actions: List[Dict[str, Any]] = []
         removal_actions: List[Dict[str, Any]] = []
 
+        # Calculate age cutoff if cleanup is enabled
+        age_cutoff = None
+        # Calculate age cutoff - apply to all files being processed, not just cleanup
+        age_cutoff = None
+        if context.config.get("age", 30) > 0:
+            age_cutoff = datetime.now() - timedelta(days=context.config.get("age", 30))
+
         for fp, ts in mp4s:
             if fp in context.state_data.get("trash_files", set()):
                 continue
@@ -872,13 +953,21 @@ class PlanningHandler:
             outp = self._output_path(context, fp, ts)
             jpg = mapping.get(ts.strftime("%Y%m%d%H%M%S"), {}).get(".jpg")
 
+            # Skip files newer than age cutoff (files must be at least age_days old to be processed)
+            if age_cutoff and ts >= age_cutoff:
+                if context.logger:
+                    context.logger.debug(
+                        f"Skipping {fp}: timestamp {ts} is newer than age cutoff {age_cutoff}"
+                    )
+                continue
+
             # Check skip logic
             if (
                 not context.config.get("no_skip", False)
                 and outp.exists()
                 and outp.stat().st_size > MIN_ARCHIVE_SIZE_BYTES
             ):
-                # Will skip transcoding but remove source files
+                # Archive exists, skip transcoding but mark for removal
                 removal_actions.append(
                     {
                         "type": "source_removal_after_skip",
@@ -902,6 +991,14 @@ class PlanningHandler:
                         "input": fp,
                         "output": outp,
                         "jpg_to_remove": jpg,
+                    }
+                )
+                # Add source MP4 for removal after successful transcoding
+                removal_actions.append(
+                    {
+                        "type": "source_removal_after_transcode",
+                        "file": fp,
+                        "reason": f"Source file for transcoded archive at {outp}",
                     }
                 )
                 if jpg:
@@ -972,24 +1069,7 @@ class PlanningHandler:
         if not isinstance(out_dir, Path):
             raise ValueError("Output directory is not properly configured")
 
-        # Check if parent directories match YYYY/MM/DD pattern
-        if len(input_file.parts) >= 4:
-            y, m, d = input_file.parts[-4:-1]
-            try:
-                int(y)
-                int(m)
-                int(d)
-                # Valid date structure → reuse it
-                return (
-                    out_dir
-                    / y
-                    / m
-                    / d
-                    / f"archived-{timestamp.strftime('%Y%m%d%H%M%S')}.mp4"
-                )
-            except ValueError:
-                pass  # Not a valid date structure → fall through
-        # Use timestamp-based structure
+        # Use consistent timestamp-based directory structure regardless of input path
         return (
             out_dir
             / str(timestamp.year)
@@ -1008,13 +1088,21 @@ class ExecutionHandler:
         plan = context.state_data.get("plan", {})
         transcoding_actions = plan.get("transcoding", [])
 
-        # Setup progress bar
+        # Setup progress bar with the shared orchestrator
         context.progress_bar = ProgressReporter(
             total_files=len(transcoding_actions),
             graceful_exit=context.graceful_exit,
             silent=context.config.get("dry_run", False),
             out=sys.stderr,
         )
+        # Set the progress bar's orchestrator to the shared one
+        context.progress_bar.orchestrator = context.orchestrator
+
+        # Update the logger with the progress bar for coordination
+        context.logger = context.services["logging_service"].setup_logging(
+            context.progress_bar, context.orchestrator
+        )
+
         context.progress_bar.start_processing()
 
     def execute(self, context: Context) -> State:
@@ -1022,7 +1110,7 @@ class ExecutionHandler:
         transcoding_actions = plan.get("transcoding", [])
         removal_actions = plan.get("removals", [])
 
-        # Execute transcoding actions
+        # Execute transcoding actions and immediate removals
         for i, action in enumerate(transcoding_actions, 1):
             if context.graceful_exit.should_exit():
                 break
@@ -1061,25 +1149,49 @@ class ExecutionHandler:
                     context.logger.info(
                         f"Successfully transcoded {input_path} -> {output_path}"
                     )
+
+                # Remove paired JPG if exists
+                jpg = action.get("jpg_to_remove")
+                if jpg and context.logger:
+                    context.services["file_service"].remove_file(
+                        jpg,
+                        context.logger,
+                        dry_run=context.config.get("dry_run", False),
+                        use_trash=context.config.get("use_trash", False),
+                        trash_root=context.config.get("trash_root"),
+                        is_output=False,
+                        source_root=jpg.parent,
+                    )
+
+                # Remove source file after successful transcoding
+                # Find and execute the corresponding source removal action
+                source_removal_action = None
+                for removal_action in removal_actions:
+                    if (
+                        removal_action.get("type") == "source_removal_after_transcode"
+                        and removal_action["file"] == input_path
+                    ):
+                        source_removal_action = removal_action
+                        break
+
+                if source_removal_action:
+                    context.services["file_service"].remove_file(
+                        source_removal_action["file"],
+                        context.logger,
+                        dry_run=context.config.get("dry_run", False),
+                        use_trash=context.config.get("use_trash", False),
+                        trash_root=context.config.get("trash_root"),
+                        is_output=False,
+                        source_root=source_removal_action["file"].parent,
+                    )
+                    # Remove this action from the list so it's not processed again later
+                    removal_actions.remove(source_removal_action)
             else:
                 if context.logger:
                     context.logger.error(f"Failed to transcode {input_path}")
                 continue
 
-            # Remove paired JPG if exists
-            jpg = action.get("jpg_to_remove")
-            if jpg and context.logger:
-                context.services["file_service"].remove_file(
-                    jpg,
-                    context.logger,
-                    dry_run=context.config.get("dry_run", False),
-                    use_trash=context.config.get("use_trash", False),
-                    trash_root=context.config.get("trash_root"),
-                    is_output=False,
-                    source_root=jpg.parent,
-                )
-
-        # Execute removal actions
+        # Execute any remaining removal actions that weren't handled above
         for action in removal_actions:
             if context.graceful_exit.should_exit():
                 break
