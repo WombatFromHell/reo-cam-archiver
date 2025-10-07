@@ -614,12 +614,18 @@ class FileProcessor:
                     # File might not be accessible, or mocking is interfering (e.g., st_mode missing from mock)
                     should_skip = False
 
+            # If cleanup is enabled, always skip transcoding and only add removal actions
+            if self.config.cleanup:
+                should_skip = True
+
             if should_skip:
                 removal_actions.append(
                     {
                         "type": "source_removal_after_skip",
                         "file": fp,
-                        "reason": f"Skipping transcoding: archive exists at {outp}",
+                        "reason": f"Skipping transcoding: archive exists at {outp}"
+                        if not self.config.cleanup
+                        else "Skipping transcoding: cleanup mode enabled",
                     }
                 )
                 if jpg:
@@ -627,7 +633,9 @@ class FileProcessor:
                         {
                             "type": "jpg_removal_after_skip",
                             "file": jpg,
-                            "reason": "Skipping transcoding: archive exists for paired MP4",
+                            "reason": "Skipping transcoding: archive exists for paired MP4"
+                            if not self.config.cleanup
+                            else "Skipping transcoding: cleanup mode enabled",
                         }
                     )
             else:

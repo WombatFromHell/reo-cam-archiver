@@ -947,6 +947,46 @@ class TestFileProcessor:
         )
         assert output_path == expected
 
+    def test_generate_action_plan_with_cleanup_flag(self, tmp_path, mocker):
+        """Test that cleanup flag disables transcoding and only generates removal actions"""
+        # Create config with cleanup flag
+        args = archiver.parse_args([str(tmp_path), "--cleanup"])
+        config = archiver.Config(args)
+
+        # Create logger
+        logger = mocker.MagicMock()
+
+        # Create graceful exit
+        graceful_exit = archiver.GracefulExit()
+
+        # Create processor
+        processor = archiver.FileProcessor(config, logger, graceful_exit)
+
+        # Create test data
+        mp4_file = (
+            tmp_path / "camera" / "2023" / "01" / "15" / "REO_camera_20230115120000.mp4"
+        )
+        jpg_file = (
+            tmp_path / "camera" / "2023" / "01" / "15" / "REO_camera_20230115120000.jpg"
+        )
+        timestamp = datetime(2023, 1, 15, 12, 0, 0)
+
+        mp4s = [(mp4_file, timestamp)]
+        mapping = {"20230115120000": {".mp4": mp4_file, ".jpg": jpg_file}}
+
+        # Mock exists to return False (so normally we'd transcode if not for cleanup)
+        mocker.patch("pathlib.Path.exists", return_value=False)
+
+        # Generate plan
+        plan = processor.generate_action_plan(mp4s, mapping)
+
+        # Verify plan - should have no transcoding when cleanup is active
+        assert len(plan["transcoding"]) == 0
+        assert len(plan["removals"]) == 2  # One for MP4, one for JPG
+        # Verify the reason includes cleanup information
+        for removal in plan["removals"]:
+            assert "cleanup mode enabled" in removal["reason"]
+
 
 class TestDisplayAndConfirmPlan:
     """Test display and confirm plan functions"""
