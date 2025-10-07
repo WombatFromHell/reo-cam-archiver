@@ -1,2651 +1,1555 @@
-#!/usr/bin/env python3
-"""Comprehensive tests for archiver.py using pytest with improved parameterization and integration tests."""
+"""
+Comprehensive test suite for the Camera Archiver application.
+Tests focus on integration and end-to-end scenarios with proper mocking.
+"""
 
 import logging
-import shutil
-import tempfile
-import io
 import signal
-import threading
-import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
 
-from archiver import (
-    MIN_ARCHIVE_SIZE_BYTES,
-    ArchiveCleanupHandler,
-    CameraService,
-    CleanupHandler,
-    Context,
-    DiscoveryHandler,
-    ExecutionHandler,
-    FileService,
-    FileInfo,
-    GracefulExit,
-    GuardedStreamHandler,
-    InitializationHandler,
-    LoggingService,
-    PlanningHandler,
-    ProgressReporter,
-    State,
-    StateHandlerFactory,
-    StorageService,
-    TerminationHandler,
-    TranscoderService,
-    main,
-    parse_arguments,
-    run_state_machine,
-    run_state_machine_with_config,
-    setup_config,
-    ConsoleOrchestrator,
-)
+# Import the modules we're testing
+import archiver
 
 
-@pytest.fixture
-def temp_dirs():
-    """Create temporary directories for testing."""
-    temp_dir = Path(tempfile.mkdtemp())
-    input_dir = temp_dir / "camera"
-    output_dir = temp_dir / "archived"
-    trash_dir = temp_dir / ".deleted"
+class TestConfig:
+    """Test the Config class"""
 
-    for d in (input_dir, output_dir, trash_dir):
-        d.mkdir(parents=True, exist_ok=True)
+    def test_config_initialization(self, tmp_path):
+        """Test that Config correctly initializes from args"""
+        args = archiver.parse_args([str(tmp_path)])
+        config = archiver.Config(args)
 
-    yield {
-        "temp_dir": temp_dir,
-        "input_dir": input_dir,
-        "output_dir": output_dir,
-        "trash_dir": trash_dir,
-    }
+        assert config.directory == tmp_path
+        assert config.output == tmp_path / "archived"
+        assert config.dry_run is False
+        assert config.no_confirm is False
+        assert config.no_skip is False
+        assert config.use_trash is False
+        assert config.trash_root is None
+        assert config.cleanup is False
+        assert config.clean_output is False
+        assert config.age == 30
+        assert config.log_file is None
 
-    shutil.rmtree(temp_dir, ignore_errors=True)
+    def test_config_initialization_default_directory(self):
+        """Test that Config correctly initializes with default directory when no argument provided"""
+        args = archiver.parse_args([])
+        config = archiver.Config(args)
 
+        assert config.directory == Path("/camera")
+        assert config.output == Path("/camera") / "archived"
+        assert config.dry_run is False
+        assert config.no_confirm is False
+        assert config.no_skip is False
+        assert config.use_trash is False
+        assert config.trash_root is None
+        assert config.cleanup is False
+        assert config.clean_output is False
+        assert config.age == 30
+        assert config.log_file is None
 
-@pytest.fixture
-def suppress_logging_and_progress():
-    """Suppress logging and progress bar output during tests."""
-    # Suppress log output during tests
-    _orig_emit = GuardedStreamHandler.emit
-    GuardedStreamHandler.emit = lambda *_, **__: None
+    def test_config_with_default_directory_and_trash(self):
+        """Test that Config correctly initializes default trash root with default directory"""
+        args = archiver.parse_args(["--use-trash"])
+        config = archiver.Config(args)
 
-    # Also suppress progress bar output during tests
-    _orig_progress_display = ProgressReporter._display
-    _orig_progress_redraw = ProgressReporter.redraw
-    _orig_progress_cleanup = ProgressReporter._cleanup_progress_bar
-    ProgressReporter._display = lambda self, line: None
-    ProgressReporter.redraw = lambda self: None
-    ProgressReporter._cleanup_progress_bar = lambda self: None
+        assert config.directory == Path("/camera")
+        assert config.trash_root == Path("/camera") / ".deleted"
+        assert config.use_trash is True
 
-    yield  # Provide the fixture
+    def test_config_with_all_options(self, tmp_path):
+        """Test Config with all options enabled"""
+        output_dir = tmp_path / "output"
+        log_file = tmp_path / "log.txt"
+        trash_root = tmp_path / "trash"
 
-    # Restore original behavior
-    GuardedStreamHandler.emit = _orig_emit
-    ProgressReporter._display = _orig_progress_display
-    ProgressReporter.redraw = _orig_progress_redraw
-    ProgressReporter._cleanup_progress_bar = _orig_progress_cleanup
-
-
-@pytest.fixture
-def file_helpers(temp_dirs):
-    """Provide helper methods for creating test files."""
-    input_dir = temp_dirs["input_dir"]
-    output_dir = temp_dirs["output_dir"]
-    trash_dir = temp_dirs["trash_dir"]
-
-    def create_file(
-        rel_path: str, content: bytes = b"test", ts: datetime | None = None
-    ) -> Path:
-        """Create a file with an optional timestamp embedded in the name."""
-        if ts is None:
-            ts = datetime.now()
-        stem = f"REO_CAMERA_{ts.strftime('%Y%m%d%H%M%S')}"
-        full_path = input_dir / rel_path
-        full_path.parent.mkdir(parents=True, exist_ok=True)
-        file_path = full_path.with_name(stem + Path(rel_path).suffix)
-        file_path.write_bytes(content)
-        return file_path
-
-    def create_archive(ts: datetime, size: int | None = None) -> Path:
-        """Create a dummy archive in the output tree."""
-        p = (
-            output_dir
-            / str(ts.year)
-            / f"{ts.month:02d}"
-            / f"{ts.day:02d}"
-            / f"archived-{ts.strftime('%Y%m%d%H%M%S')}.mp4"
+        args = archiver.parse_args(
+            [
+                str(tmp_path),
+                "-o",
+                str(output_dir),
+                "--dry-run",
+                "--no-confirm",
+                "--no-skip",
+                "--use-trash",
+                "--trash-root",
+                str(trash_root),
+                "--cleanup",
+                "--clean-output",
+                "--age",
+                "60",
+                "--log-file",
+                str(log_file),
+            ]
         )
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_bytes(b"x" * (size or MIN_ARCHIVE_SIZE_BYTES + 1))
-        return p
+        config = archiver.Config(args)
 
-    def create_trash_file(ts: datetime) -> Path:
-        """Create a file in the trash tree."""
-        p = (
-            trash_dir
-            / "input"
-            / str(ts.year)
-            / f"{ts.month:02d}"
-            / f"{ts.day:02d}"
-            / f"REO_CAMERA_{ts.strftime('%Y%m%d%H%M%S')}.mp4"
+        assert config.directory == tmp_path
+        assert config.output == output_dir
+        assert config.dry_run is True
+        assert config.no_confirm is True
+        assert config.no_skip is True
+        assert config.use_trash is True
+        assert config.trash_root == trash_root
+        assert config.cleanup is True
+        assert config.clean_output is True
+        assert config.age == 60
+        assert config.log_file == log_file
+
+    def test_config_with_use_trash_no_trash_root(self, tmp_path):
+        """Test Config with use-trash but no trash-root specified (should default to <directory>/.deleted)"""
+        args = archiver.parse_args(
+            [
+                str(tmp_path),
+                "--use-trash",
+            ]
         )
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_bytes(b"x")
-        return p
+        config = archiver.Config(args)
 
-    return {
-        "create_file": create_file,
-        "create_archive": create_archive,
-        "create_trash_file": create_trash_file,
-        "input_dir": input_dir,
-        "output_dir": output_dir,
-        "trash_dir": trash_dir,
-    }
+        assert config.directory == tmp_path
+        assert config.use_trash is True
+        assert config.trash_root == tmp_path / ".deleted"
 
 
-class TestContextAndServices:
-    """Test Context class and core services."""
+class TestGracefulExit:
+    """Test the GracefulExit class"""
 
-    @pytest.mark.parametrize(
-        "state,handler_class",
-        [
-            (State.INITIALIZATION, InitializationHandler),
-            (State.DISCOVERY, DiscoveryHandler),
-            (State.PLANNING, PlanningHandler),
-            (State.EXECUTION, ExecutionHandler),
-            (State.CLEANUP, CleanupHandler),
-            (State.ARCHIVE_CLEANUP, ArchiveCleanupHandler),
-            (State.TERMINATION, TerminationHandler),
-        ],
-    )
-    def test_state_handler_factory(self, state, handler_class):
-        """Test StateHandlerFactory creates correct handlers for all states."""
-        handler = StateHandlerFactory.create_handler(state)
-        assert isinstance(handler, handler_class)
+    def test_initial_state(self):
+        """Test that GracefulExit starts in the correct state"""
+        graceful_exit = archiver.GracefulExit()
+        assert graceful_exit.should_exit() is False
 
-    def test_context_initialization_and_state_transitions(self, temp_dirs):
-        """Test Context class initialization and state transitions."""
-        config = {
-            "directory": temp_dirs["input_dir"],
-            "output": temp_dirs["output_dir"],
-            "trash_root": temp_dirs["trash_dir"],
-        }
+    def test_request_exit(self):
+        """Test that request_exit correctly changes the state"""
+        graceful_exit = archiver.GracefulExit()
+        graceful_exit.request_exit()
+        assert graceful_exit.should_exit() is True
 
-        context = Context(config)
-        assert context.current_state == State.INITIALIZATION
-        assert context.config == config
-        assert isinstance(context.graceful_exit, GracefulExit)
-        assert "camera_service" in context.services
-        assert "storage_service" in context.services
-        assert "logging_service" in context.services
-        assert "transcoder_service" in context.services
-        assert "file_service" in context.services
+    def test_thread_safety(self):
+        """Test that GracefulExit is thread-safe"""
+        import threading
 
-        # Test state transitions
-        for state in [State.DISCOVERY, State.PLANNING, State.EXECUTION]:
-            context.transition_to(state)
-            assert context.current_state == state
+        graceful_exit = archiver.GracefulExit()
+        results = []
+
+        def check_and_request():
+            results.append(graceful_exit.should_exit())
+            graceful_exit.request_exit()
+            results.append(graceful_exit.should_exit())
+
+        t = threading.Thread(target=check_and_request)
+        t.start()
+        t.join()
+
+        assert results[0] is False
+        assert results[1] is True
 
 
-class TestServiceClasses:
-    """Test service classes functionality with parameterization."""
+class TestProgressReporter:
+    """Test the ProgressReporter class"""
 
-    @pytest.mark.parametrize(
-        "filename,expected_valid",
-        [
-            ("REO_CAM_20230101120000.mp4", True),  # Valid MP4
-            ("REO_CAM_20230101120000.jpg", True),  # Valid JPG
-            ("REO_CAM_19991231235959.mp4", False),  # Year out of range (too past)
-            ("REO_CAM_21001231235959.mp4", False),  # Year out of range (too future)
-            ("invalid.mp4", None),  # Invalid format
-            (
-                "REO_Camera_20230101120000.mp4",
-                True,
-            ),  # Different case should work (IGNORECASE)
-            (
-                "reo_camera_20230101120000.mp4",
-                True,
-            ),  # Lowercase should work (IGNORECASE)
-            ("REO_XYZ_20230101120000.mp4", True),  # Any prefix after REO_ should work
-            ("REO_CAM_invalid.mp4", None),  # Invalid timestamp
-            ("REO_CAM_20230101120000", None),  # Missing extension
-        ],
-    )
-    def test_camera_service_parse_timestamp(self, filename, expected_valid):
-        """Parametrized test for CameraService parse_timestamp functionality."""
-        service = CameraService({})
+    def test_initialization(self):
+        """Test ProgressReporter initialization"""
+        graceful_exit = archiver.GracefulExit()
+        reporter = archiver.ProgressReporter(10, graceful_exit, silent=True)
 
-        ts = service._parse_timestamp(filename)
-        if expected_valid is True:
-            assert ts is not None
-            # Extract the timestamp part from filename (after underscore)
-            timestamp_part = filename.split("_")[-1][:14]  # Get the 14-digit timestamp
-            expected_year = int(timestamp_part[:4])
-            assert ts.year == expected_year
-            # Validate the timestamp is in the expected range
-            assert 2000 <= ts.year <= 2099
-        elif expected_valid is False:
-            assert ts is None  # Year out of range returns None
-        else:  # expected_valid is None
-            assert ts is None
+        assert reporter.total == 10
+        assert reporter.current == 0
+        assert reporter.silent is True
+        assert reporter.graceful_exit == graceful_exit
 
-    def test_camera_service_discover_files(self, file_helpers):
-        """Test CameraService discover_files functionality."""
-        config = {
-            "directory": file_helpers["input_dir"],
-            "trash_root": file_helpers["trash_dir"],
-        }
-        service = CameraService(config)
+    def test_start_file(self):
+        """Test that start_file increments the counter"""
+        graceful_exit = archiver.GracefulExit()
+        reporter = archiver.ProgressReporter(10, graceful_exit, silent=True)
 
-        # Create test files - ensure no microseconds in timestamp
-        old_ts = (datetime.now() - timedelta(days=31)).replace(microsecond=0)
-        mp4_file = file_helpers["create_file"]("2023/01/01/test_video.mp4", ts=old_ts)
-        jpg_file = file_helpers["create_file"]("2023/01/01/test_image.jpg", ts=old_ts)
+        reporter.start_file()
+        assert reporter.current == 1
 
-        # Discover files
-        mp4s, mapping, trash_files = service.discover_files(file_helpers["input_dir"])
+        reporter.start_file()
+        assert reporter.current == 2
 
-        # Check that discovery worked
+    def test_update_progress(self, mocker):
+        """Test progress update with mocked stderr"""
+        graceful_exit = archiver.GracefulExit()
+
+        # Mock time.time before creating the reporter to set start_time
+        mock_time = mocker.patch("time.time")
+        mock_time.return_value = 0.0  # Start time
+
+        reporter = archiver.ProgressReporter(10, graceful_exit, silent=False)
+        mock_stderr = mocker.patch("sys.stderr")
+
+        # Now set the time to 100 seconds elapsed
+        mock_time.return_value = 100.0
+
+        reporter.start_file()
+        reporter.update_progress(50.0)
+
+        # Verify stderr.write was called with progress information
+        mock_stderr.write.assert_called()
+        call_args = mock_stderr.write.call_args[0][0]
+        assert "Progress [1/10]: 50%" in call_args
+        assert "|" in call_args  # Progress bar
+        assert "01:40" in call_args  # Elapsed time (100 seconds = 1:40)
+
+    def test_silent_mode(self, mocker):
+        """Test that silent mode doesn't write to stderr"""
+        graceful_exit = archiver.GracefulExit()
+        reporter = archiver.ProgressReporter(10, graceful_exit, silent=True)
+        mock_stderr = mocker.patch("sys.stderr")
+
+        reporter.start_file()
+        reporter.update_progress(50.0)
+
+        # Verify stderr.write was not called
+        mock_stderr.write.assert_not_called()
+
+    def test_exit_requested(self, mocker):
+        """Test that progress updates are skipped when exit is requested"""
+        graceful_exit = archiver.GracefulExit()
+        reporter = archiver.ProgressReporter(10, graceful_exit, silent=False)
+        mock_stderr = mocker.patch("sys.stderr")
+
+        graceful_exit.request_exit()
+        reporter.start_file()
+        reporter.update_progress(50.0)
+
+        # Verify stderr.write was not called
+        mock_stderr.write.assert_not_called()
+
+    def test_context_manager(self, mocker):
+        """Test that the context manager writes a newline on exit"""
+        graceful_exit = archiver.GracefulExit()
+        reporter = archiver.ProgressReporter(10, graceful_exit, silent=False)
+        mock_stderr = mocker.patch("sys.stderr")
+
+        with reporter:
+            pass
+
+        # Verify a newline was written
+        mock_stderr.write.assert_called_with("\n")
+
+
+class TestLogger:
+    """Test the Logger class"""
+
+    def test_setup_with_file(self, tmp_path, mocker):
+        """Test logger setup with a log file"""
+        log_file = tmp_path / "test.log"
+        args = archiver.parse_args([str(tmp_path), "--log-file", str(log_file)])
+        config = archiver.Config(args)
+
+        # Mock the rotation function to avoid actual file operations
+        mock_rotate = mocker.patch.object(archiver.Logger, "_rotate_log_file")
+        logger = archiver.Logger.setup(config)
+
+        # Verify rotation was called
+        mock_rotate.assert_called_once_with(log_file)
+
+        # Verify logger has both file and console handlers
+        assert len(logger.handlers) == 2
+        assert any(isinstance(h, logging.FileHandler) for h in logger.handlers)
+        assert any(isinstance(h, logging.StreamHandler) for h in logger.handlers)
+
+    def test_setup_without_file(self, tmp_path):
+        """Test logger setup without a log file"""
+        args = archiver.parse_args([str(tmp_path)])
+        config = archiver.Config(args)
+        logger = archiver.Logger.setup(config)
+
+        # Verify logger has only console handler
+        assert len(logger.handlers) == 1
+        assert isinstance(logger.handlers[0], logging.StreamHandler)
+
+    def test_log_rotation(self, tmp_path):
+        """Test log file rotation"""
+        log_file = tmp_path / "test.log"
+
+        # Create a log file that exceeds the rotation size
+        with open(log_file, "w") as f:
+            f.write("x" * (archiver.LOG_ROTATION_SIZE + 1000))
+
+        archiver.Logger._rotate_log_file(log_file)
+
+        # Verify the file was moved to backup
+        backup_file = tmp_path / "test.log.1"
+        assert backup_file.exists()
+
+        # Verify the original file was recreated and is empty
+        assert log_file.exists()
+        assert log_file.stat().st_size == 0
+
+    def test_log_rotation_with_existing_backups(self, tmp_path, mocker):
+        """Test log rotation with existing backup files"""
+        log_file = tmp_path / "test.log"
+
+        # Create backup files
+        (tmp_path / "test.log.1").touch()
+        (tmp_path / "test.log.2").touch()
+
+        # Create a log file that exceeds the rotation size
+        with open(log_file, "w") as f:
+            f.write("x" * (archiver.LOG_ROTATION_SIZE + 1000))
+
+        # Mock shutil.move to avoid actual file operations
+        mock_move = mocker.patch("shutil.move")
+
+        archiver.Logger._rotate_log_file(log_file)
+
+        # Verify the files were moved correctly
+        assert mock_move.call_count >= 3  # For .2 -> .3, .1 -> .2, and .log -> .1
+
+
+class TestFileDiscovery:
+    """Test the FileDiscovery class"""
+
+    def test_discover_files(self, tmp_path, mocker):
+        """Test file discovery with valid camera directory structure"""
+        # Create directory structure
+        camera_dir = tmp_path / "camera"
+        year_dir = camera_dir / "2023" / "01" / "15"
+
+        # Create test files
+        mp4_file = year_dir / "REO_camera_20230115120000.mp4"
+        jpg_file = year_dir / "REO_camera_20230115120000.jpg"
+        invalid_file = year_dir / "invalid.txt"
+
+        # Mock the files to exist without actually creating them
+        mocker.patch("pathlib.Path.is_file", return_value=True)
+        mock_stat = mocker.patch("pathlib.Path.stat")
+        mock_stat.return_value.st_size = 1000
+
+        # Mock rglob to return our test files
+        mock_rglob = mocker.patch("pathlib.Path.rglob")
+        mock_rglob.return_value = [mp4_file, jpg_file, invalid_file]
+
+        # Run discovery
+        mp4s, mapping, trash_files = archiver.FileDiscovery.discover_files(camera_dir)
+
+        # Verify results
         assert len(mp4s) == 1
         assert mp4s[0][0] == mp4_file
-        assert mp4s[0][1] == old_ts
+        assert mp4s[0][1] == datetime(2023, 1, 15, 12, 0, 0)
 
-        # Check that mapping contains both files
-        key = old_ts.strftime("%Y%m%d%H%M%S")
-        assert key in mapping
-        assert ".mp4" in mapping[key]
-        assert ".jpg" in mapping[key]
-        assert mapping[key][".mp4"] == mp4_file
-        assert mapping[key][".jpg"] == jpg_file
+        assert len(mapping) == 1
+        assert "20230115120000" in mapping
+        assert mapping["20230115120000"][".mp4"] == mp4_file
+        assert mapping["20230115120000"][".jpg"] == jpg_file
 
-    def test_camera_service_discover_files_only_valid_structure(self, file_helpers):
-        """Test CameraService discover_files only discovers files in the correct directory structure."""
-        config = {
-            "directory": file_helpers["input_dir"],
-            "trash_root": file_helpers["trash_dir"],
-        }
-        service = CameraService(config)
+        assert len(trash_files) == 0
 
-        # Create test files - one in valid structure, one in invalid structure
-        old_ts = (datetime.now() - timedelta(days=31)).replace(microsecond=0)
-
-        # Valid structure: /camera/YYYY/MM/DD/*.mp4
-        valid_mp4_file = file_helpers["create_file"](
-            "2023/05/15/valid_video.mp4", ts=old_ts
-        )
-        valid_jpg_file = file_helpers["create_file"](
-            "2023/05/15/valid_image.jpg", ts=old_ts
-        )
-
-        # Invalid structure: directly in camera root or non-date directories
-        _ = file_helpers["create_file"](
-            "invalid_video.mp4", ts=old_ts
-        )  # No subdirectories
-        _ = file_helpers["create_file"](
-            "subdir/invalid_video2.mp4", ts=old_ts
-        )  # Only one level deep
-        _ = file_helpers["create_file"](
-            "invalid/2023/invalid_video3.mp4", ts=old_ts
-        )  # Middle part not a month
-
-        # Discover files
-        mp4s, mapping, trash_files = service.discover_files(file_helpers["input_dir"])
-
-        # Should only discover MP4 files in the valid YYYY/MM/DD structure
-        assert len(mp4s) == 1  # Only the valid MP4 file
-        assert mp4s[0][0] == valid_mp4_file
-        assert mp4s[0][1] == old_ts
-
-        # Mapping should only contain the valid files in the correct structure
-        key = old_ts.strftime("%Y%m%d%H%M%S")
-        assert key in mapping
-        assert ".mp4" in mapping[key]
-        assert ".jpg" in mapping[key]
-        assert mapping[key][".mp4"] == valid_mp4_file
-        assert mapping[key][".jpg"] == valid_jpg_file
-
-        # Invalid files should not be in the mapping
-        # Note: Invalid files may still be in mapping if they have valid timestamps, but not in mp4s
-        # The filtering only applies to mp4s list, not mapping entirely
-
-    def test_camera_service_discover_files_with_trash(self, file_helpers):
-        """Test CameraService discover_files functionality including trash directory."""
-        config = {
-            "directory": file_helpers["input_dir"],
-            "trash_root": file_helpers["trash_dir"],
-        }
-        service = CameraService(config)
-
-        # First, create a file in the trash directory
-        old_ts = (datetime.now() - timedelta(days=35)).replace(microsecond=0)
-        trash_file = file_helpers["create_trash_file"](old_ts)
-        assert trash_file.exists()
-
-        # Discover files including from trash
-        mp4s, mapping, trash_files = service.discover_files(file_helpers["input_dir"])
-
-        # The discover_files method should have scanned the trash directory
-        # and added the trash file to the appropriate collections
-        # Check that the trash directory was properly scanned by seeing if any trash files were found
-        # The key issue is whether the nested directory structure is handled correctly
-        key = old_ts.strftime("%Y%m%d%H%M%S")
-
-        # Either the file is in the trash files set or it's in the mapping (or both)
-        file_found_in_trash = trash_file in trash_files
-        file_found_in_mapping = key in mapping and mapping[key][".mp4"] == trash_file
-
-        # At least one of these should be true
-        assert file_found_in_trash or file_found_in_mapping, (
-            f"Trash file {trash_file} not found in trash_files: {trash_files} "
-            f"or in mapping: {mapping}. The discover_files method should scan trash directories."
-        )
-
-    def test_camera_service_discover_files_exception_handling(
-        self, mocker, file_helpers
-    ):
-        """Test CameraService discover_files exception handling."""
-        config = {
-            "directory": file_helpers["input_dir"],
-            "trash_root": file_helpers["trash_dir"],
-        }
-        service = CameraService(config)
+    def test_discover_files_with_trash(self, tmp_path, mocker):
+        """Test file discovery with trash directory"""
+        # Create directory structure
+        camera_dir = tmp_path / "camera"
+        trash_dir = tmp_path / "trash"
+        year_dir = camera_dir / "2023" / "01" / "15"
+        trash_year_dir = trash_dir / "input" / "2023" / "01" / "15"
 
         # Create test files
-        old_ts = (datetime.now() - timedelta(days=31)).replace(microsecond=0)
-        _ = file_helpers["create_file"]("2023/01/01/test_video.mp4", ts=old_ts)
+        mp4_file = year_dir / "REO_camera_20230115120000.mp4"
+        trash_mp4 = trash_year_dir / "REO_camera_20230115130000.mp4"
 
-        # Mock the _parse_timestamp method to raise an exception for some files
-        original_parse = service._parse_timestamp
+        # Mock the files to exist without actually creating them
+        mocker.patch("pathlib.Path.is_file", return_value=True)
+        mock_stat = mocker.patch("pathlib.Path.stat")
+        mock_stat.return_value.st_size = 1000
 
-        def mock_parse(filename):
-            # Return a valid timestamp for most files, but raise exception for specific test
-            if "error" in filename:
-                raise ValueError("Test error")
-            return original_parse(filename)
+        # Mock exists for trash directory
+        def mock_exists(self):
+            return self == trash_dir or self == trash_dir / "input"
 
-        mocker.patch.object(service, "_parse_timestamp", side_effect=mock_parse)
+        mocker.patch("pathlib.Path.exists", mock_exists)
 
-        # Should handle the exception gracefully and continue
-        mp4s, mapping, trash_files = service.discover_files(file_helpers["input_dir"])
+        # Mock rglob to return our test files
+        def mock_rglob_func(self, pattern):
+            if pattern == "*.*":
+                if trash_dir in self.parents:
+                    return [trash_mp4]
+                else:
+                    return [mp4_file]
+            return []
 
-        # Should still have the normal files despite the error
+        mocker.patch("pathlib.Path.rglob", mock_rglob_func)
+
+        # Run discovery
+        mp4s, mapping, trash_files = archiver.FileDiscovery.discover_files(
+            camera_dir, trash_dir
+        )
+
+        # Verify results
+        assert len(mp4s) == 2
+        assert mp4_file in [mp4[0] for mp4 in mp4s]
+        assert trash_mp4 in [mp4[0] for mp4 in mp4s]
+
+        assert len(trash_files) == 1
+        assert trash_mp4 in trash_files
+
+    def test_parse_timestamp_valid(self):
+        """Test parsing valid timestamps"""
+        timestamp = archiver.FileDiscovery._parse_timestamp(
+            "REO_camera_20230115120000.mp4"
+        )
+        assert timestamp == datetime(2023, 1, 15, 12, 0, 0)
+
+        timestamp = archiver.FileDiscovery._parse_timestamp(
+            "REO_front_20231231235959.JPG"
+        )
+        assert timestamp == datetime(2023, 12, 31, 23, 59, 59)
+
+    def test_parse_timestamp_invalid(self):
+        """Test parsing invalid timestamps"""
+        assert archiver.FileDiscovery._parse_timestamp("invalid_filename.mp4") is None
         assert (
-            len(mp4s) >= 0
-        )  # May have 0 if the error affects all files, but it should continue processing
+            archiver.FileDiscovery._parse_timestamp("REO_camera_2023011512000.mp4")
+            is None
+        )  # Missing digit
+        assert (
+            archiver.FileDiscovery._parse_timestamp("REO_camera_19991231235959.mp4")
+            is None
+        )  # Year too early
+        assert (
+            archiver.FileDiscovery._parse_timestamp("REO_camera_21001231235959.mp4")
+            is None
+        )  # Year too late
 
-    def test_storage_service_check_storage(self, temp_dirs):
-        """Test StorageService check_storage functionality."""
-        config = {
-            "directory": temp_dirs["input_dir"],
-            "output": temp_dirs["output_dir"],
-        }
-        service = StorageService(config)
 
-        # Check storage status
-        status = service.check_storage()
-        assert status["input_dir_exists"] is True
-        assert status["output_dir_exists"] is True
-        assert isinstance(status["input_space"], int)
-        assert isinstance(status["output_space"], int)
+class TestFileManager:
+    """Test the FileManager class"""
 
-    @pytest.mark.parametrize(
-        "test_case",
-        ["ffprobe_not_available", "subprocess_error", "na_result", "empty_result"],
-        ids=["ffprobe_not_available", "subprocess_error", "na_result", "empty_result"],
-    )
-    def test_transcoder_service_get_video_duration(
-        self, mocker, test_case, file_helpers
-    ):
-        """Parametrized test for TranscoderService get_video_duration functionality."""
-        service = TranscoderService({})
+    def test_remove_file_dry_run(self, mocker):
+        """Test file removal in dry run mode"""
+        logger = mocker.MagicMock()
+        file_path = Path("/test/file.mp4")
 
-        # Create a test file
-        test_file = file_helpers["create_file"]("test.mp4")
+        archiver.FileManager.remove_file(file_path, logger, dry_run=True)
 
-        # Apply different mock setups based on the test case
-        if test_case == "ffprobe_not_available":
-            mocker.patch("archiver.shutil.which", return_value=None)
-        elif test_case == "subprocess_error":
-            mocker.patch(
-                "archiver.subprocess.run", side_effect=Exception("Command failed")
-            )
-        elif test_case == "na_result":
-            mocker.patch("archiver.shutil.which", return_value="/usr/bin/ffprobe")
-            mocker.patch(
-                "archiver.subprocess.run",
-                return_value=mocker.Mock(**{"stdout.strip.return_value": "N/A"}),
-            )
-        elif test_case == "empty_result":
-            mocker.patch("archiver.shutil.which", return_value="/usr/bin/ffprobe")
-            mocker.patch(
-                "archiver.subprocess.run",
-                return_value=mocker.Mock(**{"stdout.strip.return_value": ""}),
-            )
+        # Verify logger was called with dry run message
+        logger.info.assert_called_once_with("[DRY RUN] Would remove /test/file.mp4")
 
-        result = service.get_video_duration(test_file)
-        assert result is None  # All scenarios should return None
+    def test_remove_file_actual(self, mocker):
+        """Test actual file removal"""
+        logger = mocker.MagicMock()
+        file_path = Path("/test/file.mp4")
 
-    @pytest.mark.parametrize(
-        "scenario",
-        [
-            "successful_transcode",
-            "ffmpeg_not_found",
-            "popen_error",
-            "stdout_none",
-            "process_timeout",
-            "process_failed",
-            "progress_callback",
-            "graceful_exit_during_transcode",
-            "stdout_types",
-        ],
-    )
-    def test_transcoder_service_transcode_file(
-        self, mocker, scenario, file_helpers, suppress_logging_and_progress
-    ):
-        """Test TranscoderService transcode_file method with various scenarios."""
-        service = TranscoderService({})
+        # Mock the file operations
+        mocker.patch("pathlib.Path.is_file", return_value=True)
+        mock_unlink = mocker.patch("pathlib.Path.unlink")
 
-        # Create test files
-        input_file = file_helpers["create_file"]("input.mp4")
-        output_file = file_helpers["input_dir"].parent / "output.mp4"
+        archiver.FileManager.remove_file(file_path, logger, dry_run=False)
 
-        # Setup logger
-        logger = logging.getLogger("test")
-        logger.setLevel(logging.INFO)
+        # Verify file was unlinked
+        mock_unlink.assert_called_once()
+        logger.info.assert_called_once_with("Removed: /test/file.mp4")
 
-        # Check which scenario is being tested
-        if scenario == "successful_transcode":
-            # Mock successful ffmpeg execution
-            mock_proc = mocker.Mock()
-            mock_proc.stdout = [
-                "frame=1 fps=0.0 q=0.0 size=1024kB time=00:00:00.10 bitrate=83886.1kbits/s dup=0 drop=0 speed=1.23x    \n",
-                "frame=10 fps=5.0 q=0.0 size=2048kB time=00:00:00.50 bitrate=83886.1kbits/s dup=0 drop=0 speed=1.23x    \n",
-                "frame=20 fps=10.0 q=0.0 size=4096kB time=00:00:01.00 bitrate=83886.1kits/s dup=0 drop=0 speed=1.23x    \n",
-            ]
-            mock_proc.wait.return_value = 0
-            mock_popen = mocker.patch(
-                "archiver.subprocess.Popen", return_value=mock_proc
-            )
-            mocker.patch.object(service, "get_video_duration", return_value=10.0)
+    def test_remove_file_with_trash(self, mocker):
+        """Test file removal with trash"""
+        logger = mocker.MagicMock()
+        file_path = Path("/test/file.mp4")
+        trash_root = Path("/trash")
 
-            result = service.transcode_file(input_file, output_file, logger)
-            assert result is True
-            mock_popen.assert_called_once()
+        # Mock the file operations
+        mocker.patch("pathlib.Path.is_file", return_value=True)
+        mocker.patch("pathlib.Path.mkdir")
+        mock_move = mocker.patch("shutil.move")
 
-        elif scenario == "ffmpeg_not_found":
-            # Mock missing ffmpeg
-            _ = mocker.patch("archiver.shutil.which", return_value=None)
-
-            result = service.transcode_file(input_file, output_file, logger)
-            assert result is False
-
-        elif scenario == "popen_error":
-            # Mock Popen raising an OSError
-            mocker.patch(
-                "archiver.subprocess.Popen",
-                side_effect=OSError("Failed to start process"),
-            )
-            result = service.transcode_file(input_file, output_file, logger)
-            assert result is False
-
-        elif scenario == "stdout_none":
-            # Mock process with stdout as None
-            mock_proc = mocker.Mock()
-            mock_proc.stdout = None
-            mock_proc.wait.return_value = 0
-            mocker.patch("archiver.subprocess.Popen", return_value=mock_proc)
-            result = service.transcode_file(input_file, output_file, logger)
-            assert result is False
-
-        elif scenario == "process_timeout":
-            # Mock process that times out during cleanup
-            mock_proc = mocker.Mock()
-            mock_proc.stdout = [
-                "frame=1 fps=0.0 q=0.0 size=1024kB time=00:00:00.10 bitrate=83886.1kbits/s\n"
-            ]
-            mock_proc.stdout = [
-                "frame=1 fps=0.0 q=0.0 size=1024kB time=00:00:00.10 bitrate=83886.1kbits/s\\n"
-            ]
-            mock_proc.wait.return_value = 0  # Normal exit for main process
-
-            # For cleanup timeout, proc.wait(timeout=0.1) should raise TimeoutExpired
-            def side_effect_for_timeout(timeout_val=None):
-                if timeout_val is not None and timeout_val == 0.1:
-                    from subprocess import TimeoutExpired
-
-                    raise TimeoutExpired(cmd="cmd", timeout=0.1)
-                return 0  # Normal return for the main call
-
-            mock_proc.wait.side_effect = side_effect_for_timeout
-            mock_proc.terminate = mocker.Mock()
-            mock_proc.kill = mocker.Mock()
-            mocker.patch("archiver.subprocess.Popen", return_value=mock_proc)
-            mocker.patch.object(service, "get_video_duration", return_value=10.0)
-
-            result = service.transcode_file(input_file, output_file, logger)
-            # Should still return True since the main process succeeded
-            # The timeout happens only in cleanup, which is handled
-            assert result is True
-
-            mock_proc.kill = mocker.Mock()
-            mocker.patch("archiver.subprocess.Popen", return_value=mock_proc)
-            mocker.patch.object(service, "get_video_duration", return_value=10.0)
-
-            result = service.transcode_file(input_file, output_file, logger)
-            # Should still return True since the main process succeeded
-            # The timeout happens only in cleanup, which is handled
-            assert result is True
-            assert result in [True, False]  # Could be either depending on exit code
-
-        elif scenario == "process_failed":
-            # Mock process that exits with non-zero code
-            mock_proc = mocker.Mock()
-            mock_proc.stdout = [
-                "frame=1 fps=0.0 q=0.0 size=1024kB time=00:00:00.10 bitrate=83886.1kbits/s\n"
-            ]
-            mock_proc.wait.return_value = 1  # Failure exit code
-            mocker.patch("archiver.subprocess.Popen", return_value=mock_proc)
-            mocker.patch.object(service, "get_video_duration", return_value=10.0)
-
-            result = service.transcode_file(input_file, output_file, logger)
-            assert result is False
-
-        elif scenario == "progress_callback":
-            # Test with progress callback
-            progress_updates = []
-
-            def progress_cb(pct):
-                progress_updates.append(pct)
-
-            mock_proc = mocker.Mock()
-            mock_proc.stdout = [
-                "frame=10 fps=5.0 q=0.0 size=2048kB time=00:00:00.50 bitrate=83886.1kbits/s\n"
-            ]
-            mock_proc.wait.return_value = 0
-            mocker.patch("archiver.subprocess.Popen", return_value=mock_proc)
-            mocker.patch.object(service, "get_video_duration", return_value=1.0)
-
-            result = service.transcode_file(
-                input_file, output_file, logger, progress_cb=progress_cb
-            )
-            assert result is True
-            assert len(progress_updates) > 0  # Should have received progress updates
-
-        elif scenario == "graceful_exit_during_transcode":
-            # Test graceful exit during transcoding
-            graceful_exit = GracefulExit()
-            graceful_exit.request_exit()  # Request exit immediately
-
-            mock_proc = mocker.Mock()
-            mock_proc.stdout = [
-                "frame=1 fps=0.0 q=0.0 size=1024kB time=00:00:00.10 bitrate=83886.1kbits/s\n"
-            ]
-            mock_proc.wait.return_value = 0
-            mock_proc.terminate = mocker.Mock()
-            mocker.patch("archiver.subprocess.Popen", return_value=mock_proc)
-            mocker.patch.object(service, "get_video_duration", return_value=10.0)
-
-            result = service.transcode_file(
-                input_file, output_file, logger, graceful_exit=graceful_exit
-            )
-            assert result is False  # Should return False due to graceful exit
-
-        elif scenario == "stdout_types":
-            # Test handling different stdout types
-            mock_proc = mocker.Mock()
-            # Mock as an iterable instead of readline
-            mock_proc.stdout = ["line1\n", "line2\n"]
-            mock_proc.wait.return_value = 0
-            mocker.patch("archiver.subprocess.Popen", return_value=mock_proc)
-            mocker.patch.object(service, "get_video_duration", return_value=10.0)
-
-            result = service.transcode_file(input_file, output_file, logger)
-            assert result is True
-
-    def test_transcoder_service_transcode_file_unsupported_stdout_type(
-        self, mocker, file_helpers, suppress_logging_and_progress
-    ):
-        """Test transcode_file with unsupported stdout type."""
-        service = TranscoderService({})
-
-        input_file = file_helpers["create_file"]("input.mp4")
-        output_file = file_helpers["input_dir"].parent / "output.mp4"
-
-        logger = logging.getLogger("test")
-        logger.setLevel(logging.INFO)
-
-        # Mock process with unsupported stdout type
-        mock_proc = mocker.Mock()
-        mock_proc.stdout = "not_a_file_or_iterable"  # Unsupported type
-        mock_proc.terminate = mocker.Mock()
-        mock_proc.wait.return_value = 0
-        mocker.patch("archiver.subprocess.Popen", return_value=mock_proc)
-        mocker.patch.object(service, "get_video_duration", return_value=10.0)
-
-        result = service.transcode_file(input_file, output_file, logger)
-        # The function should handle the unsupported stdout type, but it might still return True
-        # depending on how far it gets before the error. Let's check the actual behavior in archiver.py
-        # Based on the test failure, it seems to return True, which might be unexpected but is the current behavior
-        assert result in [True, False]  # Could be either depending on implementation
-
-    def test_file_service_operations(self, file_helpers, suppress_logging_and_progress):
-        """Test FileService operations with different configurations."""
-        # Test remove_file in dry run mode
-        config = {
-            "dry_run": True,
-            "use_trash": True,
-            "trash_root": file_helpers["trash_dir"],
-        }
-        service = FileService(config)
-
-        # Create a test file
-        test_file = file_helpers["create_file"]("test_file.mp4")
-        assert test_file.exists()
-
-        # Setup logger
-        logger = logging.getLogger("test")
-        logger.setLevel(logging.INFO)
-
-        # Remove file in dry run mode
-        service.remove_file(test_file, logger, dry_run=True)
-        # File should still exist in dry run mode
-        assert test_file.exists()
-
-        # Test remove_file with trash
-        service.remove_file(test_file, logger, dry_run=False, use_trash=True)
-        # File should be moved to trash
-        assert not test_file.exists()
-        assert any(
-            test_file.name in f.name for f in file_helpers["trash_dir"].rglob("*")
+        archiver.FileManager.remove_file(
+            file_path, logger, dry_run=False, use_trash=True, trash_root=trash_root
         )
 
-        # Test remove_directory
-        test_dir = file_helpers["input_dir"] / "test_dir"
-        test_dir.mkdir(parents=True, exist_ok=True)
-        assert test_dir.exists()
+        # Verify file was moved to trash
+        mock_move.assert_called_once()
+        logger.info.assert_called_once()
+        assert "Moved to trash" in logger.info.call_args[0][0]
 
-        config = {"dry_run": False, "use_trash": False}
-        service = FileService(config)
-        service.remove_file(test_dir, logger, dry_run=False)
-        # Directory should be removed
-        assert not test_dir.exists()
+    def test_calculate_trash_destination(self, tmp_path):
+        """Test calculating trash destination path"""
+        file_path = tmp_path / "camera" / "2023" / "01" / "15" / "file.mp4"
+        source_root = tmp_path / "camera"
+        trash_root = tmp_path / "trash"
 
-    def test_file_service_remove_with_errors(
-        self, mocker, file_helpers, suppress_logging_and_progress
-    ):
-        """Test FileService remove_file with error scenarios."""
-        config = {
-            "use_trash": False,
-        }
-        service = FileService(config)
-
-        # Create a test file
-        test_file = file_helpers["create_file"]("test_error_file.mp4")
-        assert test_file.exists()
-
-        # Setup logger
-        logger = logging.getLogger("test")
-        logger.setLevel(logging.INFO)
-        # Capture log messages
-        log_stream = io.StringIO()
-        handler = logging.StreamHandler(log_stream)
-        logger.addHandler(handler)
-
-        # Mock the Path.unlink method to raise an exception
-        mocker.patch.object(
-            Path, "unlink", side_effect=PermissionError("Permission denied")
+        dest = archiver.FileManager._calculate_trash_destination(
+            file_path, source_root, trash_root, is_output=False
         )
 
-        # Try to remove file which should fail
-        service.remove_file(test_file, logger, dry_run=False)
+        assert dest == trash_root / "input" / "2023" / "01" / "15" / "file.mp4"
 
-        # Check that an error was logged
-        log_output = log_stream.getvalue()
-        assert "Failed to remove" in log_output
+    def test_calculate_trash_destination_with_conflict(self, tmp_path, mocker):
+        """Test calculating trash destination with existing file"""
+        file_path = tmp_path / "camera" / "2023" / "01" / "15" / "file.mp4"
+        source_root = tmp_path / "camera"
+        trash_root = tmp_path / "trash"
 
-    def test_file_service_calculate_trash_destination_conflicts(self, file_helpers):
-        """Test FileService _calculate_trash_destination with filename conflicts."""
-        config = {}
-        service = FileService(config)
+        # Mock exists to return True for the base destination
+        def mock_exists(self):
+            return self == trash_root / "input" / "2023" / "01" / "15" / "file.mp4"
 
-        # Create original file
-        original_file = file_helpers["create_file"]("conflict_test.mp4")
+        mocker.patch("pathlib.Path.exists", mock_exists)
+        mocker.patch("time.time", return_value=1000.0)
 
-        # Create a file that would conflict in trash using the same name pattern
-        trash_dir = file_helpers["trash_dir"]
-        # First create a file with the expected destination name to cause conflict
-        expected_dest = trash_dir / "input" / original_file.name
-        expected_dest.parent.mkdir(parents=True, exist_ok=True)
-        expected_dest.write_text("existing file")
-
-        # Calculate trash destination
-        dest = service._calculate_trash_destination(
-            original_file, file_helpers["input_dir"], trash_dir, is_output=False
+        dest = archiver.FileManager._calculate_trash_destination(
+            file_path, source_root, trash_root, is_output=False
         )
 
-        # Should have a different name due to conflict
-        assert dest != expected_dest
-        # Should have a suffix added for conflict resolution
-        assert "_1" in str(dest) or str(int(time.time())) in str(dest)
-
-    def test_logging_service_setup_logging(
-        self, temp_dirs, suppress_logging_and_progress
-    ):
-        """Test LoggingService setup_logging functionality."""
-        config = {"log_file": temp_dirs["temp_dir"] / "test.log"}
-        service = LoggingService(config)
-
-        # Setup logging with progress bar
-        progress_bar = ProgressReporter(total_files=1, silent=True)
-        logger = service.setup_logging(progress_bar)
-
-        assert logger is not None
-        assert logger.name == "camera_archiver"
-
-        # Test logging works
-        logger.info("Test message")
-
-        # Check log file was created
-        log_file = temp_dirs["temp_dir"] / "test.log"
-        assert log_file.exists()
-
-
-class TestProgressReporterComprehensive:
-    """Comprehensive tests for ProgressReporter functionality."""
-
-    @pytest.mark.parametrize("is_tty", [True, False])
-    def test_progress_reporter_tty_detection(self, is_tty):
-        """Test TTY detection in ProgressReporter."""
-        stream = io.StringIO()
-        stream.isatty = lambda: is_tty
-
-        with ProgressReporter(total_files=1, out=stream) as pr:
-            assert pr._is_tty() is is_tty
-
-    def test_progress_reporter_format_line(self):
-        """Test the _format_line method."""
-        pr = ProgressReporter(total_files=2, silent=True)
-        line = pr._format_line(1, 50.0)
-
-        # Check that the line contains expected elements
-        assert "50%" in line
-        assert "[" in line and "]" in line
-        assert "00:00" in line  # elapsed time
-
-        pr.finish()
-
-    def test_progress_reporter_non_tty_output(self, mocker):
-        """Test ProgressReporter non-TTY output functionality."""
-        # Test with non-TTY stream that updates periodically
-        non_tty_stream = io.StringIO()
-        non_tty_stream.isatty = lambda: False
-
-        with ProgressReporter(total_files=1, out=non_tty_stream, silent=False) as pr:
-            # Update progress to match total (which results in 100%)
-            pr.update_progress(1, 100.0)
-            pr.finish()
-
-            # Check output
-            output = non_tty_stream.getvalue()
-            # Should have written something to the stream because it's 100% and it's not TTY
-            assert output != ""
-
-    def test_progress_reporter_display_exception(self):
-        """Test ProgressReporter _display method when stream operations fail."""
-
-        # Create a stream that will raise an exception
-        class FailingStream:
-            def __init__(self, is_tty=True):
-                self.isatty_val = is_tty
-                self.closed = False
-
-            def isatty(self):
-                return self.isatty_val
-
-            def write(self, data):
-                raise Exception("Write failed")
-
-            def flush(self):
-                pass
-
-        # Test with TTY stream
-        failing_stream = FailingStream(is_tty=True)
-        with ProgressReporter(total_files=5, out=failing_stream) as pr:
-            # Should handle the exception gracefully
-            pr._display("test line")
-
-        # Test with non-TTY stream
-        failing_stream2 = FailingStream(is_tty=False)
-        with ProgressReporter(total_files=5, out=failing_stream2) as pr:
-            # Should handle the exception gracefully
-            pr.silent = False
-            pr._display("test line")
-
-    def test_progress_reporter_signal_handling(self, mocker):
-        """Test ProgressReporter signal handling functionality."""
-        # Mock signal handling functions to test the registration
-        mock_signal = mocker.patch("archiver.signal.signal")
-        mocker.patch("archiver.signal.getsignal", return_value=mocker.Mock())
-        mock_atexit_register = mocker.patch("archiver.atexit.register")
-
-        # Create a ProgressReporter and check signal handlers are registered
-        with ProgressReporter(total_files=1, silent=True) as _:
-            # Check that atexit handler was registered
-            assert mock_atexit_register.called
-
-            # Check that signal handlers were registered for expected signals
-            expected_signals = [signal.SIGINT, signal.SIGTERM, signal.SIGHUP]
-            for expected_sig in expected_signals:
-                # Check that signal.signal was called for each signal
-                calls = [
-                    call
-                    for call in mock_signal.call_args_list
-                    if call[0][0] == expected_sig
-                ]
-                assert len(calls) > 0, (
-                    f"Signal handler not registered for {expected_sig}"
-                )
-
-    def test_progress_reporter_signal_handler_execution(self, mocker):
-        """Test ProgressReporter signal handler execution."""
-        stream = io.StringIO()
-        pr = ProgressReporter(total_files=5, out=stream, silent=False)
-
-        # Create a mock frame object
-        mock_frame = mocker.Mock()
-
-        # Manually call the signal handler to test it
-        pr._signal_handler(signal.SIGINT, mock_frame)
-
-        # Check that exit was requested
-        assert pr.graceful_exit.should_exit()
-
-        # Clean up
-        pr.finish()
-
-    def test_progress_reporter_cleanup_handlers(self, mocker):
-        """Test ProgressReporter cleanup handler registration and unregistration."""
-        # Mock the functions that are used in cleanup
-        mock_atexit_unregister = mocker.patch("archiver.atexit.unregister")
-        mocker.patch("archiver.signal.signal")
-        mocker.patch("archiver.signal.getsignal", return_value=signal.SIG_DFL)
-
-        # Create and finish a ProgressReporter to test cleanup
-        pr = ProgressReporter(total_files=1, silent=True)
-        pr.finish()  # Explicitly finish to trigger cleanup
-
-        # Check that cleanup functions were called
-        assert mock_atexit_unregister.called
-
-    def test_progress_reporter_has_progress_property(self):
-        """Test ProgressReporter's has_progress property."""
-        pr = ProgressReporter(
-            total_files=1, silent=False
-        )  # Make sure it's not silent to allow progress updates
-
-        # Initially should not have progress
-        assert not pr.has_progress
-
-        # Update progress
-        pr.update_progress(1, 50.0)
-
-        # Should now have progress
-        assert pr.has_progress
-
-        pr.finish()
-
-    def test_progress_reporter_with_none_stream(self):
-        """Test ProgressReporter with None output stream."""
-        pr = ProgressReporter(total_files=1, out=None, silent=False)
-
-        # Should handle None stream gracefully
-        pr.update_progress(1, 50.0)
-        assert pr.silent  # Should be silent with None stream
-
-        pr.finish()
-
-    def test_progress_reporter_with_logging_integration(self):
-        """Test ProgressReporter integration with logging system."""
-        # Create a stream for capturing output
-        stream = io.StringIO()
-        stream.isatty = lambda: True
-
-        # Create a logger with GuardedStreamHandler
-        logger = logging.getLogger("test_integration")
-        logger.setLevel(logging.INFO)
-
-        # Create a ProgressReporter
-        pr = ProgressReporter(total_files=1, out=stream, silent=False)
-        orchestrator = ConsoleOrchestrator()
-
-        # Create a GuardedStreamHandler with the progress reporter
-        handler = GuardedStreamHandler(orchestrator, stream=stream, progress_bar=pr)
-        handler.setFormatter(logging.Formatter("%(levelname)s - %(message)s"))
-        logger.addHandler(handler)
-
-        # Update progress to create a progress line
-        pr.update_progress(1, 50.0)
-
-        # Log a message
-        logger.info("Test message during progress")
-
-        # The progress line should be redrawn after the log message
-        assert "50%" in stream.getvalue()
-        assert "Test message during progress" in stream.getvalue()
-
-        # Clean up
-        pr.finish()
-        logger.removeHandler(handler)
-
-    def test_progress_reporter_thread_safety(self):
-        """Test ProgressReporter thread safety with concurrent updates."""
-        stream = io.StringIO()
-        stream.isatty = lambda: True
-
-        with ProgressReporter(total_files=10, out=stream, silent=False) as pr:
-            # Function to update progress from a thread
-            def update_progress(idx, pct):
-                pr.update_progress(idx, pct)
-                time.sleep(0.01)  # Small delay to increase chance of race conditions
-
-            # Create multiple threads to update progress concurrently
-            threads = []
-            for i in range(1, 11):
-                thread = threading.Thread(target=update_progress, args=(i, i * 10))
-                threads.append(thread)
-                thread.start()
-
-            # Wait for all threads to complete
-            for thread in threads:
-                thread.join()
-
-            # Check that all progress updates were captured
-            output = stream.getvalue()
-            for i in range(1, 11):
-                assert f"{i * 10}%" in output or f"[{i}/10]" in output
-
-    def test_progress_reporter_with_graceful_exit(self):
-        """Test ProgressReporter behavior with graceful exit."""
-        stream = io.StringIO()
-        stream.isatty = lambda: True
-
-        graceful_exit = GracefulExit()
-
-        with ProgressReporter(
-            total_files=5, out=stream, silent=False, graceful_exit=graceful_exit
-        ) as pr:
-            # Update progress normally
-            pr.update_progress(1, 20.0)
-            assert "20%" in stream.getvalue()
-
-            # Request graceful exit
-            graceful_exit.request_exit()
-
-            # Try to update progress again - should be ignored
-            pr.update_progress(2, 40.0)
-
-            # The progress should not have updated to 40%
-            assert "40%" not in stream.getvalue()
-
-
-class TestStateHandlers:
-    """Test state handler classes with parameterization."""
-
-    def test_initialization_handler(self, temp_dirs, suppress_logging_and_progress):
-        """Test InitializationHandler functionality."""
-        config = {
-            "directory": temp_dirs["input_dir"],
-            "output": temp_dirs["output_dir"],
-            "dry_run": True,
-        }
-        context = Context(config)
-
-        handler = InitializationHandler()
-        next_state = handler.execute(context)
-
-        # Should transition to DISCOVERY
-        assert next_state == State.DISCOVERY
-        assert context.logger is not None
-        # InitializationHandler sets up logging but does not initialize progress bar
-        # (progress bar is initialized later in ExecutionHandler)
-        assert context.progress_bar is None
-
-    def test_initialization_handler_directory_missing(
-        self, temp_dirs, suppress_logging_and_progress
-    ):
-        """Test InitializationHandler when input directory doesn't exist."""
-        config = {
-            "directory": Path("/nonexistent/directory"),
-            "output": temp_dirs["output_dir"],
-        }
-        context = Context(config)
-
-        handler = InitializationHandler()
-        next_state = handler.execute(context)
-
-        # Should transition to TERMINATION due to missing directory
-        assert next_state == State.TERMINATION
-
-    def test_discovery_handler(self, file_helpers, suppress_logging_and_progress):
-        """Test DiscoveryHandler functionality."""
-        # Create test files first
-        old_ts = (datetime.now() - timedelta(days=31)).replace(microsecond=0)
-        mp4_file = file_helpers["create_file"]("2023/01/01/test.mp4", ts=old_ts)
-        jpg_file = file_helpers["create_file"]("2023/01/01/test.jpg", ts=old_ts)
-
-        config = {
-            "directory": file_helpers["input_dir"],
-            "output": file_helpers["output_dir"],
-        }
-        context = Context(config)
-
-        # Need to setup logging first
-        logging_service = LoggingService(config)
-        context.logger = logging_service.setup_logging()
-
-        handler = DiscoveryHandler()
-        next_state = handler.execute(context)
-
-        # Should transition to PLANNING
-        assert next_state == State.PLANNING
-
-        # Should have discovered the files
-        assert "mp4s" in context.state_data
-        assert len(context.state_data["mp4s"]) == 1
-        assert context.state_data["mp4s"][0][0] == mp4_file
-        assert context.state_data["mp4s"][0][1] == old_ts
-
-        # Mapping should contain both mp4 and jpg files
-        key = old_ts.strftime("%Y%m%d%H%M%S")
-        assert key in context.state_data["mapping"]
-        assert ".mp4" in context.state_data["mapping"][key]
-        assert ".jpg" in context.state_data["mapping"][key]
-        assert context.state_data["mapping"][key][".mp4"] == mp4_file
-        assert context.state_data["mapping"][key][".jpg"] == jpg_file
-
-    def test_discovery_handler_invalid_directory_config(
-        self, temp_dirs, suppress_logging_and_progress
-    ):
-        """Test DiscoveryHandler with invalid directory configuration."""
-        config = {
-            "directory": "not_a_path_object",  # Invalid - not a Path object
-            "output": temp_dirs["output_dir"],
-        }
-        context = Context(config)
-
-        # Setup logging
-        logging_service = LoggingService(config)
-        context.logger = logging_service.setup_logging()
-
-        handler = DiscoveryHandler()
-        next_state = handler.execute(context)
-
-        # Should transition to TERMINATION due to invalid directory config
-        assert next_state == State.TERMINATION
-
-    def test_planning_handler(
-        self, file_helpers, suppress_logging_and_progress, mocker
-    ):
-        """Test PlanningHandler functionality."""
-        config = {
-            "directory": file_helpers["input_dir"],
-            "output": file_helpers["output_dir"],
-            "no_confirm": True,  # Skip confirmation
-        }
-        context = Context(config)
-
-        # Setup logging
-        logging_service = LoggingService(config)
-        context.logger = logging_service.setup_logging()
-
-        # Setup test data
-        old_ts = datetime.now() - timedelta(days=31)
-        mp4_file = file_helpers["create_file"]("2023/01/01/test.mp4", ts=old_ts)
-
-        context.state_data["mp4s"] = [(mp4_file, old_ts)]
-        context.state_data["mapping"] = {
-            old_ts.strftime("%Y%m%d%H%M%S"): {".mp4": mp4_file}
-        }
-        context.state_data["trash_files"] = set()
-
-        handler = PlanningHandler()
-        next_state = handler.execute(context)
-
-        # Should transition to EXECUTION
-        assert next_state == State.EXECUTION
-        assert "plan" in context.state_data
-
-    def test_planning_handler_with_cleanup_and_no_transcoding(
-        self, file_helpers, suppress_logging_and_progress
-    ):
-        """Test PlanningHandler when cleanup is enabled but no transcoding is needed."""
-        config = {
-            "directory": file_helpers["input_dir"],
-            "output": file_helpers["output_dir"],
-            "cleanup": True,  # Enable cleanup
-            "no_confirm": True,  # Skip confirmation
-        }
-        context = Context(config)
-
-        # Setup logging
-        logging_service = LoggingService(config)
-        context.logger = logging_service.setup_logging()
-
-        # Setup test data with no MP4s to transcode
-        context.state_data["mp4s"] = []
-        context.state_data["mapping"] = {}
-        context.state_data["trash_files"] = set()
-
-        handler = PlanningHandler()
-        next_state = handler.execute(context)
-
-        # Should transition directly to ARCHIVE_CLEANUP since no transcoding is needed
-        assert next_state == State.ARCHIVE_CLEANUP
-        assert "plan" in context.state_data
-        # Plan should have empty transcoding list
-        assert len(context.state_data["plan"]["transcoding"]) == 0
-
-    def test_planning_handler_with_user_confirmation(
-        self, mocker, file_helpers, suppress_logging_and_progress
-    ):
-        """Test PlanningHandler with user confirmation workflow."""
-        # Mock input to simulate user saying 'yes'
-        mocker.patch("builtins.input", return_value="yes")
-
-        config = {
-            "directory": file_helpers["input_dir"],
-            "output": file_helpers["output_dir"],
-            "no_confirm": False,  # Don't skip confirmation
-        }
-        context = Context(config)
-
-        # Setup logging
-        logging_service = LoggingService(config)
-        context.logger = logging_service.setup_logging()
-
-        # Setup test data
-        old_ts = datetime.now() - timedelta(days=31)
-        mp4_file = file_helpers["create_file"]("2023/01/01/test.mp4", ts=old_ts)
-
-        context.state_data["mp4s"] = [(mp4_file, old_ts)]
-        context.state_data["mapping"] = {
-            old_ts.strftime("%Y%m%d%H%M%S"): {".mp4": mp4_file}
-        }
-        context.state_data["trash_files"] = set()
-
-        handler = PlanningHandler()
-        next_state = handler.execute(context)
-
-        # Should transition to EXECUTION after confirmation
-        assert next_state == State.EXECUTION
-
-    def test_planning_handler_with_user_cancel(
-        self, mocker, file_helpers, suppress_logging_and_progress
-    ):
-        """Test PlanningHandler when user cancels confirmation."""
-        # Mock input to simulate user saying 'no'
-        mocker.patch("builtins.input", return_value="no")
-
-        config = {
-            "directory": file_helpers["input_dir"],
-            "output": file_helpers["output_dir"],
-            "no_confirm": False,  # Don't skip confirmation
-        }
-        context = Context(config)
-
-        # Setup logging
-        logging_service = LoggingService(config)
-        context.logger = logging_service.setup_logging()
-
-        # Setup test data
-        old_ts = datetime.now() - timedelta(days=31)
-        mp4_file = file_helpers["create_file"]("2023/01/01/test.mp4", ts=old_ts)
-
-        context.state_data["mp4s"] = [(mp4_file, old_ts)]
-        context.state_data["mapping"] = {
-            old_ts.strftime("%Y%m%d%H%M%S"): {".mp4": mp4_file}
-        }
-        context.state_data["trash_files"] = set()
-
-        handler = PlanningHandler()
-        next_state = handler.execute(context)
-
-        # Should transition to TERMINATION after user cancels
-        assert next_state == State.TERMINATION
-
-    def test_planning_handler_with_skip_logic(
-        self, file_helpers, suppress_logging_and_progress
-    ):
-        """Test PlanningHandler with skip logic when archive exists."""
-        config = {
-            "directory": file_helpers["input_dir"],
-            "output": file_helpers["output_dir"],
-            "no_confirm": True,  # Skip confirmation
-            "no_skip": False,  # Use skip logic
-        }
-        context = Context(config)
-
-        # Setup logging
-        logging_service = LoggingService(config)
-        context.logger = logging_service.setup_logging()
-
-        # Setup test data
-        old_ts = datetime.now() - timedelta(days=31)
-        mp4_file = file_helpers["create_file"]("2023/01/01/test.mp4", ts=old_ts)
-
-        # Create an archive that already exists and is larger than MIN_ARCHIVE_SIZE_BYTES
-        existing_archive = (
-            file_helpers["output_dir"]
-            / f"archived-{old_ts.strftime('%Y%m%d%H%M%S')}.mp4"
-        )
-        existing_archive.parent.mkdir(parents=True, exist_ok=True)
-        existing_archive.write_bytes(
-            b"x" * (MIN_ARCHIVE_SIZE_BYTES + 1)
-        )  # Larger than threshold
-
-        context.state_data["mp4s"] = [(mp4_file, old_ts)]
-        context.state_data["mapping"] = {
-            old_ts.strftime("%Y%m%d%H%M%S"): {".mp4": mp4_file}
-        }
-        context.state_data["trash_files"] = set()
-
-        handler = PlanningHandler()
-        next_state = handler.execute(context)
-
-        # Should transition to EXECUTION, but plan should only have removal actions (skip transcoding)
-        assert next_state == State.EXECUTION
-        assert "plan" in context.state_data
-        _ = context.state_data["plan"]
-        # Transcoding should be skipped, but source removal should still happen
-        # This depends on the specific implementation logic
-
-    def test_planning_handler_with_no_skip_option(
-        self, file_helpers, suppress_logging_and_progress
-    ):
-        """Test PlanningHandler with no_skip option."""
-        config = {
-            "directory": file_helpers["input_dir"],
-            "output": file_helpers["output_dir"],
-            "no_confirm": True,  # Skip confirmation
-            "no_skip": True,  # Don't skip even if archive exists
-        }
-        context = Context(config)
-
-        # Setup logging
-        logging_service = LoggingService(config)
-        context.logger = logging_service.setup_logging()
-
-        # Setup test data
-        old_ts = datetime.now() - timedelta(days=31)
-        mp4_file = file_helpers["create_file"]("2023/01/01/test.mp4", ts=old_ts)
-
-        # Create an archive that already exists and is larger than MIN_ARCHIVE_SIZE_BYTES
-        existing_archive = (
-            file_helpers["output_dir"]
-            / f"archived-{old_ts.strftime('%Y%m%d%H%M%S')}.mp4"
-        )
-        existing_archive.parent.mkdir(parents=True, exist_ok=True)
-        existing_archive.write_bytes(
-            b"x" * (MIN_ARCHIVE_SIZE_BYTES + 1)
-        )  # Larger than threshold
-
-        context.state_data["mp4s"] = [(mp4_file, old_ts)]
-        context.state_data["mapping"] = {
-            old_ts.strftime("%Y%m%d%H%M%S"): {".mp4": mp4_file}
-        }
-        context.state_data["trash_files"] = set()
-
-        handler = PlanningHandler()
-        next_state = handler.execute(context)
-
-        # Should transition to EXECUTION
-        assert next_state == State.EXECUTION
-        # Plan should include transcoding since no_skip is True
-        assert len(context.state_data["plan"]["transcoding"]) > 0
-
-    def test_planning_handler_source_removal_after_transcode(
-        self, file_helpers, suppress_logging_and_progress
-    ):
-        """Test PlanningHandler adds source MP4 files to removal actions after transcoding."""
-        config = {
-            "directory": file_helpers["input_dir"],
-            "output": file_helpers["output_dir"],
-            "no_confirm": True,  # Skip confirmation
-            "no_skip": False,  # Use skip logic (default)
-        }
-        context = Context(config)
-
-        # Setup logging
-        logging_service = LoggingService(config)
-        context.logger = logging_service.setup_logging()
-
-        # Setup test data with a file that requires transcoding (no existing archive)
-        old_ts = datetime.now() - timedelta(days=31)
-        mp4_file = file_helpers["create_file"]("2023/01/01/test.mp4", ts=old_ts)
-        jpg_file = file_helpers["create_file"]("2023/01/01/test.jpg", ts=old_ts)
-
-        context.state_data["mp4s"] = [(mp4_file, old_ts)]
-        context.state_data["mapping"] = {
-            old_ts.strftime("%Y%m%d%H%M%S"): {".mp4": mp4_file, ".jpg": jpg_file}
-        }
-        context.state_data["trash_files"] = set()
-
-        handler = PlanningHandler()
-        next_state = handler.execute(context)
-
-        # Should transition to EXECUTION
-        assert next_state == State.EXECUTION
-
-        # Check that the plan includes both transcoding and removal actions
-        plan = context.state_data["plan"]
-        assert len(plan["transcoding"]) == 1
-        assert len(plan["removals"]) == 2  # Source MP4 + paired JPG
-
-        # Verify that the source MP4 is in removal actions after transcoding
-        removal_files = [action["file"] for action in plan["removals"]]
-        assert mp4_file in removal_files
-        assert jpg_file in removal_files
-
-        # Verify the source MP4 removal action type
-        mp4_removal_action = next(
-            (action for action in plan["removals"] if action["file"] == mp4_file), None
-        )
-        assert mp4_removal_action is not None
-        assert mp4_removal_action["type"] == "source_removal_after_transcode"
-
-    @pytest.mark.parametrize(
-        "test_file_path,expected_path",
-        [
-            # Test with date structure in path - output uses timestamp, not input path
-            (
-                Path("/camera/2023/01/15/test.mp4"),
-                Path("/output/2023/06/15/archived-20230615123045.mp4"),  # ← FIXED
-            ),
-            # Test without date structure in path - output uses timestamp
-            (
-                Path("/camera/plain_dir/test.mp4"),
-                Path("/output/2023/06/15/archived-20230615123045.mp4"),
-            ),
-        ],
-    )
-    def test_planning_handler_output_path(self, test_file_path, expected_path, mocker):
-        """Test PlanningHandler's _output_path with different path structures."""
-        config = {
-            "directory": Path("/camera"),
-            "output": Path("/output"),
-        }
-        context = Context(config)
-
-        handler = PlanningHandler()
-        timestamp = datetime(2023, 6, 15, 12, 30, 45)
-
-        # Mock the input_dir to match our test case
-        mocker.patch.object(
-            context, "config", {"directory": Path("/camera"), "output": Path("/output")}
-        )
-        result = handler._output_path(context, test_file_path, timestamp)
-        assert result == expected_path
-
-    def test_planning_handler_output_path_invalid_config(self, temp_dirs):
-        """Test PlanningHandler's _output_path with invalid output config."""
-        config = {
-            "directory": temp_dirs["input_dir"],
-            "output": "not_a_path_object",  # Invalid - not a Path object
-        }
-        context = Context(config)
-
-        handler = PlanningHandler()
-
-        # Should raise ValueError for invalid output directory config
-        with pytest.raises(
-            ValueError, match="Output directory is not properly configured"
-        ):
-            handler._output_path(
-                context, temp_dirs["input_dir"] / "test.mp4", datetime.now()
-            )
-
-    def test_execution_handler(self, file_helpers, suppress_logging_and_progress):
-        """Test ExecutionHandler functionality."""
-        config = {
-            "directory": file_helpers["input_dir"],
-            "output": file_helpers["output_dir"],
-            "dry_run": True,  # Don't actually transcode
-        }
-        context = Context(config)
-
-        # Setup logging
-        logging_service = LoggingService(config)
-        context.logger = logging_service.setup_logging()
-
-        # Setup test data
-        old_ts = datetime.now() - timedelta(days=31)
-        mp4_file = file_helpers["create_file"]("2023/01/01/test.mp4", ts=old_ts)
-
-        # Create a plan with a transcoding action
-        plan = {
-            "transcoding": [
-                {
-                    "type": "transcode",
-                    "input": mp4_file,
-                    "output": file_helpers["output_dir"]
-                    / f"archived-{old_ts.strftime('%Y%m%d%H%M%S')}.mp4",
-                    "jpg_to_remove": None,
-                }
+        # Verify timestamp and counter were added
+        assert "1000_1" in dest.name
+        assert dest.suffix == ".mp4"
+
+    def test_clean_empty_directories(self, mocker):
+        """Test cleaning empty directories"""
+        logger = mocker.MagicMock()
+        directory = Path("/test")
+
+        # Mock os.walk to return empty directories
+        mocker.patch(
+            "os.walk",
+            return_value=[
+                ("/test/2023/01/15", [], []),
+                ("/test/2023/01", [], []),
+                ("/test/2023", [], []),
+                ("/test", ["2023"], []),
             ],
-            "removals": [],
+        )
+
+        # Mock Path operations
+        mock_rmdir = mocker.patch("pathlib.Path.rmdir")
+        mocker.patch("pathlib.Path.iterdir", return_value=[])
+
+        archiver.FileManager.clean_empty_directories(directory, logger)
+
+        # Verify rmdir was called for empty directories
+        assert mock_rmdir.call_count == 3
+        logger.info.assert_called()
+
+
+class TestTranscoder:
+    """Test the Transcoder class"""
+
+    def test_get_video_duration(self, mocker):
+        """Test getting video duration with ffprobe"""
+        file_path = Path("/test/video.mp4")
+
+        # Mock shutil.which to return ffprobe path
+        mocker.patch("shutil.which", return_value="/usr/bin/ffprobe")
+
+        # Mock subprocess.run
+        mock_run = mocker.patch("subprocess.run")
+        mock_run.return_value.stdout = "120.5"
+
+        duration = archiver.Transcoder.get_video_duration(file_path)
+
+        assert duration == 120.5
+        mock_run.assert_called_once()
+
+    def test_get_video_duration_no_ffprobe(self, mocker):
+        """Test getting video duration when ffprobe is not available"""
+        file_path = Path("/test/video.mp4")
+
+        # Mock shutil.which to return None
+        mocker.patch("shutil.which", return_value=None)
+
+        duration = archiver.Transcoder.get_video_duration(file_path)
+
+        assert duration is None
+
+    def test_transcode_file_success(self, mocker):
+        """Test successful file transcoding"""
+        input_path = Path("/test/input.mp4")
+        output_path = Path("/test/output.mp4")
+        logger = mocker.MagicMock()
+        graceful_exit = archiver.GracefulExit()
+
+        # Mock subprocess.Popen
+        mock_proc = mocker.MagicMock()
+        mock_proc.stdout = mocker.MagicMock()
+        mock_proc.stdout.readline = mocker.MagicMock()
+        mock_proc.stdout.readline.side_effect = [
+            "frame=  100 fps=100 q=20.0 size=    1024kB time=00:00:01.00 bitrate=1024.0kbits/s",
+            "frame=  200 fps=100 q=20.0 size=    2048kB time=00:00:02.00 bitrate=1024.0kbits/s",
+            "",  # End of output
+        ]
+        mock_proc.wait.return_value = 0
+
+        mocker.patch("subprocess.Popen", return_value=mock_proc)
+
+        # Mock get_video_duration
+        mocker.patch.object(archiver.Transcoder, "get_video_duration", return_value=3.0)
+
+        # Mock Path.mkdir
+        mocker.patch("pathlib.Path.mkdir")
+
+        # Mock progress callback
+        progress_cb = mocker.MagicMock()
+
+        result = archiver.Transcoder.transcode_file(
+            input_path, output_path, logger, progress_cb, graceful_exit
+        )
+
+        assert result is True
+        progress_cb.assert_called()
+
+    def test_transcode_file_failure(self, mocker):
+        """Test failed file transcoding"""
+        input_path = Path("/test/input.mp4")
+        output_path = Path("/test/output.mp4")
+        logger = mocker.MagicMock()
+        graceful_exit = archiver.GracefulExit()
+
+        # Mock subprocess.Popen
+        mock_proc = mocker.MagicMock()
+        mock_proc.stdout = mocker.MagicMock()
+        mock_proc.stdout.readline = mocker.MagicMock()
+        mock_proc.stdout.readline.side_effect = [
+            "Error: Invalid input",
+            "",  # End of output
+        ]
+        mock_proc.wait.return_value = 1  # Non-zero exit code
+
+        mocker.patch("subprocess.Popen", return_value=mock_proc)
+
+        # Mock get_video_duration
+        mocker.patch.object(archiver.Transcoder, "get_video_duration", return_value=3.0)
+
+        # Mock Path.mkdir
+        mocker.patch("pathlib.Path.mkdir")
+
+        # Mock progress callback
+        progress_cb = mocker.MagicMock()
+
+        result = archiver.Transcoder.transcode_file(
+            input_path, output_path, logger, progress_cb, graceful_exit
+        )
+
+        assert result is False
+        logger.error.assert_called()
+
+    def test_transcode_file_cancellation(self, mocker):
+        """Test file transcoding with cancellation"""
+        input_path = Path("/test/input.mp4")
+        output_path = Path("/test/output.mp4")
+        logger = mocker.MagicMock()
+        graceful_exit = archiver.GracefulExit()
+
+        # Request exit before transcoding
+        graceful_exit.request_exit()
+
+        # Mock Path.mkdir
+        mocker.patch("pathlib.Path.mkdir")
+
+        # Mock progress callback
+        progress_cb = mocker.MagicMock()
+
+        result = archiver.Transcoder.transcode_file(
+            input_path, output_path, logger, progress_cb, graceful_exit
+        )
+
+        assert result is False
+
+
+class TestFileProcessor:
+    """Test the FileProcessor class"""
+
+    def test_generate_action_plan(self, tmp_path, mocker):
+        """Test generating an action plan"""
+        # Create config
+        args = archiver.parse_args([str(tmp_path)])
+        config = archiver.Config(args)
+
+        # Create logger
+        logger = mocker.MagicMock()
+
+        # Create graceful exit
+        graceful_exit = archiver.GracefulExit()
+
+        # Create processor
+        processor = archiver.FileProcessor(config, logger, graceful_exit)
+
+        # Create test data
+        mp4_file = (
+            tmp_path / "camera" / "2023" / "01" / "15" / "REO_camera_20230115120000.mp4"
+        )
+        jpg_file = (
+            tmp_path / "camera" / "2023" / "01" / "15" / "REO_camera_20230115120000.jpg"
+        )
+        timestamp = datetime(2023, 1, 15, 12, 0, 0)
+
+        mp4s = [(mp4_file, timestamp)]
+        mapping = {"20230115120000": {".mp4": mp4_file, ".jpg": jpg_file}}
+
+        # Mock exists and stat for output file
+        mocker.patch("pathlib.Path.exists", return_value=False)
+
+        # Generate plan
+        plan = processor.generate_action_plan(mp4s, mapping)
+
+        # Verify plan
+        assert "transcoding" in plan
+        assert "removals" in plan
+        assert len(plan["transcoding"]) == 1
+        assert plan["transcoding"][0]["input"] == mp4_file
+        assert plan["transcoding"][0]["jpg_to_remove"] == jpg_file
+        assert len(plan["removals"]) == 2  # One for MP4, one for JPG
+
+    def test_generate_action_plan_with_existing_archive(self, tmp_path, mocker):
+        """Test generating an action plan when archive already exists"""
+        # Create config
+        args = archiver.parse_args([str(tmp_path)])
+        config = archiver.Config(args)
+
+        # Create logger
+        logger = mocker.MagicMock()
+
+        # Create graceful exit
+        graceful_exit = archiver.GracefulExit()
+
+        # Create processor
+        processor = archiver.FileProcessor(config, logger, graceful_exit)
+
+        # Create test data
+        mp4_file = (
+            tmp_path / "camera" / "2023" / "01" / "15" / "REO_camera_20230115120000.mp4"
+        )
+        jpg_file = (
+            tmp_path / "camera" / "2023" / "01" / "15" / "REO_camera_20230115120000.jpg"
+        )
+        timestamp = datetime(2023, 1, 15, 12, 0, 0)
+
+        mp4s = [(mp4_file, timestamp)]
+        mapping = {"20230115120000": {".mp4": mp4_file, ".jpg": jpg_file}}
+
+        # Mock exists and stat for output file (exists and is large enough)
+        mocker.patch("pathlib.Path.exists", return_value=True)
+        mock_stat = mocker.patch("pathlib.Path.stat")
+        mock_stat.return_value.st_size = archiver.MIN_ARCHIVE_SIZE_BYTES + 1000
+
+        # Generate plan
+        plan = processor.generate_action_plan(mp4s, mapping)
+
+        # Verify plan - no transcoding, just removals
+        assert len(plan["transcoding"]) == 0
+        assert len(plan["removals"]) == 2  # One for MP4, one for JPG
+
+    def test_generate_action_plan_with_age_cutoff(self, tmp_path, mocker):
+        """Test generating an action plan with age cutoff"""
+        # Create config with age of 30 days
+        args = archiver.parse_args([str(tmp_path), "--age", "30"])
+        config = archiver.Config(args)
+
+        # Create logger
+        logger = mocker.MagicMock()
+
+        # Create graceful exit
+        graceful_exit = archiver.GracefulExit()
+
+        # Create processor
+        processor = archiver.FileProcessor(config, logger, graceful_exit)
+
+        # Create test data - recent file (should be skipped)
+        recent_mp4 = (
+            tmp_path / "camera" / "2023" / "01" / "15" / "REO_camera_20230115120000.mp4"
+        )
+        recent_timestamp = datetime.now() - timedelta(days=10)  # 10 days ago
+
+        # Create test data - old file (should be included)
+        old_mp4 = (
+            tmp_path / "camera" / "2023" / "01" / "15" / "REO_camera_20230115120001.mp4"
+        )
+        old_timestamp = datetime.now() - timedelta(days=40)  # 40 days ago
+
+        mp4s = [(recent_mp4, recent_timestamp), (old_mp4, old_timestamp)]
+        mapping = {
+            recent_timestamp.strftime("%Y%m%d%H%M%S"): {".mp4": recent_mp4},
+            old_timestamp.strftime("%Y%m%d%H%M%S"): {".mp4": old_mp4},
         }
-        context.state_data["plan"] = plan
 
-        handler = ExecutionHandler()
-        next_state = handler.execute(context)
+        # Mock exists and stat for output file
+        mocker.patch("pathlib.Path.exists", return_value=False)
 
-        # Should transition to CLEANUP
-        assert next_state == State.CLEANUP
+        # Generate plan
+        plan = processor.generate_action_plan(mp4s, mapping)
 
-    def test_execution_handler_source_removal_after_successful_transcode(
-        self, mocker, file_helpers, suppress_logging_and_progress
-    ):
-        """Test that source files are removed immediately after successful transcoding."""
-        config = {
-            "directory": file_helpers["input_dir"],
-            "output": file_helpers["output_dir"],
-            "dry_run": False,  # Actually perform operations
-            "use_trash": True,
-            "trash_root": file_helpers["trash_dir"],
-        }
-        context = Context(config)
+        # Verify plan - only old file should be included
+        assert len(plan["transcoding"]) == 1
+        assert plan["transcoding"][0]["input"] == old_mp4
 
-        # Setup logging
-        logging_service = LoggingService(config)
-        context.logger = logging_service.setup_logging()
+    def test_execute_plan(self, tmp_path, mocker):
+        """Test executing an action plan"""
+        # Create config
+        args = archiver.parse_args([str(tmp_path)])
+        config = archiver.Config(args)
 
-        # Setup test data
-        old_ts = datetime.now() - timedelta(days=31)
-        mp4_file = file_helpers["create_file"]("2023/01/01/test.mp4", ts=old_ts)
-        jpg_file = file_helpers["create_file"]("2023/01/01/test.jpg", ts=old_ts)
+        # Create logger
+        logger = mocker.MagicMock()
 
-        # Verify files exist initially
-        assert mp4_file.exists()
-        assert jpg_file.exists()
+        # Create graceful exit
+        graceful_exit = archiver.GracefulExit()
 
-        # Create a plan with a transcoding action that has a JPG to remove
+        # Create processor
+        processor = archiver.FileProcessor(config, logger, graceful_exit)
+
+        # Create test plan
+        input_path = tmp_path / "input.mp4"
+        output_path = tmp_path / "output.mp4"
+        jpg_path = tmp_path / "input.jpg"
+
         plan = {
             "transcoding": [
                 {
                     "type": "transcode",
-                    "input": mp4_file,
-                    "output": file_helpers["output_dir"]
-                    / f"archived-{old_ts.strftime('%Y%m%d%H%M%S')}.mp4",
-                    "jpg_to_remove": jpg_file,
+                    "input": input_path,
+                    "output": output_path,
+                    "jpg_to_remove": jpg_path,
                 }
             ],
             "removals": [
                 {
                     "type": "source_removal_after_transcode",
-                    "file": mp4_file,
+                    "file": input_path,
                     "reason": "Source file for transcoded archive",
                 },
                 {
                     "type": "jpg_removal_after_transcode",
-                    "file": jpg_file,
+                    "file": jpg_path,
                     "reason": "Paired with transcoded MP4",
                 },
             ],
         }
-        context.state_data["plan"] = plan
 
-        handler = ExecutionHandler()
-        # Mock the transcoder service to simulate success
-        context.services["transcoder_service"] = mocker.Mock()
-        context.services["transcoder_service"].transcode_file.return_value = True
+        # Mock transcoding
+        mocker.patch.object(archiver.Transcoder, "transcode_file", return_value=True)
 
-        # Mock the transcoder service to verify the output file exists (to avoid actual transcoding)
-        def mock_transcode_file(
-            input_path, output_path, logger, progress_cb=None, graceful_exit=None
-        ):
-            # Create a dummy output file to simulate successful transcoding
-            output_path.parent.mkdir(parents=True, exist_ok=True)
-            output_path.write_bytes(b"dummy transcoded content")
-            return True
+        # Mock file removal
+        mock_remove = mocker.patch.object(archiver.FileManager, "remove_file")
 
-        context.services[
-            "transcoder_service"
-        ].transcode_file.side_effect = mock_transcode_file
+        # Create progress reporter
+        progress_reporter = mocker.MagicMock()
 
-        next_state = handler.execute(context)
+        # Execute plan
+        result = processor.execute_plan(plan, progress_reporter)
 
-        # Should transition to CLEANUP or ARCHIVE_CLEANUP depending on config
-        assert next_state in [State.CLEANUP, State.ARCHIVE_CLEANUP, State.TERMINATION]
+        # Verify execution
+        assert result is True
+        # Should be 3 calls: 1 for JPG after transcode, 1 for MP4 source, 1 for JPG from removals
+        assert mock_remove.call_count == 3
 
-        # Verify that both source files (MP4 and JPG) have been removed/moved to trash
-        assert not mp4_file.exists()
-        assert not jpg_file.exists()
+    def test_cleanup_orphaned_files(self, tmp_path, mocker):
+        """Test cleaning up orphaned JPG files"""
+        # Create config
+        args = archiver.parse_args([str(tmp_path)])
+        config = archiver.Config(args)
 
-        # Verify files are in trash
-        trash_files = list(file_helpers["trash_dir"].rglob("*"))
-        assert len(trash_files) >= 2  # Should have both MP4 and JPG in trash
-        found_mp4_in_trash = any(mp4_file.name in str(f) for f in trash_files)
-        found_jpg_in_trash = any(jpg_file.name in str(f) for f in trash_files)
-        assert found_mp4_in_trash, f"MP4 file not found in trash: {list(trash_files)}"
-        assert found_jpg_in_trash, f"JPG file not found in trash: {list(trash_files)}"
+        # Create logger
+        logger = mocker.MagicMock()
 
-    def test_execution_handler_with_jpg_removal(
-        self, mocker, file_helpers, suppress_logging_and_progress
-    ):
-        """Test ExecutionHandler with JPG file removal after successful transcoding."""
-        config = {
-            "directory": file_helpers["input_dir"],
-            "output": file_helpers["output_dir"],
-            "dry_run": True,  # Don't actually transcode or remove
-            "use_trash": True,
-            "trash_root": file_helpers["trash_dir"],
+        # Create graceful exit
+        graceful_exit = archiver.GracefulExit()
+
+        # Create processor
+        processor = archiver.FileProcessor(config, logger, graceful_exit)
+
+        # Create test data - orphaned JPG (no MP4)
+        orphaned_jpg = (
+            tmp_path / "camera" / "2023" / "01" / "15" / "REO_camera_20230115120000.jpg"
+        )
+
+        # Create test data - paired files
+        mp4_file = (
+            tmp_path / "camera" / "2023" / "01" / "15" / "REO_camera_20230115120001.mp4"
+        )
+        paired_jpg = (
+            tmp_path / "camera" / "2023" / "01" / "15" / "REO_camera_20230115120001.jpg"
+        )
+
+        mapping = {
+            "20230115120000": {".jpg": orphaned_jpg},  # Orphaned
+            "20230115120001": {".mp4": mp4_file, ".jpg": paired_jpg},  # Paired
         }
-        context = Context(config)
 
-        # Setup logging
-        logging_service = LoggingService(config)
-        context.logger = logging_service.setup_logging()
+        # Mock file removal
+        mock_remove = mocker.patch.object(archiver.FileManager, "remove_file")
 
-        # Setup test data
-        old_ts = datetime.now() - timedelta(days=31)
-        mp4_file = file_helpers["create_file"]("2023/01/01/test.mp4", ts=old_ts)
-        jpg_file = file_helpers["create_file"]("2023/01/01/test.jpg", ts=old_ts)
+        # Mock clean_empty_directories
+        mock_clean_dirs = mocker.patch.object(
+            archiver.FileManager, "clean_empty_directories"
+        )
 
-        # Create a plan with a transcoding action that has a JPG to remove
+        # Cleanup orphaned files
+        processor.cleanup_orphaned_files(mapping)
+
+        # Verify only orphaned JPG was removed
+        mock_remove.assert_called_once()
+        assert mock_remove.call_args[0][0] == orphaned_jpg
+        mock_clean_dirs.assert_called_once()
+
+    def test_output_path(self, tmp_path, mocker):
+        """Test generating output path for archived file"""
+        # Create config
+        args = archiver.parse_args([str(tmp_path)])
+        config = archiver.Config(args)
+
+        # Create logger
+        logger = mocker.MagicMock()
+
+        # Create graceful exit
+        graceful_exit = archiver.GracefulExit()
+
+        # Create processor
+        processor = archiver.FileProcessor(config, logger, graceful_exit)
+
+        # Create test data
+        input_file = (
+            tmp_path / "camera" / "2023" / "01" / "15" / "REO_camera_20230115120000.mp4"
+        )
+        timestamp = datetime(2023, 1, 15, 12, 0, 0)
+
+        # Generate output path
+        output_path = processor._output_path(input_file, timestamp)
+
+        # Verify path
+        expected = (
+            tmp_path / "archived" / "2023" / "01" / "15" / "archived-20230115120000.mp4"
+        )
+        assert output_path == expected
+
+
+class TestDisplayAndConfirmPlan:
+    """Test display and confirm plan functions"""
+
+    def test_display_plan(self, mocker):
+        """Test displaying the action plan"""
+        logger = mocker.MagicMock()
+
+        # Create config
+        args = archiver.parse_args(["/test"])
+        config = archiver.Config(args)
+
+        # Create test plan
         plan = {
             "transcoding": [
                 {
                     "type": "transcode",
-                    "input": mp4_file,
-                    "output": file_helpers["output_dir"]
-                    / f"archived-{old_ts.strftime('%Y%m%d%H%M%S')}.mp4",
-                    "jpg_to_remove": jpg_file,
-                }
-            ],
-            "removals": [],
-        }
-        context.state_data["plan"] = plan
-
-        handler = ExecutionHandler()
-        # Mock the transcoder service to simulate success
-        context.services["transcoder_service"] = mocker.Mock()
-        context.services["transcoder_service"].transcode_file.return_value = True
-        next_state = handler.execute(context)
-
-        # Should transition to CLEANUP
-        assert next_state == State.CLEANUP
-
-    def test_execution_handler_with_graceful_exit(
-        self, file_helpers, suppress_logging_and_progress
-    ):
-        """Test ExecutionHandler behavior with graceful exit."""
-        config = {
-            "directory": file_helpers["input_dir"],
-            "output": file_helpers["output_dir"],
-            "dry_run": True,
-        }
-        context = Context(config)
-
-        # Setup logging
-        logging_service = LoggingService(config)
-        context.logger = logging_service.setup_logging()
-
-        # Setup test data
-        old_ts = datetime.now() - timedelta(days=31)
-        mp4_file = file_helpers["create_file"]("2023/01/01/test.mp4", ts=old_ts)
-
-        # Create a plan with a transcoding action
-        plan = {
-            "transcoding": [
+                    "input": Path("/test/input1.mp4"),
+                    "output": Path("/test/output1.mp4"),
+                    "jpg_to_remove": Path("/test/input1.jpg"),
+                },
                 {
                     "type": "transcode",
-                    "input": mp4_file,
-                    "output": file_helpers["output_dir"]
-                    / f"archived-{old_ts.strftime('%Y%m%d%H%M%S')}.mp4",
+                    "input": Path("/test/input2.mp4"),
+                    "output": Path("/test/output2.mp4"),
                     "jpg_to_remove": None,
-                }
-            ],
-            "removals": [],
-        }
-        context.state_data["plan"] = plan
-
-        # Request graceful exit before execution
-        context.graceful_exit.request_exit()
-
-        handler = ExecutionHandler()
-        next_state = handler.execute(context)
-
-        # Should transition to CLEANUP or ARCHIVE_CLEANUP depending on config
-        assert next_state in [State.CLEANUP, State.ARCHIVE_CLEANUP, State.TERMINATION]
-
-    def test_execution_handler_with_removal_actions(
-        self, mocker, file_helpers, suppress_logging_and_progress
-    ):
-        """Test ExecutionHandler with removal actions after transcoding."""
-        config = {
-            "directory": file_helpers["input_dir"],
-            "output": file_helpers["output_dir"],
-            "dry_run": True,  # Don't actually perform removals
-        }
-        context = Context(config)
-
-        # Setup logging
-        logging_service = LoggingService(config)
-        context.logger = logging_service.setup_logging()
-
-        # Setup test data
-        old_ts = datetime.now() - timedelta(days=31)
-        mp4_file = file_helpers["create_file"]("2023/01/01/test.mp4", ts=old_ts)
-
-        # Create a plan with both transcoding and removal actions
-        plan = {
-            "transcoding": [
-                {
-                    "type": "transcode",
-                    "input": mp4_file,
-                    "output": file_helpers["output_dir"]
-                    / f"archived-{old_ts.strftime('%Y%m%d%H%M%S')}.mp4",
-                    "jpg_to_remove": None,
-                }
+                },
             ],
             "removals": [
                 {
-                    "type": "test_removal",
-                    "file": mp4_file,
-                    "reason": "test reason",
-                }
-            ],
-        }
-        context.state_data["plan"] = plan
-
-        handler = ExecutionHandler()
-        # Mock the transcoder service to simulate success
-        context.services["transcoder_service"] = mocker.Mock()
-        context.services["transcoder_service"].transcode_file.return_value = True
-        next_state = handler.execute(context)
-
-        # Should transition to state based on config (cleanup might be enabled)
-        if config.get("cleanup"):
-            assert next_state == State.ARCHIVE_CLEANUP
-        else:
-            assert next_state == State.CLEANUP
-
-    def test_cleanup_handler(self, file_helpers, suppress_logging_and_progress):
-        """Test CleanupHandler functionality."""
-        config = {
-            "directory": file_helpers["input_dir"],
-            "output": file_helpers["output_dir"],
-        }
-        context = Context(config)
-
-        # Setup logging
-        logging_service = LoggingService(config)
-        context.logger = logging_service.setup_logging()
-
-        # Setup test data
-        old_ts = datetime.now() - timedelta(days=31)
-        mp4_file = file_helpers["create_file"]("2023/01/01/test.mp4", ts=old_ts)
-
-        # Create a transcoding plan to mark the file as processed
-        plan = {
-            "transcoding": [
+                    "type": "source_removal_after_transcode",
+                    "file": Path("/test/input1.mp4"),
+                    "reason": "Source file for transcoded archive",
+                },
                 {
-                    "type": "transcode",
-                    "input": mp4_file,
-                    "output": file_helpers["output_dir"]
-                    / f"archived-{old_ts.strftime('%Y%m%d%H%M%S')}.mp4",
-                    "jpg_to_remove": None,
-                }
+                    "type": "jpg_removal_after_transcode",
+                    "file": Path("/test/input1.jpg"),
+                    "reason": "Paired with transcoded MP4",
+                },
             ],
-            "removals": [],
-        }
-        context.state_data["plan"] = plan
-
-        # Create a mapping with an orphaned JPG
-        jpg_file = file_helpers["create_file"]("2023/01/01/test.jpg", ts=old_ts)
-        context.state_data["mapping"] = {
-            old_ts.strftime("%Y%m%d%H%M%S"): {".mp4": mp4_file, ".jpg": jpg_file}
         }
 
-        handler = CleanupHandler()
-        next_state = handler.execute(context)
+        # Display plan
+        archiver.display_plan(plan, logger, config)
 
-        # Should transition to TERMINATION
-        assert next_state == State.TERMINATION
-
-    def test_cleanup_handler_orphaned_jpgs(
-        self, file_helpers, suppress_logging_and_progress
-    ):
-        """Test CleanupHandler's removal of orphaned JPG files."""
-        config = {
-            "directory": file_helpers["input_dir"],
-            "output": file_helpers["output_dir"],
-            "use_trash": True,
-            "trash_root": file_helpers["trash_dir"],
-        }
-        context = Context(config)
-
-        # Setup logging
-        logging_service = LoggingService(config)
-        context.logger = logging_service.setup_logging()
-
-        # Setup test data - create orphaned JPG
-        old_ts = datetime.now() - timedelta(days=31)
-        jpg_file = file_helpers["create_file"]("2023/01/01/orphaned.jpg", ts=old_ts)
-
-        # Create mapping with only JPG (no MP4 pair)
-        context.state_data["mapping"] = {
-            old_ts.strftime("%Y%m%d%H%M%S"): {".jpg": jpg_file}
-        }
-
-        # Empty plan to indicate no processed files
-        context.state_data["plan"] = {"transcoding": []}
-
-        handler = CleanupHandler()
-        next_state = handler.execute(context)
-
-        # Should transition to TERMINATION
-        assert next_state == State.TERMINATION
-        # Verify the orphaned JPG was moved to trash
-        assert not jpg_file.exists()
-
-    def test_cleanup_handler_empty_directories(
-        self, file_helpers, suppress_logging_and_progress
-    ):
-        """Test CleanupHandler's removal of empty date-structured directories."""
-        config = {
-            "directory": file_helpers["input_dir"],
-            "output": file_helpers["output_dir"],
-        }
-        context = Context(config)
-
-        # Setup logging
-        logging_service = LoggingService(config)
-        context.logger = logging_service.setup_logging()
-
-        # Create a valid date structure directory that is empty
-        empty_date_dir = file_helpers["input_dir"] / "2023" / "01" / "15"
-        empty_date_dir.mkdir(parents=True, exist_ok=True)
-
-        # Create a non-date directory that should not be cleaned up
-        non_date_dir = file_helpers["input_dir"] / "non_date_dir"
-        non_date_dir.mkdir(parents=True, exist_ok=True)
-
-        handler = CleanupHandler()
-        next_state = handler.execute(context)
-
-        # Should transition to TERMINATION
-        assert next_state == State.TERMINATION
-        # Empty date directory should be removed
-        assert not empty_date_dir.exists()
-        # Non-date directory should still exist
-        assert non_date_dir.exists()
-
-    def test_cleanup_handler_invalid_directory_config(
-        self, temp_dirs, suppress_logging_and_progress
-    ):
-        """Test CleanupHandler with invalid directory configuration."""
-        config = {
-            "directory": "not_a_path_object",  # Invalid - not a Path object
-            "output": temp_dirs["output_dir"],
-        }
-        context = Context(config)
-
-        # Setup logging
-        logging_service = LoggingService(config)
-        context.logger = logging_service.setup_logging()
-
-        handler = CleanupHandler()
-        next_state = handler.execute(context)
-
-        # Should transition to TERMINATION
-        assert next_state == State.TERMINATION
-
-    def test_archive_cleanup_handler(self, file_helpers, suppress_logging_and_progress):
-        """Test ArchiveCleanupHandler functionality."""
-        # Create some test archive files for cleanup to process
-        old_ts = datetime.now() - timedelta(days=35)  # Older than age threshold
-        archive_file = file_helpers["create_archive"](old_ts, size=1024 * 1024)  # 1MB
-        assert archive_file.exists()
-
-        config = {
-            "directory": file_helpers["input_dir"],
-            "output": file_helpers["output_dir"],
-            "max_size": 1,  # 1GB
-            "age": 30,
-            "dry_run": True,  # Use dry run to avoid actual deletion
-        }
-        context = Context(config)
-
-        # Setup logging
-        logging_service = LoggingService(config)
-        context.logger = logging_service.setup_logging()
-
-        # Setup state data
-        context.state_data["mp4s"] = []
-        context.state_data["mapping"] = {}
-        context.state_data["trash_files"] = set()
-        context.config = config
-
-        handler = ArchiveCleanupHandler()
-        next_state = handler.execute(context)
-
-        # Can transition to CLEANUP or TERMINATION (both are valid depending on implementation)
-        assert next_state in [State.CLEANUP, State.TERMINATION]
-
-    def test_archive_cleanup_handler_collect_all_files(
-        self, file_helpers, suppress_logging_and_progress
-    ):
-        """Test ArchiveCleanupHandler's _collect_all_archive_files method."""
-        # Create test files
-        old_ts = datetime.now() - timedelta(days=35)  # Older than age threshold
-        archive_file = file_helpers["create_archive"](old_ts, size=1024 * 1024)  # 1MB
-        assert archive_file.exists()
-
-        config = {
-            "directory": file_helpers["input_dir"],
-            "output": file_helpers["output_dir"],
-            "max_size": 1,  # 1GB
-            "age": 30,
-            "dry_run": True,  # Use dry run to avoid actual deletion
-        }
-        context = Context(config)
-
-        # Setup logging
-        logging_service = LoggingService(config)
-        context.logger = logging_service.setup_logging()
-
-        # Setup state data
-        context.state_data["mp4s"] = [
-            (file_helpers["create_file"]("test.mp4", ts=old_ts), old_ts)
-        ]
-        context.state_data["mapping"] = {}
-        context.state_data["trash_files"] = set()
-        context.config = config
-
-        handler = ArchiveCleanupHandler()
-
-        # Call the private method to test it specifically
-        file_infos = handler._collect_all_archive_files(context)
-
-        # Should have both archive and source files
-        assert len(file_infos) >= 1  # Should have at least the archive file
-        for file_info in file_infos:
-            if file_info.is_archive:
-                assert archive_file == file_info.path
-            else:
-                # Check that source files are properly identified
-                assert file_info.path in [
-                    path for path, _ in context.state_data["mp4s"]
-                ]
-
-    def test_archive_cleanup_handler_intelligent_cleanup_size(
-        self, file_helpers, suppress_logging_and_progress
-    ):
-        """Test ArchiveCleanupHandler's _intelligent_cleanup with size constraints."""
-        config = {
-            "directory": file_helpers["input_dir"],
-            "output": file_helpers["output_dir"],
-            "max_size": 0,  # Very small size limit to force cleanup
-            "age": 30,
-            "dry_run": True,
-        }
-        context = Context(config)
-
-        # Setup logging
-        logging_service = LoggingService(config)
-        context.logger = logging_service.setup_logging()
-
-        handler = ArchiveCleanupHandler()
-
-        # Create test FileInfo objects
-        old_ts = datetime.now() - timedelta(days=35)
-        test_files = [
-            FileInfo(
-                path=file_helpers["create_archive"](old_ts, size=512 * 1024),  # 512KB
-                timestamp=old_ts,
-                size=512 * 1024,
-                is_archive=True,
-                is_trash=False,
-            )
-        ]
-
-        # Call the private method to test it specifically
-        files_to_remove = handler._intelligent_cleanup(context, test_files)
-
-        # Since size limit is 0, all files should be marked for removal
-        assert len(files_to_remove) == len(test_files)
-
-    def test_archive_cleanup_handler_intelligent_cleanup_age(
-        self, file_helpers, suppress_logging_and_progress
-    ):
-        """Test ArchiveCleanupHandler's _intelligent_cleanup with age constraints."""
-        config = {
-            "directory": file_helpers["input_dir"],
-            "output": file_helpers["output_dir"],
-            "max_size": 100,  # Large enough to not trigger size cleanup
-            "age": 5,  # Only files older than 5 days
-            "dry_run": True,
-            "clean_output": True,  # Include output files in age cleanup
-        }
-        context = Context(config)
-
-        # Setup logging
-        logging_service = LoggingService(config)
-        context.logger = logging_service.setup_logging()
-
-        handler = ArchiveCleanupHandler()
-
-        # Create test FileInfo objects with old timestamps
-        old_ts = datetime.now() - timedelta(days=10)  # 10 days old
-        test_files = [
-            FileInfo(
-                path=file_helpers["create_archive"](old_ts, size=512 * 1024),  # 512KB
-                timestamp=old_ts,
-                size=512 * 1024,
-                is_archive=True,
-                is_trash=False,
-            )
-        ]
-
-        # Call the private method to test it specifically
-        files_to_remove = handler._intelligent_cleanup(context, test_files)
-
-        # Since age threshold is 5 days and file is 10 days old, it should be marked for removal
-        assert len(files_to_remove) == 1
-
-    def test_archive_cleanup_handler_intelligent_cleanup_age_disabled(
-        self, file_helpers, suppress_logging_and_progress
-    ):
-        """Test ArchiveCleanupHandler's _intelligent_cleanup with age disabled."""
-        config = {
-            "directory": file_helpers["input_dir"],
-            "output": file_helpers["output_dir"],
-            "max_size": 100,  # Large enough to not trigger size cleanup
-            "age": 0,  # Age-based cleanup disabled
-            "dry_run": True,
-        }
-        context = Context(config)
-
-        # Setup logging
-        logging_service = LoggingService(config)
-        context.logger = logging_service.setup_logging()
-
-        handler = ArchiveCleanupHandler()
-
-        # Create test FileInfo objects
-        old_ts = datetime.now() - timedelta(days=10)  # 10 days old
-        test_files = [
-            FileInfo(
-                path=file_helpers["create_archive"](old_ts, size=512 * 1024),  # 512KB
-                timestamp=old_ts,
-                size=512 * 1024,
-                is_archive=True,
-                is_trash=False,
-            )
-        ]
-
-        # Call the private method to test it specifically
-        files_to_remove = handler._intelligent_cleanup(context, test_files)
-
-        # Since age is 0 (disabled), no files should be marked for age-based removal
-        assert len(files_to_remove) == 0
-
-    def test_archive_cleanup_handler_categorize_files(
-        self, file_helpers, suppress_logging_and_progress
-    ):
-        """Test ArchiveCleanupHandler's _categorize_files method."""
-        handler = ArchiveCleanupHandler()
-
-        # Create test FileInfo objects with different characteristics
-        old_ts = datetime.now() - timedelta(days=10)
-        test_files = [
-            FileInfo(
-                path=file_helpers["create_archive"](old_ts, size=512 * 1024),
-                timestamp=old_ts,
-                size=512 * 1024,
-                is_archive=True,
-                is_trash=True,  # Trash file
-            ),
-            FileInfo(
-                path=file_helpers["create_archive"](old_ts, size=256 * 1024),
-                timestamp=old_ts + timedelta(days=1),
-                size=256 * 1024,
-                is_archive=True,
-                is_trash=False,  # Archive file
-            ),
-            FileInfo(
-                path=file_helpers["create_file"]("test.mp4", ts=old_ts),
-                timestamp=old_ts + timedelta(days=2),
-                size=128 * 1024,
-                is_archive=False,
-                is_trash=False,  # Source file
-            ),
-        ]
-
-        # Call the private method to test it specifically
-        categorized = handler._categorize_files(test_files)
-
-        # Should have all three categories
-        assert 0 in categorized  # Trash
-        assert 1 in categorized  # Archive
-        assert 2 in categorized  # Source
-        assert len(categorized[0]) == 1  # One trash file
-        assert len(categorized[1]) == 1  # One archive file
-        assert len(categorized[2]) == 1  # One source file
-
-        # Files should be sorted by timestamp (oldest first)
-        assert categorized[0][0].timestamp == old_ts  # Oldest trash file first
-        assert categorized[1][0].timestamp == old_ts + timedelta(
-            days=1
-        )  # Oldest archive first (second timestamp)
-        assert categorized[2][0].timestamp == old_ts + timedelta(
-            days=2
-        )  # Oldest source first (third timestamp)
-
-    def test_termination_handler(self, temp_dirs, suppress_logging_and_progress):
-        """Test TerminationHandler functionality."""
-        config = {
-            "directory": temp_dirs["input_dir"],
-            "output": temp_dirs["output_dir"],
-        }
-        context = Context(config)
-
-        # Setup logging
-        logging_service = LoggingService(config)
-        context.logger = logging_service.setup_logging()
-
-        handler = TerminationHandler()
-        next_state = handler.execute(context)
-
-        # Should stay in TERMINATION
-        assert next_state == State.TERMINATION
-
-    def test_state_handler_factory_invalid_state(self):
-        """Test StateHandlerFactory with invalid state."""
-
-        # Create an invalid state (not in the enum)
-        class InvalidState:
-            pass
-
-        # Should return a default handler (TerminationHandler) for invalid states
-        handler = StateHandlerFactory.create_handler(InvalidState)
-        assert isinstance(handler, TerminationHandler)
-
-
-class TestMainAndIntegration:
-    """Test main functions and integration workflows."""
-
-    def test_parse_arguments(self, mocker):
-        """Test argument parsing functionality."""
-        # Test with default arguments
-        mocker.patch("sys.argv", ["archiver.py"])
-        args = parse_arguments()
-        assert args.directory == Path("/camera")
+        # Verify logger was called with plan information
         assert (
-            args.output is None
-        )  # Output has no default in arg parser, handled in setup_config
-        assert args.dry_run is False
+            logger.info.call_count >= 6
+        )  # Header, transcoding count, transcoding items, removals count, removal items, footer
 
-        # Test with custom arguments
-        mocker.patch(
-            "sys.argv",
+    def test_display_plan_with_cleanup(self, mocker):
+        """Test displaying the action plan with cleanup enabled"""
+        logger = mocker.MagicMock()
+
+        # Create config with cleanup
+        args = archiver.parse_args(["/test", "--cleanup", "--age", "30"])
+        config = archiver.Config(args)
+
+        # Create test plan
+        plan = {"transcoding": [], "removals": []}
+
+        # Display plan
+        archiver.display_plan(plan, logger, config)
+
+        # Verify logger was called with cleanup information
+        assert any(
+            "Cleanup enabled" in call[0][0] for call in logger.info.call_args_list
+        )
+
+    def test_confirm_plan_no_confirm(self, mocker):
+        """Test confirming plan when no_confirm is True"""
+        logger = mocker.MagicMock()
+
+        # Create config with no_confirm
+        args = archiver.parse_args(["/test", "--no-confirm"])
+        config = archiver.Config(args)
+
+        # Create test plan
+        plan = {"transcoding": [], "removals": []}
+
+        # Confirm plan
+        result = archiver.confirm_plan(plan, config, logger)
+
+        # Should return True without prompting
+        assert result is True
+
+    def test_confirm_plan_with_user_input(self, mocker):
+        """Test confirming plan with user input"""
+        logger = mocker.MagicMock()
+
+        # Create config
+        args = archiver.parse_args(["/test"])
+        config = archiver.Config(args)
+
+        # Create test plan
+        plan = {"transcoding": [], "removals": []}
+
+        # Mock user input
+        mock_input = mocker.patch("builtins.input", return_value="y")
+
+        # Confirm plan
+        result = archiver.confirm_plan(plan, config, logger)
+
+        # Should return True based on user input
+        assert result is True
+        mock_input.assert_called_once()
+
+    def test_confirm_plan_with_user_rejection(self, mocker):
+        """Test confirming plan with user rejection"""
+        logger = mocker.MagicMock()
+
+        # Create config
+        args = archiver.parse_args(["/test"])
+        config = archiver.Config(args)
+
+        # Create test plan
+        plan = {"transcoding": [], "removals": []}
+
+        # Mock user input
+        mock_input = mocker.patch("builtins.input", return_value="n")
+
+        # Confirm plan
+        result = archiver.confirm_plan(plan, config, logger)
+
+        # Should return False based on user input
+        assert result is False
+        mock_input.assert_called_once()
+
+    def test_confirm_plan_with_keyboard_interrupt(self, mocker):
+        """Test confirming plan with keyboard interrupt"""
+        logger = mocker.MagicMock()
+
+        # Create config
+        args = archiver.parse_args(["/test"])
+        config = archiver.Config(args)
+
+        # Create test plan
+        plan = {"transcoding": [], "removals": []}
+
+        # Mock user input with KeyboardInterrupt
+        mock_input = mocker.patch("builtins.input", side_effect=KeyboardInterrupt)
+
+        # Confirm plan
+        result = archiver.confirm_plan(plan, config, logger)
+
+        # Should return False on KeyboardInterrupt
+        assert result is False
+        mock_input.assert_called_once()
+
+
+class TestSignalHandlers:
+    """Test signal handler setup"""
+
+    def test_setup_signal_handlers(self, mocker):
+        """Test setting up signal handlers"""
+        graceful_exit = archiver.GracefulExit()
+
+        # Mock signal.signal
+        mock_signal = mocker.patch("signal.signal")
+
+        # Setup signal handlers
+        archiver.setup_signal_handlers(graceful_exit)
+
+        # Verify signal.signal was called for each signal
+        assert mock_signal.call_count == 3  # SIGINT, SIGTERM, SIGHUP
+
+        # Verify the handler function
+        handler = mock_signal.call_args_list[0][0][1]
+        handler(signal.SIGINT, None)
+        assert graceful_exit.should_exit() is True
+
+
+class TestParseArgs:
+    """Test argument parsing"""
+
+    def test_parse_args_minimal(self):
+        """Test parsing minimal arguments"""
+        args = archiver.parse_args(["/test"])
+
+        assert args.directory == "/test"
+        assert args.output is None
+        assert args.dry_run is False
+        assert args.no_confirm is False
+        assert args.no_skip is False
+        assert args.use_trash is False
+        assert args.trash_root is None
+        assert args.cleanup is False
+        assert args.clean_output is False
+        assert args.age == 30
+        assert args.log_file is None
+
+    def test_parse_args_all_options(self):
+        """Test parsing all options"""
+        args = archiver.parse_args(
             [
-                "archiver.py",
-                "--directory",
-                "/custom/camera",
-                "--output",
-                "/custom/output",
+                "/test",
+                "-o",
+                "/output",
                 "--dry-run",
                 "--no-confirm",
-                "--max-size",
-                "100",
-                "--age",
-                "60",
+                "--no-skip",
+                "--use-trash",
+                "--trash-root",
+                "/trash",
                 "--cleanup",
                 "--clean-output",
-                "--no-skip",
-                "--trashdir",
-                "/custom/trash",
+                "--age",
+                "60",
                 "--log-file",
-                "/tmp/test.log",
-            ],
+                "/log.txt",
+            ]
         )
-        args = parse_arguments()
-        assert args.directory == Path("/custom/camera")
-        assert args.output == Path("/custom/output")
+
+        assert args.directory == "/test"
+        assert args.output == "/output"
         assert args.dry_run is True
         assert args.no_confirm is True
-        assert args.max_size == 100
-        assert args.age == 60
+        assert args.no_skip is True
+        assert args.use_trash is True
+        assert args.trash_root == "/trash"
         assert args.cleanup is True
         assert args.clean_output is True
-        assert args.no_skip is True
-        assert args.trashdir == Path("/custom/trash")
-        assert args.log_file == Path("/tmp/test.log")
+        assert args.age == 60
+        assert args.log_file == "/log.txt"
 
-    def test_parse_arguments_no_trash_option(self, mocker):
-        """Test argument parsing with --no-trash option."""
-        mocker.patch(
-            "sys.argv",
-            [
-                "archiver.py",
-                "--directory",
-                "/camera",
-                "--no-trash",
-            ],
-        )
-        args = parse_arguments()
-        # We can't directly assert no_trash since it's processed in setup_config
-        # but we can verify the arg is parsed
-        # The important thing is that no_trash exists as an option
-        import argparse
 
-        parser = argparse.ArgumentParser(description="Camera Archiver")
-        parser.add_argument("--no-trash", action="store_true")
-        # This test mainly ensures the no-trash argument is recognized
-        assert hasattr(args, "no_trash") or True  # The argument exists in the function
+class TestRunArchiver:
+    """Test the main run_archiver function"""
 
-    def test_setup_config(self, mocker):
-        """Test configuration setup."""
-        # Create a mock args object
-        args = mocker.Mock()
-        args.directory = Path("/camera")
-        args.output = Path("/output")
-        args.dry_run = True
-        args.no_confirm = True
-        args.max_size = 100
-        args.age = 60
-        args.cleanup = True
-        args.log_file = Path("/tmp/test.log")
-        args.use_trash = True  # This will become config["use_trash"] after the "not args.no_trash" logic
-        args.no_skip = False
-        args.clean_output = False
-        args.trash_root = None
-        args.trashdir = None
-        args.no_trash = False
+    def test_run_archiver_no_files(self, tmp_path, mocker):
+        """Test running archiver with no files to process"""
+        # Create config
+        args = archiver.parse_args([str(tmp_path)])
+        config = archiver.Config(args)
 
-        config = setup_config(args)
+        # Mock logger setup
+        mock_logger = mocker.MagicMock()
+        mocker.patch.object(archiver.Logger, "setup", return_value=mock_logger)
 
-        assert config["directory"] == Path("/camera")
-        assert config["output"] == Path("/output")
-        assert config["dry_run"] is True
-        assert config["no_confirm"] is True
-        assert config["max_size"] == 100
-        assert config["age"] == 60
-        assert config["cleanup"] is True
-        assert config["log_file"] == Path("/tmp/test.log")
-        assert (
-            config["use_trash"] is True
-        )  # Since args.no_trash is False (default), not False = True
-        assert config["no_skip"] is False
-        assert config["clean_output"] is False
-        assert config["trash_root"] == Path(
-            "/camera/.deleted"
-        )  # Default trash location when trashdir is None and use_trash is True
-
-    def test_setup_config_with_trash_settings(self, mocker):
-        """Test configuration setup with trash settings."""
-        # Create a mock args object with trash settings
-        args = mocker.Mock()
-        args.directory = Path("/camera")
-        args.output = Path("/output")
-        args.dry_run = False
-        args.no_confirm = False
-        args.max_size = 500
-        args.age = 30
-        args.cleanup = False
-        args.log_file = Path("/camera/transcoding.log")
-        args.no_trash = False  # Use trash
-        args.trashdir = Path("/custom/trash")  # Custom trash directory
-        args.no_skip = False
-        args.clean_output = False
-
-        config = setup_config(args)
-
-        assert config["directory"] == Path("/camera")
-        assert config["output"] == Path("/output")
-        assert config["use_trash"] is True
-        assert config["trash_root"] == Path("/custom/trash")
-
-    def test_setup_config_with_no_trash(self, mocker):
-        """Test configuration setup with no-trash option."""
-        # Create a mock args object with no_trash enabled
-        args = mocker.Mock()
-        args.directory = Path("/camera")
-        args.output = Path("/output")
-        args.dry_run = False
-        args.no_confirm = False
-        args.max_size = 500
-        args.age = 30
-        args.cleanup = False
-        args.log_file = Path("/camera/transcoding.log")
-        args.no_trash = True  # Disable trash
-        args.trashdir = None
-        args.no_skip = False
-        args.clean_output = False
-
-        config = setup_config(args)
-
-        assert config["directory"] == Path("/camera")
-        assert config["output"] == Path("/output")
-        assert config["use_trash"] is False
-        assert config["trash_root"] is None
-
-    def test_setup_config_with_default_trash(self, mocker):
-        """Test configuration setup with default trash directory."""
-        # Create a mock args object without specifying trashdir
-        temp_dir = Path("/tmp/camera")
-        args = mocker.Mock()
-        args.directory = temp_dir
-        args.output = temp_dir / "archived"
-        args.dry_run = False
-        args.no_confirm = False
-        args.max_size = 500
-        args.age = 30
-        args.cleanup = False
-        args.log_file = temp_dir / "transcoding.log"
-        args.no_trash = False  # Use trash
-        args.trashdir = None  # No custom trash directory
-        args.no_skip = False
-        args.clean_output = False
-
-        # Mock the directory.exists method to return True for our test directory
-        mocker.patch.object(args.directory.__class__, "exists", return_value=True)
-        config = setup_config(args)
-
-        assert config["directory"] == temp_dir
-        assert config["use_trash"] is True
-        assert config["trash_root"] == temp_dir / ".deleted"  # Default trash location
-
-    def test_run_state_machine(self, file_helpers, suppress_logging_and_progress):
-        """Test state machine execution."""
-        # Create test files
-        old_ts = (datetime.now() - timedelta(days=31)).replace(microsecond=0)
-        _mp4_file = file_helpers["create_file"]("2023/01/01/test.mp4", ts=old_ts)
-        _jpg_file = file_helpers["create_file"]("2023/01/01/test.jpg", ts=old_ts)
-
-        config = {
-            "directory": file_helpers["input_dir"],
-            "output": file_helpers["output_dir"],
-            "dry_run": True,  # Use dry run to avoid actual transcoding
-            "no_confirm": True,  # Skip confirmation
-        }
-
-        # Run the state machine
-        result = run_state_machine_with_config(config)
-
-        # Should return 0 for success
-        assert result == 0
-
-    def test_run_state_machine_with_exception_handling(
-        self, mocker, temp_dirs, suppress_logging_and_progress
-    ):
-        """Test state machine exception handling."""
-        # Create a context with a handler that raises an exception
-        config = {
-            "directory": temp_dirs["input_dir"],
-            "output": temp_dirs["output_dir"],
-        }
-
-        context = Context(config)
-
-        # Setup logging
-        logging_service = LoggingService(config)
-        context.logger = logging_service.setup_logging()
-
-        # Mock a handler to raise an exception
-        original_handler = StateHandlerFactory.create_handler(State.DISCOVERY)
-        mock_handler = mocker.Mock()
-        mock_handler.enter = mocker.Mock()
-        mock_handler.execute = mocker.Mock(side_effect=Exception("Test exception"))
-        mock_handler.exit = mocker.Mock()
-
+        # Mock file discovery to return no files
         mocker.patch.object(
-            StateHandlerFactory,
-            "create_handler",
-            side_effect=lambda state: mock_handler
-            if state == State.DISCOVERY
-            else original_handler,
+            archiver.FileDiscovery, "discover_files", return_value=([], {}, set())
         )
 
-        # Transition to DISCOVERY state
-        context.transition_to(State.DISCOVERY)
+        # Run archiver
+        result = archiver.run_archiver(config)
 
-        # Run the state machine - should catch the exception and return error code
-        result = run_state_machine(context)
-
-        # Should return non-zero for error
-        assert result != 0
-
-    def test_run_state_machine_early_termination(
-        self, temp_dirs, suppress_logging_and_progress
-    ):
-        """Test state machine early termination from initialization."""
-        # Test with invalid directory that should cause immediate termination
-        config = {
-            "directory": Path("/nonexistent/directory"),
-            "output": temp_dirs["output_dir"],
-        }
-
-        # Run the state machine
-        result = run_state_machine_with_config(config)
-
-        # Should return non-zero for error since init fails
-        assert result != 0
-
-    def test_run_state_machine_with_graceful_exit(
-        self, mocker, file_helpers, suppress_logging_and_progress
-    ):
-        """Test state machine behavior with graceful exit."""
-        # Create test files
-        old_ts = (datetime.now() - timedelta(days=31)).replace(microsecond=0)
-        _mp4_file = file_helpers["create_file"]("2023/01/01/test.mp4", ts=old_ts)
-
-        config = {
-            "directory": file_helpers["input_dir"],
-            "output": file_helpers["output_dir"],
-            "dry_run": True,
-            "no_confirm": True,
-        }
-
-        context = Context(config)
-
-        # Setup logging
-        logging_service = LoggingService(config)
-        context.logger = logging_service.setup_logging()
-
-        # Request graceful exit before running the state machine
-        context.graceful_exit.request_exit()
-
-        # Run the state machine
-        result = run_state_machine(context)
-
-        # Should return 0 for graceful exit
+        # Verify result
         assert result == 0
+        mock_logger.info.assert_any_call("No files to process")
 
-    def test_full_integration_workflow(
-        self, file_helpers, suppress_logging_and_progress
-    ):
-        """Test the full integration workflow with multiple files."""
-        # Create test files with different timestamps
-        now = datetime.now()
-        old_ts1 = (now - timedelta(days=31)).replace(microsecond=0)
-        old_ts2 = (now - timedelta(days=35)).replace(microsecond=0)
+    def test_run_archiver_dry_run(self, tmp_path, mocker):
+        """Test running archiver in dry run mode"""
+        # Create config with dry run
+        args = archiver.parse_args([str(tmp_path), "--dry-run"])
+        config = archiver.Config(args)
 
-        _mp4_file1 = file_helpers["create_file"]("2023/01/01/test1.mp4", ts=old_ts1)
-        _jpg_file1 = file_helpers["create_file"]("2023/01/01/test1.jpg", ts=old_ts1)
+        # Mock logger setup
+        mock_logger = mocker.MagicMock()
+        mocker.patch.object(archiver.Logger, "setup", return_value=mock_logger)
 
-        _mp4_file2 = file_helpers["create_file"]("2023/01/02/test2.mp4", ts=old_ts2)
-        _jpg_file2 = file_helpers["create_file"]("2023/01/02/test2.jpg", ts=old_ts2)
+        # Create test data
+        mp4_file = (
+            tmp_path / "camera" / "2023" / "01" / "15" / "REO_camera_20230115120000.mp4"
+        )
+        timestamp = datetime(2023, 1, 15, 12, 0, 0)
 
-        # Create an existing archive for one of the files
-        _archive_file = file_helpers["create_archive"](old_ts1, size=1024 * 1024)
-
-        config = {
-            "directory": file_helpers["input_dir"],
-            "output": file_helpers["output_dir"],
-            "dry_run": True,  # Use dry run to avoid actual transcoding
-            "no_confirm": True,  # Skip confirmation
-            "cleanup": True,  # Enable cleanup
-            "age": 30,  # 30 days
-            "max_size": 1,  # 1GB
-        }
-
-        # Run the state machine
-        result = run_state_machine_with_config(config)
-
-        # Should return 0 for success
-        assert result == 0
-
-    def test_main_function(self, mocker, file_helpers, suppress_logging_and_progress):
-        """Test the main function."""
-        # Mock sys.argv
-        mocker.patch(
-            "sys.argv",
-            [
-                "archiver.py",
-                "--directory",
-                str(file_helpers["input_dir"]),
-                "--output",
-                str(file_helpers["output_dir"]),
-                "--dry-run",
-                "--no-confirm",
-            ],
+        # Mock file discovery
+        mocker.patch.object(
+            archiver.FileDiscovery,
+            "discover_files",
+            return_value=(
+                [(mp4_file, timestamp)],
+                {"20230115120000": {".mp4": mp4_file}},
+                set(),
+            ),
         )
 
+        # Mock directory exists
+        mocker.patch("pathlib.Path.exists", return_value=True)
+
+        # Run archiver
+        result = archiver.run_archiver(config)
+
+        # Verify result
+        assert result == 0
+        mock_logger.info.assert_any_call(
+            "Dry run completed - no transcoding or removals performed"
+        )
+
+    def test_run_archiver_user_cancelled(self, tmp_path, mocker):
+        """Test running archiver when user cancels"""
+        # Create config
+        args = archiver.parse_args([str(tmp_path)])
+        config = archiver.Config(args)
+
+        # Mock logger setup
+        mock_logger = mocker.MagicMock()
+        mocker.patch.object(archiver.Logger, "setup", return_value=mock_logger)
+
+        # Create test data
+        mp4_file = (
+            tmp_path / "camera" / "2023" / "01" / "15" / "REO_camera_20230115120000.mp4"
+        )
+        timestamp = datetime(2023, 1, 15, 12, 0, 0)
+
+        # Mock file discovery
+        mocker.patch.object(
+            archiver.FileDiscovery,
+            "discover_files",
+            return_value=(
+                [(mp4_file, timestamp)],
+                {"20230115120000": {".mp4": mp4_file}},
+                set(),
+            ),
+        )
+
+        # Mock directory exists
+        mocker.patch("pathlib.Path.exists", return_value=True)
+
+        # Mock confirm_plan to return False (user cancelled)
+        mocker.patch("archiver.confirm_plan", return_value=False)
+
+        # Run archiver
+        result = archiver.run_archiver(config)
+
+        # Verify result
+        assert result == 0
+        mock_logger.info.assert_any_call("Operation cancelled by user")
+
+    def test_run_archiver_success(self, tmp_path, mocker):
+        """Test running archiver successfully"""
+        # Create config
+        args = archiver.parse_args([str(tmp_path)])
+        config = archiver.Config(args)
+
+        # Mock logger setup
+        mock_logger = mocker.MagicMock()
+        mocker.patch.object(archiver.Logger, "setup", return_value=mock_logger)
+
+        # Create test data
+        mp4_file = (
+            tmp_path / "camera" / "2023" / "01" / "15" / "REO_camera_20230115120000.mp4"
+        )
+        timestamp = datetime(2023, 1, 15, 12, 0, 0)
+
+        # Mock file discovery
+        mocker.patch.object(
+            archiver.FileDiscovery,
+            "discover_files",
+            return_value=([(mp4_file, timestamp)], {}, set()),
+        )
+
+        # Mock directory exists
+        mocker.patch("pathlib.Path.exists", return_value=True)
+
+        # Mock confirm_plan to return True
+        mocker.patch("archiver.confirm_plan", return_value=True)
+
+        # Mock FileProcessor
+        mock_processor = mocker.MagicMock()
+        mock_processor.generate_action_plan.return_value = {
+            "transcoding": [],
+            "removals": [],
+        }
+        mock_processor.execute_plan.return_value = True
+        mock_processor.cleanup_orphaned_files.return_value = None
+        mocker.patch("archiver.FileProcessor", return_value=mock_processor)
+
+        # Mock ProgressReporter
+        mock_progress = mocker.MagicMock()
+        mock_progress.__enter__ = mocker.MagicMock(return_value=mock_progress)
+        mock_progress.__exit__ = mocker.MagicMock(return_value=None)
+        mocker.patch("archiver.ProgressReporter", return_value=mock_progress)
+
+        # Run archiver
+        result = archiver.run_archiver(config)
+
+        # Verify result
+        assert result == 0
+        mock_logger.info.assert_any_call("Archiving completed successfully")
+
+    def test_run_archiver_with_error(self, tmp_path, mocker):
+        """Test running archiver with an error"""
+        # Create config
+        args = archiver.parse_args([str(tmp_path)])
+        config = archiver.Config(args)
+
+        # Mock logger setup
+        mock_logger = mocker.MagicMock()
+        mocker.patch.object(archiver.Logger, "setup", return_value=mock_logger)
+
+        # Mock directory exists to raise an exception
+        mocker.patch("pathlib.Path.exists", side_effect=Exception("Test error"))
+
+        # Run archiver
+        result = archiver.run_archiver(config)
+
+        # Verify result
+        assert result == 1
+        mock_logger.error.assert_called_once()
+
+    def test_run_archiver_with_cleanup(self, tmp_path, mocker):
+        """Test running archiver with cleanup enabled"""
+        # Create config with cleanup
+        args = archiver.parse_args([str(tmp_path), "--cleanup"])
+        config = archiver.Config(args)
+
+        # Mock logger setup
+        mock_logger = mocker.MagicMock()
+        mocker.patch.object(archiver.Logger, "setup", return_value=mock_logger)
+
+        # Create test data
+        mp4_file = (
+            tmp_path / "camera" / "2023" / "01" / "15" / "REO_camera_20230115120000.mp4"
+        )
+        timestamp = datetime(2023, 1, 15, 12, 0, 0)
+
+        # Mock file discovery
+        mocker.patch.object(
+            archiver.FileDiscovery,
+            "discover_files",
+            return_value=([(mp4_file, timestamp)], {}, set()),
+        )
+
+        # Mock directory exists
+        mocker.patch("pathlib.Path.exists", return_value=True)
+
+        # Mock confirm_plan to return True
+        mocker.patch("archiver.confirm_plan", return_value=True)
+
+        # Mock FileProcessor
+        mock_processor = mocker.MagicMock()
+        mock_processor.generate_action_plan.return_value = {
+            "transcoding": [],
+            "removals": [],
+        }
+        mock_processor.execute_plan.return_value = True
+        mock_processor.cleanup_orphaned_files.return_value = None
+        mocker.patch("archiver.FileProcessor", return_value=mock_processor)
+
+        # Mock ProgressReporter
+        mock_progress = mocker.MagicMock()
+        mock_progress.__enter__ = mocker.MagicMock(return_value=mock_progress)
+        mock_progress.__exit__ = mocker.MagicMock(return_value=None)
+        mocker.patch("archiver.ProgressReporter", return_value=mock_progress)
+
+        # Run archiver
+        result = archiver.run_archiver(config)
+
+        # Verify result
+        assert result == 0
+        mock_logger.info.assert_any_call("Cleaning up files")
+        mock_processor.cleanup_orphaned_files.assert_called_once()
+
+
+class TestMain:
+    """Test the main entry point"""
+
+    def test_main(self, mocker):
+        """Test the main function"""
+        # Mock parse_args
+        mock_args = mocker.MagicMock()
+        mocker.patch("archiver.parse_args", return_value=mock_args)
+
+        # Mock Config
+        mock_config = mocker.MagicMock()
+        mocker.patch("archiver.Config", return_value=mock_config)
+
+        # Mock run_archiver
+        mocker.patch("archiver.run_archiver", return_value=0)
+
+        # Call main (it calls sys.exit internally)
+        archiver.main()
+
+
+class TestIntegration:
+    """Integration tests for the archiver"""
+
+    @pytest.mark.parametrize("dry_run", [True, False])
+    @pytest.mark.parametrize("use_trash", [True, False])
+    @pytest.mark.parametrize("cleanup", [True, False])
+    def test_end_to_end_workflow(self, tmp_path, mocker, dry_run, use_trash, cleanup):
+        """Test the end-to-end workflow with different configurations"""
+        # Create directory structure
+        camera_dir = tmp_path / "camera"
+        output_dir = tmp_path / "output"
+        trash_dir = tmp_path / "trash"
+
         # Create test files
-        old_ts = (datetime.now() - timedelta(days=31)).replace(microsecond=0)
-        _mp4_file = file_helpers["create_file"]("2023/01/01/test.mp4", ts=old_ts)
+        mp4_file = camera_dir / "2023" / "01" / "15" / "REO_camera_20230115120000.mp4"
 
-        # Run main function
-        result = main()
+        # Build command line arguments
+        args = [str(camera_dir), "-o", str(output_dir)]
+        if dry_run:
+            args.append("--dry-run")
+        if use_trash:
+            args.extend(["--use-trash", "--trash-root", str(trash_dir)])
+        if cleanup:
+            args.append("--cleanup")
 
-        # Should return 0 for success
-        assert result == 0
+        # Parse arguments
+        parsed_args = archiver.parse_args(args)
+        config = archiver.Config(parsed_args)
 
-    def test_error_handling_in_state_machine(
-        self, temp_dirs, suppress_logging_and_progress
-    ):
-        """Test error handling in the state machine."""
-        # Test with invalid directory
-        config = {
-            "directory": Path("/nonexistent/directory"),
-            "output": temp_dirs["output_dir"],
-        }
+        # Mock logger setup
+        mock_logger = mocker.MagicMock()
+        mocker.patch.object(archiver.Logger, "setup", return_value=mock_logger)
 
-        # Run the state machine
-        result = run_state_machine_with_config(config)
+        # Create test data
+        timestamp = datetime(2023, 1, 15, 12, 0, 0)
 
-        # Should return non-zero for error
-        assert result != 0
+        # Mock file discovery
+        mocker.patch.object(
+            archiver.FileDiscovery,
+            "discover_files",
+            return_value=(
+                [(mp4_file, timestamp)],
+                {"20230115120000": {".mp4": mp4_file}},
+                set(),
+            ),
+        )
 
-    def test_graceful_exit_handling(self, file_helpers, suppress_logging_and_progress):
-        """Test graceful exit handling in the state machine."""
-        # Create test files
-        old_ts = (datetime.now() - timedelta(days=31)).replace(microsecond=0)
-        _mp4_file = file_helpers["create_file"]("2023/01/01/test.mp4", ts=old_ts)
+        # Mock directory exists
+        mocker.patch("pathlib.Path.exists", return_value=True)
 
-        config = {
-            "directory": file_helpers["input_dir"],
-            "output": file_helpers["output_dir"],
-            "dry_run": True,
-            "no_confirm": True,
-        }
+        # Mock confirm_plan to return True
+        mocker.patch("archiver.confirm_plan", return_value=True)
 
-        # Create a context and mock the graceful exit to be requested
-        context = Context(config)
+        # Mock FileProcessor if not dry_run
+        if not dry_run:
+            mock_processor = mocker.MagicMock()
+            mock_processor.generate_action_plan.return_value = {
+                "transcoding": [],
+                "removals": [],
+            }
+            mock_processor.execute_plan.return_value = True
+            if cleanup:
+                mock_processor.cleanup_orphaned_files.return_value = None
+            mocker.patch("archiver.FileProcessor", return_value=mock_processor)
 
-        # Setup logging
-        logging_service = LoggingService(config)
-        context.logger = logging_service.setup_logging()
+            # Mock ProgressReporter
+            mock_progress = mocker.MagicMock()
+            mock_progress.__enter__ = mocker.MagicMock(return_value=mock_progress)
+            mock_progress.__exit__ = mocker.MagicMock(return_value=None)
+            mocker.patch("archiver.ProgressReporter", return_value=mock_progress)
 
-        # Request graceful exit
-        context.graceful_exit.request_exit()
+        # Run archiver
+        result = archiver.run_archiver(config)
 
-        # Run the state machine with the context
-        result = run_state_machine(context)
-
-        # Should return 0 for success (graceful exit is not an error)
-        assert result == 0
-
-    @pytest.mark.parametrize(
-        "cleanup_enabled,use_trash",
-        [
-            (True, True),
-            (True, False),
-            (False, True),
-            (False, False),
-        ],
-        ids=[
-            "cleanup_trash",
-            "cleanup_no_trash",
-            "no_cleanup_trash",
-            "no_cleanup_no_trash",
-        ],
-    )
-    def test_parametrized_integration_workflow(
-        self, file_helpers, suppress_logging_and_progress, cleanup_enabled, use_trash
-    ):
-        """Parameterized test for the full integration workflow with different configurations."""
-        # Create test files with different timestamps
-        now = datetime.now()
-        old_ts1 = (now - timedelta(days=31)).replace(microsecond=0)
-        old_ts2 = (now - timedelta(days=35)).replace(microsecond=0)
-
-        _mp4_file1 = file_helpers["create_file"]("2023/01/01/test1.mp4", ts=old_ts1)
-        _jpg_file1 = file_helpers["create_file"]("2023/01/01/test1.jpg", ts=old_ts1)
-
-        _mp4_file2 = file_helpers["create_file"]("2023/01/02/test2.mp4", ts=old_ts2)
-        _jpg_file2 = file_helpers["create_file"]("2023/01/02/test2.jpg", ts=old_ts2)
-
-        config = {
-            "directory": file_helpers["input_dir"],
-            "output": file_helpers["output_dir"],
-            "dry_run": True,  # Use dry run to avoid actual transcoding
-            "no_confirm": True,  # Skip confirmation
-            "cleanup": cleanup_enabled,
-            "age": 30,  # 30 days
-            "max_size": 1,  # 1GB
-            "use_trash": use_trash,
-            "trash_root": file_helpers["trash_dir"] if use_trash else None,
-        }
-
-        # Run the state machine
-        result = run_state_machine_with_config(config)
-
-        # Should return 0 for success regardless of configuration
+        # Verify result
         assert result == 0
 
 
-class TestLogRotation:
-    """Test log rotation functionality."""
+class TestLoggingProgressInteraction:
+    """Test the interaction between logging and progress updates"""
 
-    def test_rotate_log_file_function(self, temp_dirs):
-        """Test the rotate_log_file function directly."""
-        from archiver import rotate_log_file, LOG_ROTATION_SIZE
+    def test_thread_safety_with_logging_and_progress(self, mocker):
+        """Test that logging and progress updates don't interfere with each other"""
+        import threading
+        import time
 
-        log_file = temp_dirs["temp_dir"] / "test.log"
+        # Create a logger and progress reporter
+        graceful_exit = archiver.GracefulExit()
 
-        # Create a log file with content larger than the rotation size
-        large_content = b"x" * (LOG_ROTATION_SIZE + 100)  # Larger than rotation size
-        log_file.write_bytes(large_content)
+        # Create a mock logger to avoid actual file writes
+        mock_logger = mocker.MagicMock()
 
-        # Verify the log file exists and is larger than rotation size
-        assert log_file.exists()
-        assert log_file.stat().st_size > LOG_ROTATION_SIZE
+        # Test the global OUTPUT_LOCK coordination
+        reporter = archiver.ProgressReporter(5, graceful_exit, silent=False)
 
-        # Call the rotation function
-        rotate_log_file(log_file)
+        # Mock stderr to capture writes
+        mock_stderr = mocker.patch("sys.stderr")
 
-        # The original log file should now be empty (or new)
-        assert log_file.exists()
-        assert log_file.stat().st_size < len(large_content)  # Should be smaller now
+        # Mock time for predictable elapsed time
+        mock_time = mocker.patch("time.time")
+        mock_time.return_value = 0.0  # Start time
 
-        # The old log file should exist as .1 backup
-        backup_file = log_file.with_suffix(".log.1")
-        assert backup_file.exists()
-        assert backup_file.stat().st_size == len(large_content)  # Has the old content
+        results = []
 
-    def test_rotate_log_file_multiple_backups(self, temp_dirs):
-        """Test rotating log file creates multiple backups with proper numbering."""
-        from archiver import rotate_log_file, LOG_ROTATION_SIZE
+        def simulate_logging():
+            """Simulate logging happening in another thread"""
+            for i in range(3):
+                with (
+                    archiver.OUTPUT_LOCK
+                ):  # This simulates what the logger does when writing
+                    mock_stderr.write(f"Log message {i}\n")
+                    mock_stderr.flush()
+                    results.append(f"log_{i}")
+                time.sleep(0.01)  # Small delay
 
-        log_file = temp_dirs["temp_dir"] / "test.log"
+        def simulate_progress():
+            """Simulate progress updates happening in main thread"""
+            for i in range(3):
+                reporter.current = i
+                reporter.update_progress(i * 33.33)
+                results.append(f"progress_{i}")
+                time.sleep(0.01)  # Small delay
 
-        # First, create some backup files manually to simulate existing backups
-        backup_1 = log_file.with_suffix(".log.1")
-        backup_2 = log_file.with_suffix(".log.2")
+        # Run both operations simultaneously to test thread safety
+        log_thread = threading.Thread(target=simulate_logging)
+        progress_thread = threading.Thread(target=simulate_progress)
 
-        backup_2.write_bytes(b"old content 2")  # Oldest backup
-        backup_1.write_bytes(b"old content 1")  # More recent backup
+        log_thread.start()
+        progress_thread.start()
 
-        # Create the main log file with content larger than rotation size
-        large_content = b"x" * (LOG_ROTATION_SIZE + 100)
-        log_file.write_bytes(large_content)
+        log_thread.join()
+        progress_thread.join()
 
-        # Verify initial state
-        assert log_file.exists() and log_file.stat().st_size > LOG_ROTATION_SIZE
-        assert backup_1.exists() and backup_2.exists()
+        # Verify no exceptions occurred due to race conditions
+        # Both operations should complete without interfering
+        assert len([r for r in results if r.startswith("log_")]) == 3
+        assert len([r for r in results if r.startswith("progress_")]) == 3
 
-        # Call the rotation function
-        rotate_log_file(log_file)
+    def test_logger_uses_threadsafe_handler(self, mocker, tmp_path):
+        """Test that the logger uses the thread-safe handler"""
+        log_file = tmp_path / "test.log"
+        args = archiver.parse_args([str(tmp_path), "--log-file", str(log_file)])
+        config = archiver.Config(args)
 
-        # Check that the backup files have been renamed correctly
-        # Original .1 should become .2, new backup should be .1
-        new_backup_1 = log_file.with_suffix(".log.1")
-        new_backup_2 = log_file.with_suffix(".log.2")
-        new_backup_3 = log_file.with_suffix(".log.3")
+        # Mock the rotation function to avoid actual file operations
+        mocker.patch.object(archiver.Logger, "_rotate_log_file")
 
-        # The original log file should be recreated as a new smaller file
-        assert log_file.exists()
-        assert log_file.stat().st_size < len(large_content)
+        logger = archiver.Logger.setup(config)
 
-        # The old log file (large_content) should now be in .1
-        assert new_backup_1.exists()
-        assert new_backup_1.stat().st_size == len(large_content)
+        # Check that at least one handler is our ThreadSafeStreamHandler
+        console_handlers = [
+            h
+            for h in logger.handlers
+            if isinstance(h, archiver.ThreadSafeStreamHandler)
+        ]
+        assert len(console_handlers) == 1, (
+            f"Expected 1 ThreadSafeStreamHandler, got {len(console_handlers)}: {logger.handlers}"
+        )
 
-        # The old .1 backup should now be in .2
-        assert new_backup_2.exists()
-        assert new_backup_2.read_bytes() == b"old content 1"
-
-        # The old .2 backup should now be in .3
-        assert new_backup_3.exists()
-        assert new_backup_3.read_bytes() == b"old content 2"
-
-    def test_rotate_log_file_no_rotation_if_small(self, temp_dirs):
-        """Test that log file is not rotated if it's smaller than rotation size."""
-        from archiver import rotate_log_file, LOG_ROTATION_SIZE
-
-        log_file = temp_dirs["temp_dir"] / "test.log"
-
-        # Create a small log file with content smaller than the rotation size
-        small_content = b"x" * (LOG_ROTATION_SIZE - 100)  # Smaller than rotation size
-        log_file.write_bytes(small_content)
-
-        initial_size = log_file.stat().st_size
-        assert initial_size < LOG_ROTATION_SIZE
-
-        # Call the rotation function
-        rotate_log_file(log_file)
-
-        # The log file should remain unchanged
-        assert log_file.exists()
-        assert log_file.stat().st_size == initial_size
-        assert log_file.read_bytes() == small_content
-
-        # No backup file should be created
-        backup_file = log_file.with_suffix(".log.1")
-        assert not backup_file.exists()
-
-    def test_log_rotation_integration(self, temp_dirs):
-        """Test that log rotation happens during logging setup."""
-        from archiver import LoggingService, LOG_ROTATION_SIZE
-
-        log_file = temp_dirs["temp_dir"] / "transcoding.log"
-
-        # Create a large log file
-        large_content = b"x" * (LOG_ROTATION_SIZE + 500)
-        log_file.write_bytes(large_content)
-
-        config = {"log_file": log_file}
-        service = LoggingService(config)
-
-        # Setup logging - this should trigger rotation
-        logger = service.setup_logging()
-
-        # Check that rotation happened
-        assert log_file.exists()  # New log file exists
-        assert log_file.stat().st_size < len(large_content)  # New file is smaller
-
-        backup_file = log_file.with_suffix(".log.1")
-        assert backup_file.exists()  # Backup exists
-        assert backup_file.stat().st_size == len(
-            large_content
-        )  # Backup has original content
-
-        # Check that logging still works
-        logger.info("Test message after rotation")
-        assert log_file.stat().st_size > 0  # New log has content
+        # Verify the handler is correctly configured (we can't easily check stream since it's stderr)
+        handler = console_handlers[0]
+        assert handler.formatter is not None  # Should have a formatter
