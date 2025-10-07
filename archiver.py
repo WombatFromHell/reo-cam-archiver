@@ -33,7 +33,7 @@ class State(Enum):
     PLANNING = "planning"
     EXECUTION = "execution"
     CLEANUP = "cleanup"
-    ARCHIVE_CLEANUP = "archive_cleanup"  # Added for intelligent cleanup
+    ARCHIVE_CLEANUP = "archive_cleanup"
     TERMINATION = "termination"
 
 
@@ -128,7 +128,7 @@ class CameraService:
         mp4s: List[Tuple[Path, datetime]] = []
         mapping: Dict[str, Dict[str, Path]] = {}
         trash_files: Set[Path] = set()
-        trash_root = None
+        trash_root = self.config.get("trash_root")
 
         # Scan base directory
         for p in directory.rglob("*.*"):
@@ -136,7 +136,6 @@ class CameraService:
                 continue
 
             # Skip files in trash directory when scanning base directory
-            trash_root = self.config.get("trash_root")
             if trash_root and trash_root in p.parents:
                 continue
 
@@ -486,6 +485,10 @@ class FileService:
             if source_root is None:
                 source_root = file_path.parent
 
+            # Use config trash_root if not provided explicitly
+            if trash_root is None:
+                trash_root = self.config.get("trash_root")
+
             if use_trash and trash_root:
                 new_dest = self._calculate_trash_destination(
                     file_path, source_root, trash_root, is_output
@@ -716,9 +719,13 @@ class ProgressReporter:
             self.out.write(f"\r\x1b[2K{line}")
             self.out.flush()
         except Exception:
-            # Fallback for terminals that don't support ANSI escape codes
-            self.out.write(f"\r{line}")
-            self.out.flush()
+            try:
+                # Fallback for terminals that don't support ANSI escape codes
+                self.out.write(f"\r{line}")
+                self.out.flush()
+            except Exception:
+                # If both write attempts fail, silently ignore to prevent cascading errors
+                pass
 
     def __enter__(self):
         return self
@@ -1574,7 +1581,7 @@ class StateHandlerFactory:
     """Creates appropriate state handlers"""
 
     @staticmethod
-    def create_handler(state: State) -> StateHandler:
+    def create_handler(state: Any) -> StateHandler:
         handlers = {
             State.INITIALIZATION: InitializationHandler(),
             State.DISCOVERY: DiscoveryHandler(),
@@ -1668,12 +1675,19 @@ def setup_config(args: argparse.Namespace) -> Dict[str, Any]:
     return config
 
 
-def run_state_machine(context: Context) -> None:
+def run_state_machine(context: Context) -> int:
     """Run the state machine until termination"""
+    initial_state = context.current_state
+    error_occurred = False
+    states_visited = set()
+
     while (
         context.current_state != State.TERMINATION
         and not context.graceful_exit.should_exit()
     ):
+        # Track the states we visit to know if we're completing the workflow
+        states_visited.add(context.current_state)
+
         handler = StateHandlerFactory.create_handler(context.current_state)
 
         try:
@@ -1683,11 +1697,42 @@ def run_state_machine(context: Context) -> None:
 
             context.transition_to(next_state)
         except Exception as e:
+            error_occurred = True
             if context.logger:
                 context.logger.error(
                     f"Error in state {context.current_state.value}: {e}"
                 )
             context.transition_to(State.TERMINATION)
+
+    # Return 1 if an exception occurred during execution
+    if error_occurred:
+        return 1
+
+    # Return 1 if we terminated early in the workflow (e.g., from INITIALIZATION due to missing directory)
+    # If we only visited INITIALIZATION and then TERMINATION, that's an error condition
+    if (
+        initial_state == State.INITIALIZATION
+        and len(states_visited) == 1
+        and context.current_state == State.TERMINATION
+    ):
+        # We started at INITIALIZATION and immediately went to TERMINATION without visiting other states
+        return 1
+
+    # Return success code otherwise
+    return 0
+
+
+def run_state_machine_with_config(config: Dict[str, Any]) -> int:
+    """Run the state machine with a configuration dictionary.
+
+    Args:
+        config: Configuration dictionary
+
+    Returns:
+        int: 0 for success, non-zero for error
+    """
+    context = Context(config)
+    return run_state_machine(context)
 
 
 def cleanup_resources(context: Optional[Context]) -> None:
@@ -1704,8 +1749,8 @@ def main() -> int:
         args = parse_arguments()
         config = setup_config(args)
         context = Context(config)
-        run_state_machine(context)
-        return 0
+        result = run_state_machine(context)
+        return result
     except Exception as e:
         logging.error(f"Application error: {e}")
         return 1
