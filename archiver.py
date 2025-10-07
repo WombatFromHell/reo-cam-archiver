@@ -61,7 +61,7 @@ class Config:
         self.clean_output: bool = args.clean_output
         self.age: int = args.age
         self.log_file: Optional[FilePath] = (
-            Path(args.log_file) if args.log_file else None
+            Path(args.log_file) if args.log_file else self.directory / "archiver.log"
         )
 
 

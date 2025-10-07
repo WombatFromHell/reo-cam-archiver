@@ -32,7 +32,7 @@ class TestConfig:
         assert config.cleanup is False
         assert config.clean_output is False
         assert config.age == 30
-        assert config.log_file is None
+        assert config.log_file == tmp_path / "archiver.log"
 
     def test_config_initialization_default_directory(self):
         """Test that Config correctly initializes with default directory when no argument provided"""
@@ -49,7 +49,7 @@ class TestConfig:
         assert config.cleanup is False
         assert config.clean_output is False
         assert config.age == 30
-        assert config.log_file is None
+        assert config.log_file == Path("/camera/archiver.log")
 
     def test_config_with_default_directory_and_trash(self):
         """Test that Config correctly initializes default trash root with default directory"""
@@ -265,15 +265,16 @@ class TestLogger:
         assert any(isinstance(h, logging.FileHandler) for h in logger.handlers)
         assert any(isinstance(h, logging.StreamHandler) for h in logger.handlers)
 
-    def test_setup_without_file(self, tmp_path):
-        """Test logger setup without a log file"""
+    def test_setup_with_default_file(self, tmp_path):
+        """Test logger setup with default log file"""
         args = archiver.parse_args([str(tmp_path)])
         config = archiver.Config(args)
         logger = archiver.Logger.setup(config)
 
-        # Verify logger has only console handler
-        assert len(logger.handlers) == 1
-        assert isinstance(logger.handlers[0], logging.StreamHandler)
+        # Verify logger has both file and console handlers (due to default log file)
+        assert len(logger.handlers) == 2
+        assert any(isinstance(h, logging.FileHandler) for h in logger.handlers)
+        assert any(isinstance(h, logging.StreamHandler) for h in logger.handlers)
 
     def test_log_rotation(self, tmp_path):
         """Test log file rotation"""
@@ -312,6 +313,27 @@ class TestLogger:
 
         # Verify the files were moved correctly
         assert mock_move.call_count >= 3  # For .2 -> .3, .1 -> .2, and .log -> .1
+
+    def test_setup_with_default_log_file(self, tmp_path, mocker):
+        """Test logger setup with default log file path"""
+        args = archiver.parse_args([str(tmp_path)])  # No explicit log file
+        config = archiver.Config(args)
+
+        # Verify the default log file path is set correctly
+        expected_log_path = tmp_path / "archiver.log"
+        assert config.log_file == expected_log_path
+
+        # Mock the rotation function to avoid actual file operations
+        mock_rotate = mocker.patch.object(archiver.Logger, "_rotate_log_file")
+        logger = archiver.Logger.setup(config)
+
+        # Verify rotation was called with the default log file
+        mock_rotate.assert_called_once_with(expected_log_path)
+
+        # Verify logger has both file and console handlers
+        assert len(logger.handlers) == 2
+        assert any(isinstance(h, logging.FileHandler) for h in logger.handlers)
+        assert any(isinstance(h, logging.StreamHandler) for h in logger.handlers)
 
 
 class TestFileDiscovery:
