@@ -49,13 +49,13 @@ class Config:
         self.dry_run: bool = args.dry_run
         self.no_confirm: bool = args.no_confirm
         self.no_skip: bool = args.no_skip
-        self.use_trash: bool = args.use_trash
+        self.delete: bool = args.delete
         self.trash_root: Optional[FilePath] = (
-            Path(args.trash_root)
+            None
+            if args.delete  # If delete flag is set, don't use trash regardless
+            else Path(args.trash_root)
             if args.trash_root
             else (self.directory / ".deleted")
-            if self.use_trash
-            else None
         )
         self.cleanup: bool = args.cleanup
         self.clean_output: bool = args.clean_output
@@ -326,7 +326,7 @@ class FileManager:
         file_path: FilePath,
         logger: logging.Logger,
         dry_run: bool = False,
-        use_trash: bool = False,
+        delete: bool = False,
         trash_root: Optional[FilePath] = None,
         is_output: bool = False,
         source_root: Optional[FilePath] = None,
@@ -340,7 +340,7 @@ class FileManager:
             if source_root is None:
                 source_root = file_path.parent
 
-            if use_trash and trash_root:
+            if not delete and trash_root:  # Use trash by default unless delete is True
                 new_dest = FileManager._calculate_trash_destination(
                     file_path, source_root, trash_root, is_output
                 )
@@ -713,7 +713,7 @@ class FileProcessor:
                         jpg,
                         self.logger,
                         dry_run=self.config.dry_run,
-                        use_trash=self.config.use_trash,
+                        delete=self.config.delete,
                         trash_root=self.config.trash_root,
                         is_output=False,
                         source_root=jpg.parent,
@@ -734,7 +734,7 @@ class FileProcessor:
                         source_removal_action["file"],
                         self.logger,
                         dry_run=self.config.dry_run,
-                        use_trash=self.config.use_trash,
+                        delete=self.config.delete,
                         trash_root=self.config.trash_root,
                         is_output=False,
                         source_root=source_removal_action["file"].parent,
@@ -754,7 +754,7 @@ class FileProcessor:
                 file_path,
                 self.logger,
                 dry_run=self.config.dry_run,
-                use_trash=self.config.use_trash,
+                delete=self.config.delete,
                 trash_root=self.config.trash_root,
                 is_output=False,
                 source_root=file_path.parent,
@@ -779,7 +779,7 @@ class FileProcessor:
                 jpg,
                 self.logger,
                 dry_run=self.config.dry_run,
-                use_trash=self.config.use_trash,
+                delete=self.config.delete,
                 trash_root=self.config.trash_root,
                 is_output=False,
                 source_root=jpg.parent,
@@ -913,9 +913,9 @@ def parse_args(args: Optional[List[str]] = None) -> argparse.Namespace:
         help="Don't skip files that already have archives",
     )
     parser.add_argument(
-        "--use-trash",
+        "--delete",
         action="store_true",
-        help="Move files to trash instead of deleting",
+        help="Permanently delete files instead of moving to trash",
     )
     parser.add_argument(
         "--trash-root",

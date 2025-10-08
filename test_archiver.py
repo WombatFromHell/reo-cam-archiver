@@ -27,8 +27,10 @@ class TestConfig:
         assert config.dry_run is False
         assert config.no_confirm is False
         assert config.no_skip is False
-        assert config.use_trash is False
-        assert config.trash_root is None
+        assert config.delete is False
+        assert (
+            config.trash_root == tmp_path / ".deleted"
+        )  # Trash is now default behavior
         assert config.cleanup is False
         assert config.clean_output is False
         assert config.age == 30
@@ -44,21 +46,23 @@ class TestConfig:
         assert config.dry_run is False
         assert config.no_confirm is False
         assert config.no_skip is False
-        assert config.use_trash is False
-        assert config.trash_root is None
+        assert config.delete is False
+        assert (
+            config.trash_root == Path("/camera") / ".deleted"
+        )  # Trash is now default behavior
         assert config.cleanup is False
         assert config.clean_output is False
         assert config.age == 30
         assert config.log_file == Path("/camera/archiver.log")
 
-    def test_config_with_default_directory_and_trash(self):
-        """Test that Config correctly initializes default trash root with default directory"""
-        args = archiver.parse_args(["--use-trash"])
+    def test_config_with_default_directory_uses_trash_by_default(self):
+        """Test that Config correctly initializes default trash root with default directory (trash by default)"""
+        args = archiver.parse_args([])
         config = archiver.Config(args)
 
         assert config.directory == Path("/camera")
         assert config.trash_root == Path("/camera") / ".deleted"
-        assert config.use_trash is True
+        assert config.delete is False
 
     def test_config_with_all_options(self, tmp_path):
         """Test Config with all options enabled"""
@@ -74,9 +78,11 @@ class TestConfig:
                 "--dry-run",
                 "--no-confirm",
                 "--no-skip",
-                "--use-trash",
+                "--delete",  # New flag to enable permanent deletion instead of trash
                 "--trash-root",
-                str(trash_root),
+                str(
+                    trash_root
+                ),  # Even with trash-root specified, delete=True should override
                 "--cleanup",
                 "--clean-output",
                 "--age",
@@ -92,25 +98,28 @@ class TestConfig:
         assert config.dry_run is True
         assert config.no_confirm is True
         assert config.no_skip is True
-        assert config.use_trash is True
-        assert config.trash_root == trash_root
+        assert (
+            config.delete is True
+        )  # New behavior: --delete flag enables permanent deletion
+        assert (
+            config.trash_root is None
+        )  # With --delete flag, trash root is ignored even if specified
         assert config.cleanup is True
         assert config.clean_output is True
         assert config.age == 60
         assert config.log_file == log_file
 
-    def test_config_with_use_trash_no_trash_root(self, tmp_path):
-        """Test Config with use-trash but no trash-root specified (should default to <directory>/.deleted)"""
+    def test_config_default_trash_behavior_no_trash_root_specified(self, tmp_path):
+        """Test Config default trash behavior with no trash-root specified (should default to <directory>/.deleted)"""
         args = archiver.parse_args(
             [
                 str(tmp_path),
-                "--use-trash",
             ]
         )
         config = archiver.Config(args)
 
         assert config.directory == tmp_path
-        assert config.use_trash is True
+        assert config.delete is False
         assert config.trash_root == tmp_path / ".deleted"
 
 
@@ -490,7 +499,7 @@ class TestFileManager:
         mock_move = mocker.patch("shutil.move")
 
         archiver.FileManager.remove_file(
-            file_path, logger, dry_run=False, use_trash=True, trash_root=trash_root
+            file_path, logger, dry_run=False, delete=False, trash_root=trash_root
         )
 
         # Verify file was moved to trash
@@ -1171,7 +1180,7 @@ class TestParseArgs:
         assert args.dry_run is False
         assert args.no_confirm is False
         assert args.no_skip is False
-        assert args.use_trash is False
+        assert args.delete is False
         assert args.trash_root is None
         assert args.cleanup is False
         assert args.clean_output is False
@@ -1188,7 +1197,7 @@ class TestParseArgs:
                 "--dry-run",
                 "--no-confirm",
                 "--no-skip",
-                "--use-trash",
+                "--delete",  # New flag replacing --use-trash
                 "--trash-root",
                 "/trash",
                 "--cleanup",
@@ -1205,7 +1214,7 @@ class TestParseArgs:
         assert args.dry_run is True
         assert args.no_confirm is True
         assert args.no_skip is True
-        assert args.use_trash is True
+        assert args.delete is True  # New behavior: --delete flag
         assert args.trash_root == "/trash"
         assert args.cleanup is True
         assert args.clean_output is True
@@ -1483,15 +1492,19 @@ class TestIntegration:
         args = [str(camera_dir), "-o", str(output_dir)]
         if dry_run:
             args.append("--dry-run")
+        # The parametrized test has old behavior: use_trash=True meant enable trash
+        # Now trash is default, so we need to reverse the logic
+        # When old use_trash was True (wanted trash), now we use default (no flag needed)
+        # When old use_trash was False (didn't want trash), now we need --delete flag
+        if not use_trash:
+            args.append("--delete")
+        # Add trash-root configuration regardless
         if use_trash:
-            args.extend(["--use-trash", "--trash-root", str(trash_dir)])
-        if cleanup:
-            args.append("--cleanup")
+            args.extend(["--trash-root", str(trash_dir)])
 
-        # Parse arguments
+        # Parse arguments and create config
         parsed_args = archiver.parse_args(args)
         config = archiver.Config(parsed_args)
-
         # Mock logger setup
         mock_logger = mocker.MagicMock()
         mocker.patch.object(archiver.Logger, "setup", return_value=mock_logger)
