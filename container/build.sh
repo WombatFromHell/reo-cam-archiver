@@ -1,6 +1,5 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
-set -euxo pipefail
 IMAGE_NAME="cam_archiver"
 
 build() {
@@ -28,7 +27,7 @@ help() {
   exit 1
 }
 
-CMD=${@:-""}
+CMD=${1:-} # only use first arg
 case "$CMD" in
 "--help" | "-h")
   help
@@ -44,7 +43,6 @@ case "$CMD" in
   ;;
 *)
   build
-  run
   ;;
 esac
 

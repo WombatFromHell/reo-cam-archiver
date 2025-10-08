@@ -1,2 +1,5 @@
 # run FFMPEG archival and organization every day @ midnight
 0 0 * * * /camera/archive-task.sh >> /var/log/cron.log 2>&1
+# run cleanup task twice a month on 1st/3rd Sunday @ 11pm
+0 23 1-7 * 0 /camera/cleanup-task.sh >> /var/log/cron.log 2>&1
+0 23 15-21 * 0 /camera/cleanup-task.sh >> /var/log/cron.log 2>&1
