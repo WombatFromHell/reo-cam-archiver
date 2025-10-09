@@ -438,7 +438,9 @@ class FileManager:
         return new_dest
 
     @staticmethod
-    def clean_empty_directories(directory: FilePath, logger: logging.Logger) -> None:
+    def clean_empty_directories(
+        directory: FilePath, logger: logging.Logger, dry_run: bool = False
+    ) -> None:
         """Remove empty date-structured directories"""
         for dirpath, dirs, files in os.walk(directory, topdown=False):
             p = Path(dirpath)
@@ -448,8 +450,11 @@ class FileManager:
             try:
                 # Check if directory is empty
                 if not any(p.iterdir()):
-                    p.rmdir()
-                    logger.info(f"Removed empty directory: {p}")
+                    if dry_run:
+                        logger.info(f"[DRY RUN] Would remove empty directory: {p}")
+                    else:
+                        p.rmdir()
+                        logger.info(f"Removed empty directory: {p}")
             except OSError:
                 pass
 
@@ -489,12 +494,17 @@ class Transcoder:
         logger: logging.Logger,
         progress_cb: Optional[ProgressCallback] = None,
         graceful_exit: Optional[GracefulExit] = None,
+        dry_run: bool = False,
     ) -> bool:
         """Transcode a video file using ffmpeg with QSV hardware acceleration"""
         if graceful_exit is None:
             graceful_exit = GracefulExit()
         if graceful_exit.should_exit():
             return False
+
+        if dry_run:
+            logger.info(f"[DRY RUN] Would transcode {input_path} -> {output_path}")
+            return True  # Pretend transcoding succeeded in dry run
 
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -751,6 +761,7 @@ class FileProcessor:
                 self.logger,
                 progress_callback,
                 self.graceful_exit,
+                dry_run=self.config.dry_run,
             )
 
             if success:
@@ -803,13 +814,24 @@ class FileProcessor:
                 break
 
             file_path = action["file"]
+            # Determine if this file is from the output directory
+            # by checking if it's within the output directory path
+            is_output_file = False
+            if self.config.output and self.config.clean_output:
+                try:
+                    file_path.relative_to(self.config.output)
+                    is_output_file = True
+                except ValueError:
+                    # File is not within output directory
+                    is_output_file = False
+
             FileManager.remove_file(
                 file_path,
                 self.logger,
                 dry_run=self.config.dry_run,
                 delete=self.config.delete,
                 trash_root=self.config.trash_root,
-                is_output=False,
+                is_output=is_output_file,
                 source_root=file_path.parent,
             )
 
@@ -828,13 +850,24 @@ class FileProcessor:
                 continue
 
             self.logger.info(f"Found orphaned JPG (no MP4 pair): {jpg}")
+            # Determine if this file is from the output directory
+            # by checking if it's within the output directory path
+            is_output_file = False
+            if self.config.output:
+                try:
+                    jpg.relative_to(self.config.output)
+                    is_output_file = True
+                except ValueError:
+                    # File is not within output directory
+                    is_output_file = False
+
             FileManager.remove_file(
                 jpg,
                 self.logger,
                 dry_run=self.config.dry_run,
                 delete=self.config.delete,
                 trash_root=self.config.trash_root,
-                is_output=False,
+                is_output=is_output_file,
                 source_root=jpg.parent,
             )
             count += 1
@@ -843,7 +876,9 @@ class FileProcessor:
             self.logger.info(f"Removed {count} orphaned JPG files")
 
         # Clean empty directories
-        FileManager.clean_empty_directories(self.config.directory, self.logger)
+        FileManager.clean_empty_directories(
+            self.config.directory, self.logger, dry_run=self.config.dry_run
+        )
 
     def _output_path(self, input_file: FilePath, timestamp: Timestamp) -> FilePath:
         """Generate output path for archived file"""
@@ -1033,8 +1068,26 @@ def run_archiver(config: Config) -> int:
         # Display plan
         display_plan(plan, logger, config)
 
-        # If in dry-run mode, exit immediately
+        # If in dry-run mode, execute the plan but without actually modifying files
         if config.dry_run:
+            logger.info("Processing files (dry run - no actual filesystem changes)")
+
+            progress_reporter = ProgressReporter(
+                total_files=len(plan["transcoding"]),
+                graceful_exit=graceful_exit,
+                silent=True,  # Don't show progress bar since no real work is done
+            )
+
+            with progress_reporter:
+                processor.execute_plan(plan, progress_reporter)
+
+            # Stage 4: Cleanup (in dry run mode)
+            if config.cleanup:
+                logger.info(
+                    "Cleaning up files (dry run - no actual filesystem changes)"
+                )
+                processor.cleanup_orphaned_files(mapping)
+
             logger.info("Dry run completed - no transcoding or removals performed")
             return 0
 
@@ -1043,18 +1096,13 @@ def run_archiver(config: Config) -> int:
             logger.info("Operation cancelled by user")
             return 0
 
-        # Ask for confirmation if needed
-        if not confirm_plan(plan, config, logger):
-            logger.info("Operation cancelled by user")
-            return 0
-
-        # Stage 3: Processing
+        # Stage 3: Processing (real execution)
         logger.info("Processing files")
 
         progress_reporter = ProgressReporter(
             total_files=len(plan["transcoding"]),
             graceful_exit=graceful_exit,
-            silent=config.dry_run,
+            silent=False,
         )
 
         with progress_reporter:

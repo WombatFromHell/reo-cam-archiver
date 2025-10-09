@@ -725,7 +725,7 @@ class TestTranscoder:
         progress_cb = mocker.MagicMock()
 
         result = archiver.Transcoder.transcode_file(
-            input_path, output_path, logger, progress_cb, graceful_exit
+            input_path, output_path, logger, progress_cb, graceful_exit, dry_run=False
         )
 
         assert result is True
@@ -760,7 +760,7 @@ class TestTranscoder:
         progress_cb = mocker.MagicMock()
 
         result = archiver.Transcoder.transcode_file(
-            input_path, output_path, logger, progress_cb, graceful_exit
+            input_path, output_path, logger, progress_cb, graceful_exit, dry_run=False
         )
 
         assert result is False
@@ -783,10 +783,43 @@ class TestTranscoder:
         progress_cb = mocker.MagicMock()
 
         result = archiver.Transcoder.transcode_file(
-            input_path, output_path, logger, progress_cb, graceful_exit
+            input_path, output_path, logger, progress_cb, graceful_exit, dry_run=False
         )
 
         assert result is False
+
+    def test_transcode_file_dry_run(self, mocker):
+        """Test file transcoding in dry-run mode (should not execute ffmpeg)"""
+        input_path = Path("/test/input.mp4")
+        output_path = Path("/test/output.mp4")
+        logger = mocker.MagicMock()
+        graceful_exit = archiver.GracefulExit()
+
+        # Mock Path.mkdir to verify it's NOT called
+        mock_mkdir = mocker.patch("pathlib.Path.mkdir")
+
+        # Mock subprocess.Popen to verify it's NOT called
+        mock_popen = mocker.patch("subprocess.Popen")
+
+        # Mock progress callback
+        progress_cb = mocker.MagicMock()
+
+        result = archiver.Transcoder.transcode_file(
+            input_path, output_path, logger, progress_cb, graceful_exit, dry_run=True
+        )
+
+        # Should return True (success) in dry run mode
+        assert result is True
+
+        # Verify that neither mkdir nor subprocess was called
+        mock_mkdir.assert_not_called()
+        mock_popen.assert_not_called()
+
+        # Verify that the dry-run message was logged
+        logger.info.assert_called_once()
+        assert "[DRY RUN] Would transcode" in logger.info.call_args[0][0]
+        assert str(input_path) in logger.info.call_args[0][0]
+        assert str(output_path) in logger.info.call_args[0][0]
 
 
 class TestFileProcessor:
@@ -1024,6 +1057,49 @@ class TestFileProcessor:
         assert mock_remove.call_args[0][0] == orphaned_jpg
         mock_clean_dirs.assert_called_once()
 
+    def test_cleanup_orphaned_files_from_output_directory(self, tmp_path, mocker):
+        """Test cleaning up orphaned JPG files from output directory"""
+        # Create config with output directory
+        output_dir = tmp_path / "archived"
+        args = archiver.parse_args([str(tmp_path), "-o", str(output_dir)])
+        config = archiver.Config(args)
+
+        # Create logger
+        logger = mocker.MagicMock()
+
+        # Create graceful exit
+        graceful_exit = archiver.GracefulExit()
+
+        # Create processor
+        processor = archiver.FileProcessor(config, logger, graceful_exit)
+
+        # Create test data - orphaned JPG in output directory (no MP4)
+        orphaned_output_jpg = (
+            output_dir / "2023" / "01" / "15" / "archived-20230115120000.jpg"
+        )
+
+        mapping = {
+            "20230115120000": {".jpg": orphaned_output_jpg},  # Orphaned in output
+        }
+
+        # Mock file removal
+        mock_remove = mocker.patch.object(archiver.FileManager, "remove_file")
+
+        # Mock clean_empty_directories
+        mock_clean_dirs = mocker.patch.object(
+            archiver.FileManager, "clean_empty_directories"
+        )
+
+        # Cleanup orphaned files
+        processor.cleanup_orphaned_files(mapping)
+
+        # Verify that remove_file was called with is_output=True
+        mock_remove.assert_called_once()
+        assert mock_remove.call_args[0][0] == orphaned_output_jpg
+        # Check that is_output was set to True because the file is in the output directory
+        assert mock_remove.call_args[1]["is_output"] is True
+        mock_clean_dirs.assert_called_once()
+
     def test_output_path(self, tmp_path, mocker):
         """Test generating output path for archived file"""
         # Create config
@@ -1053,6 +1129,146 @@ class TestFileProcessor:
             tmp_path / "archived" / "2023" / "01" / "15" / "archived-20230115120000.mp4"
         )
         assert output_path == expected
+
+    def test_execute_plan_with_files_from_output_directory(self, tmp_path, mocker):
+        """Test executing an action plan with files from output directory during cleanup"""
+        # Create config with cleanup and clean_output
+        output_dir = tmp_path / "archived"
+        args = archiver.parse_args([str(tmp_path), "--cleanup", "--clean-output"])
+        config = archiver.Config(args)
+
+        # Create logger
+        logger = mocker.MagicMock()
+
+        # Create graceful exit
+        graceful_exit = archiver.GracefulExit()
+
+        # Create processor
+        processor = archiver.FileProcessor(config, logger, graceful_exit)
+
+        # Create test plan with a file from output directory
+        archived_file = (
+            output_dir / "2023" / "01" / "15" / "archived-20230115120000.mp4"
+        )
+
+        plan = {
+            "transcoding": [],
+            "removals": [
+                {
+                    "type": "source_removal_after_skip",
+                    "file": archived_file,
+                    "reason": "Skipping transcoding: cleanup mode enabled",
+                },
+            ],
+        }
+
+        # Mock file removal
+        mock_remove = mocker.patch.object(archiver.FileManager, "remove_file")
+
+        # Create progress reporter
+        progress_reporter = mocker.MagicMock()
+
+        # Execute plan
+        result = processor.execute_plan(plan, progress_reporter)
+
+        # Verify execution
+        assert result is True
+        # Should be called with is_output=True because the file is from the output directory
+        mock_remove.assert_called_once()
+        assert mock_remove.call_args[0][0] == archived_file
+        # Check that is_output was set to True because the file is in the output directory
+        assert mock_remove.call_args[1]["is_output"] is True
+
+    def test_execute_plan_dry_run_with_cleanup(self, tmp_path, mocker):
+        """Test executing an action plan in dry-run mode with cleanup"""
+        # Create config with cleanup and dry-run
+        args = archiver.parse_args([str(tmp_path), "--cleanup", "--dry-run"])
+        config = archiver.Config(args)
+
+        # Create logger
+        logger = mocker.MagicMock()
+
+        # Create graceful exit
+        graceful_exit = archiver.GracefulExit()
+
+        # Create processor
+        processor = archiver.FileProcessor(config, logger, graceful_exit)
+
+        # Create test plan with removals (simulating cleanup)
+        input_file = (
+            tmp_path / "camera" / "2023" / "01" / "15" / "REO_camera_20230115120000.mp4"
+        )
+
+        plan = {
+            "transcoding": [],  # No transcoding in cleanup mode
+            "removals": [
+                {
+                    "type": "source_removal_after_skip",
+                    "file": input_file,
+                    "reason": "Skipping transcoding: cleanup mode enabled",
+                },
+            ],
+        }
+
+        # Mock file removal to verify dry-run behavior
+        mock_remove = mocker.patch.object(archiver.FileManager, "remove_file")
+
+        # Create progress reporter
+        progress_reporter = mocker.MagicMock()
+
+        # Execute plan
+        result = processor.execute_plan(plan, progress_reporter)
+
+        # Verify execution completed
+        assert result is True
+
+        # Verify that FileManager.remove_file was called with dry_run=True
+        mock_remove.assert_called_once()
+        assert mock_remove.call_args[0][0] == input_file
+        assert mock_remove.call_args[1]["dry_run"] is True  # This should be true
+
+    def test_cleanup_orphaned_files_dry_run(self, tmp_path, mocker):
+        """Test cleanup of orphaned files in dry-run mode"""
+        # Create config with dry-run
+        args = archiver.parse_args([str(tmp_path), "--dry-run"])
+        config = archiver.Config(args)
+
+        # Create logger
+        logger = mocker.MagicMock()
+
+        # Create graceful exit
+        graceful_exit = archiver.GracefulExit()
+
+        # Create processor
+        processor = archiver.FileProcessor(config, logger, graceful_exit)
+
+        # Create test mapping with an orphaned JPG file
+        orphaned_jpg = (
+            tmp_path / "camera" / "2023" / "01" / "15" / "REO_camera_20230115120000.jpg"
+        )
+        mapping = {
+            "20230115120000": {".jpg": orphaned_jpg},  # Orphaned JPG, no MP4
+        }
+
+        # Mock file removal to verify it's called with dry_run
+        mock_remove = mocker.patch.object(archiver.FileManager, "remove_file")
+
+        # Mock clean_empty_directories to verify it's called with dry_run
+        mock_clean_dirs = mocker.patch.object(
+            archiver.FileManager, "clean_empty_directories"
+        )
+
+        # Execute cleanup
+        processor.cleanup_orphaned_files(mapping)
+
+        # Verify that FileManager.remove_file was called with dry_run=True
+        mock_remove.assert_called_once()
+        assert mock_remove.call_args[0][0] == orphaned_jpg
+        assert mock_remove.call_args[1]["dry_run"] is True  # This should be true
+
+        # Verify that clean_empty_directories was called with dry_run=True
+        mock_clean_dirs.assert_called_once()
+        assert mock_clean_dirs.call_args[1]["dry_run"] is True
 
     def test_generate_action_plan_with_cleanup_flag(self, tmp_path, mocker):
         """Test that cleanup flag disables transcoding and only generates removal actions"""
