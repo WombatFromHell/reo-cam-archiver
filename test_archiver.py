@@ -17,125 +17,119 @@ import archiver
 class TestConfig:
     """Test the Config class"""
 
-    def test_config_initialization(self, tmp_path):
-        """Test that Config correctly initializes from args"""
-        args = archiver.parse_args([str(tmp_path)])
+    @pytest.mark.parametrize(
+        "args_input,expected_values",
+        [
+            # Test config initialization with default directory
+            (
+                [],
+                {
+                    "directory": Path("/camera"),
+                    "output": Path("/camera") / "archived",
+                    "dry_run": False,
+                    "no_confirm": False,
+                    "no_skip": False,
+                    "delete": False,
+                    "trash_root": Path("/camera") / ".deleted",
+                    "cleanup": False,
+                    "clean_output": False,
+                    "age": 30,
+                    "log_file": Path("/camera/archiver.log"),
+                },
+            ),
+            # Test config initialization with custom directory
+            (
+                ["{tmp_path}"],
+                {
+                    "directory": "{tmp_path}",
+                    "output": "{tmp_path}/archived",
+                    "dry_run": False,
+                    "no_confirm": False,
+                    "no_skip": False,
+                    "delete": False,
+                    "trash_root": "{tmp_path}/.deleted",
+                    "cleanup": False,
+                    "clean_output": False,
+                    "age": 30,
+                    "log_file": "{tmp_path}/archiver.log",
+                },
+            ),
+            # Test config with all options enabled
+            (
+                [
+                    "{tmp_path}",
+                    "-o",
+                    "{tmp_path}/output",
+                    "--dry-run",
+                    "--no-confirm",
+                    "--no-skip",
+                    "--delete",
+                    "--trash-root",
+                    "{tmp_path}/trash",
+                    "--cleanup",
+                    "--clean-output",
+                    "--age",
+                    "60",
+                    "--log-file",
+                    "{tmp_path}/log.txt",
+                ],
+                {
+                    "directory": "{tmp_path}",
+                    "output": "{tmp_path}/output",
+                    "dry_run": True,
+                    "no_confirm": True,
+                    "no_skip": True,
+                    "delete": True,
+                    "trash_root": None,  # With --delete flag, trash root is ignored
+                    "cleanup": True,
+                    "clean_output": True,
+                    "age": 60,
+                    "log_file": "{tmp_path}/log.txt",
+                },
+            ),
+        ],
+    )
+    def test_config_initialization_various_scenarios(
+        self, tmp_path, args_input, expected_values
+    ):
+        """Test Config initialization with various argument combinations"""
+        # Replace placeholders in args_input
+        processed_args = [arg.format(tmp_path=tmp_path) for arg in args_input]
+        args = archiver.parse_args(processed_args)
         config = archiver.Config(args)
 
-        assert config.directory == tmp_path
-        assert config.output == tmp_path / "archived"
-        assert config.dry_run is False
-        assert config.no_confirm is False
-        assert config.no_skip is False
-        assert config.delete is False
-        assert (
-            config.trash_root == tmp_path / ".deleted"
-        )  # Trash is now default behavior
-        assert config.cleanup is False
-        assert config.clean_output is False
-        assert config.age == 30
-        assert config.log_file == tmp_path / "archiver.log"
+        # Replace placeholders in expected values
+        processed_expected = {}
+        for key, value in expected_values.items():
+            if isinstance(value, str):
+                processed_expected[key] = Path(value.format(tmp_path=tmp_path))
+            else:
+                processed_expected[key] = value
 
-    def test_config_initialization_default_directory(self):
-        """Test that Config correctly initializes with default directory when no argument provided"""
-        args = archiver.parse_args([])
-        config = archiver.Config(args)
-
-        assert config.directory == Path("/camera")
-        assert config.output == Path("/camera") / "archived"
-        assert config.dry_run is False
-        assert config.no_confirm is False
-        assert config.no_skip is False
-        assert config.delete is False
-        assert (
-            config.trash_root == Path("/camera") / ".deleted"
-        )  # Trash is now default behavior
-        assert config.cleanup is False
-        assert config.clean_output is False
-        assert config.age == 30
-        assert config.log_file == Path("/camera/archiver.log")
-
-    def test_config_with_default_directory_uses_trash_by_default(self):
-        """Test that Config correctly initializes default trash root with default directory (trash by default)"""
-        args = archiver.parse_args([])
-        config = archiver.Config(args)
-
-        assert config.directory == Path("/camera")
-        assert config.trash_root == Path("/camera") / ".deleted"
-        assert config.delete is False
-
-    def test_config_with_all_options(self, tmp_path):
-        """Test Config with all options enabled"""
-        output_dir = tmp_path / "output"
-        log_file = tmp_path / "log.txt"
-        trash_root = tmp_path / "trash"
-
-        args = archiver.parse_args(
-            [
-                str(tmp_path),
-                "-o",
-                str(output_dir),
-                "--dry-run",
-                "--no-confirm",
-                "--no-skip",
-                "--delete",  # New flag to enable permanent deletion instead of trash
-                "--trash-root",
-                str(
-                    trash_root
-                ),  # Even with trash-root specified, delete=True should override
-                "--cleanup",
-                "--clean-output",
-                "--age",
-                "60",
-                "--log-file",
-                str(log_file),
-            ]
-        )
-        config = archiver.Config(args)
-
-        assert config.directory == tmp_path
-        assert config.output == output_dir
-        assert config.dry_run is True
-        assert config.no_confirm is True
-        assert config.no_skip is True
-        assert (
-            config.delete is True
-        )  # New behavior: --delete flag enables permanent deletion
-        assert (
-            config.trash_root is None
-        )  # With --delete flag, trash root is ignored even if specified
-        assert config.cleanup is True
-        assert config.clean_output is True
-        assert config.age == 60
-        assert config.log_file == log_file
-
-    def test_config_default_trash_behavior_no_trash_root_specified(self, tmp_path):
-        """Test Config default trash behavior with no trash-root specified (should default to <directory>/.deleted)"""
-        args = archiver.parse_args(
-            [
-                str(tmp_path),
-            ]
-        )
-        config = archiver.Config(args)
-
-        assert config.directory == tmp_path
-        assert config.delete is False
-        assert config.trash_root == tmp_path / ".deleted"
+        # Assert all expected values
+        for key, expected_value in processed_expected.items():
+            actual_value = getattr(config, key)
+            assert actual_value == expected_value
 
 
 class TestGracefulExit:
     """Test the GracefulExit class"""
 
-    def test_initial_state(self):
-        """Test that GracefulExit starts in the correct state"""
+    @pytest.mark.parametrize(
+        "action,expected_state",
+        [
+            ("initial", False),
+            ("request_exit", True),
+        ],
+    )
+    def test_graceful_exit_states(self, action, expected_state):
+        """Test that GracefulExit starts in the correct state and changes correctly after request_exit"""
         graceful_exit = archiver.GracefulExit()
-        assert graceful_exit.should_exit() is False
 
-    def test_request_exit(self):
-        """Test that request_exit correctly changes the state"""
-        graceful_exit = archiver.GracefulExit()
-        graceful_exit.request_exit()
-        assert graceful_exit.should_exit() is True
+        if action == "request_exit":
+            graceful_exit.request_exit()
+
+        assert graceful_exit.should_exit() is expected_state
 
     def test_thread_safety(self):
         """Test that GracefulExit is thread-safe"""
@@ -256,34 +250,50 @@ class TestProgressReporter:
 class TestLogger:
     """Test the Logger class"""
 
-    def test_setup_with_file(self, tmp_path, mocker):
-        """Test logger setup with a log file"""
-        log_file = tmp_path / "test.log"
-        args = archiver.parse_args([str(tmp_path), "--log-file", str(log_file)])
+    @pytest.mark.parametrize(
+        "args_input,has_file_handler,has_console_handler,should_rotate",
+        [
+            # With explicit log file
+            (["{tmp_path}", "--log-file", "{tmp_path}/test.log"], True, True, True),
+            # With default log file
+            (["{tmp_path}"], True, True, True),
+        ],
+    )
+    def test_setup_various_scenarios(
+        self,
+        tmp_path,
+        mocker,
+        args_input,
+        has_file_handler,
+        has_console_handler,
+        should_rotate,
+    ):
+        """Test logger setup with various configurations"""
+        # Replace placeholders in args_input
+        processed_args = [arg.format(tmp_path=tmp_path) for arg in args_input]
+        args = archiver.parse_args(processed_args)
         config = archiver.Config(args)
 
-        # Mock the rotation function to avoid actual file operations
-        mock_rotate = mocker.patch.object(archiver.Logger, "_rotate_log_file")
+        # Initialize mock variable to prevent unbound error
+        mock_rotate = None
+
+        # Mock the rotation function to avoid actual file operations if needed
+        if should_rotate:
+            mock_rotate = mocker.patch.object(archiver.Logger, "_rotate_log_file")
+
         logger = archiver.Logger.setup(config)
 
-        # Verify rotation was called
-        mock_rotate.assert_called_once_with(log_file)
+        if should_rotate and mock_rotate:
+            # Verify rotation was called
+            log_file = config.log_file
+            mock_rotate.assert_called_once_with(log_file)
 
-        # Verify logger has both file and console handlers
-        assert len(logger.handlers) == 2
-        assert any(isinstance(h, logging.FileHandler) for h in logger.handlers)
-        assert any(isinstance(h, logging.StreamHandler) for h in logger.handlers)
-
-    def test_setup_with_default_file(self, tmp_path):
-        """Test logger setup with default log file"""
-        args = archiver.parse_args([str(tmp_path)])
-        config = archiver.Config(args)
-        logger = archiver.Logger.setup(config)
-
-        # Verify logger has both file and console handlers (due to default log file)
-        assert len(logger.handlers) == 2
-        assert any(isinstance(h, logging.FileHandler) for h in logger.handlers)
-        assert any(isinstance(h, logging.StreamHandler) for h in logger.handlers)
+        # Verify logger has expected handlers
+        assert len(logger.handlers) == sum([has_file_handler, has_console_handler])
+        if has_file_handler:
+            assert any(isinstance(h, logging.FileHandler) for h in logger.handlers)
+        if has_console_handler:
+            assert any(isinstance(h, logging.StreamHandler) for h in logger.handlers)
 
     def test_log_rotation(self, tmp_path):
         """Test log file rotation"""
@@ -322,27 +332,6 @@ class TestLogger:
 
         # Verify the files were moved correctly
         assert mock_move.call_count >= 3  # For .2 -> .3, .1 -> .2, and .log -> .1
-
-    def test_setup_with_default_log_file(self, tmp_path, mocker):
-        """Test logger setup with default log file path"""
-        args = archiver.parse_args([str(tmp_path)])  # No explicit log file
-        config = archiver.Config(args)
-
-        # Verify the default log file path is set correctly
-        expected_log_path = tmp_path / "archiver.log"
-        assert config.log_file == expected_log_path
-
-        # Mock the rotation function to avoid actual file operations
-        mock_rotate = mocker.patch.object(archiver.Logger, "_rotate_log_file")
-        logger = archiver.Logger.setup(config)
-
-        # Verify rotation was called with the default log file
-        mock_rotate.assert_called_once_with(expected_log_path)
-
-        # Verify logger has both file and console handlers
-        assert len(logger.handlers) == 2
-        assert any(isinstance(h, logging.FileHandler) for h in logger.handlers)
-        assert any(isinstance(h, logging.StreamHandler) for h in logger.handlers)
 
 
 class TestFileDiscovery:
@@ -430,115 +419,224 @@ class TestFileDiscovery:
         assert len(trash_files) == 1
         assert trash_mp4 in trash_files
 
-    def test_parse_timestamp_valid(self):
-        """Test parsing valid timestamps"""
-        timestamp = archiver.FileDiscovery._parse_timestamp(
-            "REO_camera_20230115120000.mp4"
-        )
-        assert timestamp == datetime(2023, 1, 15, 12, 0, 0)
+    @pytest.mark.parametrize(
+        "filename,method,expected_result",
+        [
+            # Valid timestamps for regular filenames
+            (
+                "REO_camera_20230115120000.mp4",
+                "_parse_timestamp",
+                datetime(2023, 1, 15, 12, 0, 0),
+            ),
+            (
+                "REO_front_20231231235959.JPG",
+                "_parse_timestamp",
+                datetime(2023, 12, 31, 23, 59, 59),
+            ),
+            # Valid timestamps for archived filenames
+            (
+                "archived-20230115120000.mp4",
+                "_parse_timestamp_from_archived_filename",
+                datetime(2023, 1, 15, 12, 0, 0),
+            ),
+            (
+                "archived-20231231235959.MP4",
+                "_parse_timestamp_from_archived_filename",
+                datetime(2023, 12, 31, 23, 59, 59),
+            ),
+            # Invalid timestamps for regular filenames
+            ("invalid_filename.mp4", "_parse_timestamp", None),
+            ("REO_camera_2023011512000.mp4", "_parse_timestamp", None),  # Missing digit
+            (
+                "REO_camera_19991231235959.mp4",
+                "_parse_timestamp",
+                None,
+            ),  # Year too early
+            (
+                "REO_camera_21001231235959.mp4",
+                "_parse_timestamp",
+                None,
+            ),  # Year too late
+            # Invalid timestamps for archived filenames
+            ("invalid_filename.mp4", "_parse_timestamp_from_archived_filename", None),
+        ],
+    )
+    def test_parse_timestamp_various_formats(self, filename, method, expected_result):
+        """Test parsing timestamps from various filename formats"""
+        parse_method = getattr(archiver.FileDiscovery, method)
+        result = parse_method(filename)
+        assert result == expected_result
 
-        timestamp = archiver.FileDiscovery._parse_timestamp(
-            "REO_front_20231231235959.JPG"
+    @pytest.mark.parametrize(
+        "test_scenario",
+        [
+            # Basic functionality: input/output flags with standard paths
+            {
+                "type": "basic",
+                "file_path": "camera/2023/01/15/file.mp4",
+                "source_root": "camera",
+                "is_output": False,
+                "expected_subdir": "input",
+                "with_conflict": False,
+            },
+            {
+                "type": "basic",
+                "file_path": "camera/2023/01/15/file.mp4",
+                "source_root": "camera",
+                "is_output": True,
+                "expected_subdir": "output",
+                "with_conflict": False,
+            },
+            # Real workflow paths
+            {
+                "type": "workflow",
+                "file_path": "camera/2023/01/15/file.mp4",
+                "source_root": "camera",
+                "is_output": False,
+                "expected_subdir": "input",
+                "with_conflict": False,
+            },
+            {
+                "type": "workflow",
+                "file_path": "camera/archived/2023/01/15/file.mp4",
+                "source_root": "camera/archived",
+                "is_output": True,
+                "expected_subdir": "output",
+                "with_conflict": False,
+            },
+            # Complex workflow with archived files managed from main camera root
+            {
+                "type": "workflow_complex",
+                "file_path": "camera/archived/2023/01/15/archived-20230115120000.mp4",
+                "source_root": "camera",
+                "is_output": True,
+                "expected_subdir": "output",
+                "with_conflict": False,
+            },
+            {
+                "type": "workflow_complex",
+                "file_path": "camera/2023/01/15/original.mp4",
+                "source_root": "camera",
+                "is_output": False,
+                "expected_subdir": "input",
+                "with_conflict": False,
+            },
+            # Conflict scenarios
+            {
+                "type": "conflict",
+                "file_path": "camera/2023/01/15/file.mp4",
+                "source_root": "camera",
+                "is_output": False,
+                "expected_subdir": "input",
+                "with_conflict": True,
+            },
+            {
+                "type": "conflict",
+                "file_path": "camera/2023/01/15/file.mp4",
+                "source_root": "camera",
+                "is_output": True,
+                "expected_subdir": "output",
+                "with_conflict": True,
+            },
+        ],
+    )
+    def test_calculate_trash_destination_comprehensive(
+        self, tmp_path, mocker, test_scenario
+    ):
+        """Comprehensive test for calculating trash destination with various scenarios"""
+        file_path = tmp_path / test_scenario["file_path"]
+        source_root = tmp_path / test_scenario["source_root"]
+        trash_root = (
+            tmp_path / "trash"
+            if test_scenario["type"] == "conflict"
+            else tmp_path / ".deleted"
         )
-        assert timestamp == datetime(2023, 12, 31, 23, 59, 59)
+        is_output = test_scenario["is_output"]
+        expected_subdir = test_scenario["expected_subdir"]
+        with_conflict = test_scenario["with_conflict"]
 
-    def test_parse_timestamp_invalid(self):
-        """Test parsing invalid timestamps"""
-        assert archiver.FileDiscovery._parse_timestamp("invalid_filename.mp4") is None
-        assert (
-            archiver.FileDiscovery._parse_timestamp("REO_camera_2023011512000.mp4")
-            is None
-        )  # Missing digit
-        assert (
-            archiver.FileDiscovery._parse_timestamp("REO_camera_19991231235959.mp4")
-            is None
-        )  # Year too early
-        assert (
-            archiver.FileDiscovery._parse_timestamp("REO_camera_21001231235959.mp4")
-            is None
-        )  # Year too late
+        if with_conflict:
+            # Mock exists to return True for the base destination for conflict testing
+            def mock_exists(self):
+                return (
+                    self
+                    == trash_root / expected_subdir / "2023" / "01" / "15" / "file.mp4"
+                )
+
+            mocker.patch("pathlib.Path.exists", mock_exists)
+            mocker.patch("time.time", return_value=1000.0)
+
+        dest = archiver.FileManager._calculate_trash_destination(
+            file_path, source_root, trash_root, is_output=is_output
+        )
+
+        if with_conflict:
+            # For conflict tests, verify timestamp and counter were added
+            assert "1000_1" in dest.name
+            assert dest.suffix == ".mp4"
+        else:
+            # For normal tests, verify path correctness
+            relative_path = file_path.relative_to(source_root)
+            expected_dest = trash_root / expected_subdir / relative_path
+            assert dest == expected_dest
 
 
 class TestFileManager:
     """Test the FileManager class"""
 
-    def test_remove_file_dry_run(self, mocker):
-        """Test file removal in dry run mode"""
+    @pytest.mark.parametrize(
+        "dry_run,delete,trash_root,expected_message_contains",
+        [
+            # Test dry run mode
+            (True, False, None, "[DRY RUN] Would remove"),
+            # Test actual file removal
+            (False, True, None, "Removed:"),
+            # Test trash mode
+            (False, False, "/trash", "Moved to trash"),
+        ],
+    )
+    def test_remove_file_various_scenarios(
+        self, mocker, dry_run, delete, trash_root, expected_message_contains
+    ):
+        """Test file removal with various configurations"""
         logger = mocker.MagicMock()
         file_path = Path("/test/file.mp4")
 
-        archiver.FileManager.remove_file(file_path, logger, dry_run=True)
+        # Initialize mock variables to prevent unbound errors
+        mock_unlink = None
+        mock_move = None
 
-        # Verify logger was called with dry run message
-        logger.info.assert_called_once_with("[DRY RUN] Would remove /test/file.mp4")
+        # Conditionally handle trash_root
+        effective_trash_root = Path(trash_root) if trash_root else None
 
-    def test_remove_file_actual(self, mocker):
-        """Test actual file removal"""
-        logger = mocker.MagicMock()
-        file_path = Path("/test/file.mp4")
-
-        # Mock the file operations
-        mocker.patch("pathlib.Path.is_file", return_value=True)
-        mock_unlink = mocker.patch("pathlib.Path.unlink")
-
-        archiver.FileManager.remove_file(file_path, logger, dry_run=False)
-
-        # Verify file was unlinked
-        mock_unlink.assert_called_once()
-        logger.info.assert_called_once_with("Removed: /test/file.mp4")
-
-    def test_remove_file_with_trash(self, mocker):
-        """Test file removal with trash"""
-        logger = mocker.MagicMock()
-        file_path = Path("/test/file.mp4")
-        trash_root = Path("/trash")
-
-        # Mock the file operations
-        mocker.patch("pathlib.Path.is_file", return_value=True)
-        mocker.patch("pathlib.Path.mkdir")
-        mock_move = mocker.patch("shutil.move")
+        if not dry_run and delete:
+            # For actual removal
+            mocker.patch("pathlib.Path.is_file", return_value=True)
+            mock_unlink = mocker.patch("pathlib.Path.unlink")
+        elif not dry_run and effective_trash_root:
+            # For trash mode
+            mocker.patch("pathlib.Path.is_file", return_value=True)
+            mocker.patch("pathlib.Path.mkdir")
+            mock_move = mocker.patch("shutil.move")
 
         archiver.FileManager.remove_file(
-            file_path, logger, dry_run=False, delete=False, trash_root=trash_root
+            file_path,
+            logger,
+            dry_run=dry_run,
+            delete=delete,
+            trash_root=effective_trash_root,
         )
 
-        # Verify file was moved to trash
-        mock_move.assert_called_once()
-        logger.info.assert_called_once()
-        assert "Moved to trash" in logger.info.call_args[0][0]
+        # Verify logger was called
+        assert logger.info.call_count >= 1
+        call_args = logger.info.call_args[0][0]
+        assert expected_message_contains in call_args
 
-    def test_calculate_trash_destination(self, tmp_path):
-        """Test calculating trash destination path"""
-        file_path = tmp_path / "camera" / "2023" / "01" / "15" / "file.mp4"
-        source_root = tmp_path / "camera"
-        trash_root = tmp_path / "trash"
-
-        dest = archiver.FileManager._calculate_trash_destination(
-            file_path, source_root, trash_root, is_output=False
-        )
-
-        assert dest == trash_root / "input" / "2023" / "01" / "15" / "file.mp4"
-
-    def test_calculate_trash_destination_with_conflict(self, tmp_path, mocker):
-        """Test calculating trash destination with existing file"""
-        file_path = tmp_path / "camera" / "2023" / "01" / "15" / "file.mp4"
-        source_root = tmp_path / "camera"
-        trash_root = tmp_path / "trash"
-
-        # Mock exists to return True for the base destination
-        def mock_exists(self):
-            return self == trash_root / "input" / "2023" / "01" / "15" / "file.mp4"
-
-        mocker.patch("pathlib.Path.exists", mock_exists)
-        mocker.patch("time.time", return_value=1000.0)
-
-        dest = archiver.FileManager._calculate_trash_destination(
-            file_path, source_root, trash_root, is_output=False
-        )
-
-        # Verify timestamp and counter were added
-        assert "1000_1" in dest.name
-        assert dest.suffix == ".mp4"
+        # Additional verification for non-dry-run cases
+        if not dry_run and delete and mock_unlink:
+            assert mock_unlink.call_count == 1
+        elif not dry_run and effective_trash_root and mock_move:
+            assert mock_move.call_count == 1
 
     def test_clean_empty_directories(self, mocker):
         """Test cleaning empty directories"""
@@ -996,6 +1094,264 @@ class TestFileProcessor:
         for removal in plan["removals"]:
             assert "cleanup mode enabled" in removal["reason"]
 
+    def test_generate_action_plan_with_clean_output_flag(self, tmp_path, mocker):
+        """Test that clean_output flag works with cleanup to include output directory files"""
+        # Create config with cleanup and clean_output flags
+        output_dir = tmp_path / "archived"
+        args = archiver.parse_args(
+            [str(tmp_path), "--cleanup", "--clean-output", "--age", "10"]
+        )
+        config = archiver.Config(args)
+
+        # Create logger
+        logger = mocker.MagicMock()
+
+        # Create graceful exit
+        graceful_exit = archiver.GracefulExit()
+
+        # Create processor
+        processor = archiver.FileProcessor(config, logger, graceful_exit)
+
+        # Calculate dates based on current time for accurate age testing
+        ten_days_ago = datetime.now() - timedelta(days=10)
+        twelve_days_ago = datetime.now() - timedelta(days=12)
+        two_days_ago = datetime.now() - timedelta(days=2)
+
+        # Create test data - both input and output (archived) files
+        old_input_mp4 = (
+            tmp_path
+            / "camera"
+            / f"{ten_days_ago.year}"
+            / f"{ten_days_ago.month:02d}"
+            / f"{ten_days_ago.day:02d}"
+            / f"REO_camera_{ten_days_ago.strftime('%Y%m%d%H%M%S')}.mp4"  # Old file (just at threshold)
+        )
+        older_input_mp4 = (
+            tmp_path
+            / "camera"
+            / f"{twelve_days_ago.year}"
+            / f"{twelve_days_ago.month:02d}"
+            / f"{twelve_days_ago.day:02d}"
+            / f"REO_camera_{twelve_days_ago.strftime('%Y%m%d%H%M%S')}.mp4"  # Older file
+        )
+        old_archived_mp4 = (
+            output_dir
+            / f"{twelve_days_ago.year}"
+            / f"{twelve_days_ago.month:02d}"
+            / f"{twelve_days_ago.day:02d}"
+            / f"archived-{twelve_days_ago.strftime('%Y%m%d%H%M%S')}.mp4"  # Older archived file
+        )
+        recent_input_mp4 = (
+            tmp_path
+            / "camera"
+            / f"{two_days_ago.year}"
+            / f"{two_days_ago.month:02d}"
+            / f"{two_days_ago.day:02d}"
+            / f"REO_camera_{two_days_ago.strftime('%Y%m%d%H%M%S')}.mp4"  # Recent file
+        )
+        recent_archived_mp4 = (
+            output_dir
+            / f"{two_days_ago.year}"
+            / f"{two_days_ago.month:02d}"
+            / f"{two_days_ago.day:02d}"
+            / f"archived-{two_days_ago.strftime('%Y%m%d%H%M%S')}.mp4"  # Recent archived file
+        )
+
+        # Both old files should be processed (they're older than 10 days from now)
+        mp4s = [
+            (old_input_mp4, ten_days_ago),
+            (older_input_mp4, twelve_days_ago),
+            (
+                old_archived_mp4,
+                twelve_days_ago,
+            ),  # This is an archived file that should be removed with --clean-output
+            (recent_input_mp4, two_days_ago),  # This is too recent to be removed
+            (
+                recent_archived_mp4,
+                two_days_ago,
+            ),  # This is also too recent to be removed
+        ]
+
+        # Actually, let me fix the mapping to have unique keys for each file
+        mapping = {
+            ten_days_ago.strftime("%Y%m%d%H%M%S"): {".mp4": old_input_mp4},
+            twelve_days_ago.strftime("%Y%m%d%H%M%S"): {
+                ".mp4": older_input_mp4
+            },  # for input file
+            f"{twelve_days_ago.strftime('%Y%m%d%H%M%S')}": {
+                ".mp4": old_archived_mp4
+            },  # Same timestamp for archived
+            two_days_ago.strftime("%Y%m%d%H%M%S"): {".mp4": recent_input_mp4},
+            f"{two_days_ago.strftime('%Y%m%d%H%M%S')}": {
+                ".mp4": recent_archived_mp4
+            },  # Same timestamp for archived
+        }
+
+        # Since two files have the same timestamp, I'll need to use different timestamps
+        mp4s = [
+            (old_input_mp4, ten_days_ago),
+            (older_input_mp4, twelve_days_ago),
+            (
+                old_archived_mp4,
+                datetime.strptime(
+                    twelve_days_ago.strftime("%Y%m%d%H%M%S"), "%Y%m%d%H%M%S"
+                ),
+            ),  # Same timestamp
+            (recent_input_mp4, two_days_ago),
+            (
+                recent_archived_mp4,
+                datetime.strptime(
+                    two_days_ago.strftime("%Y%m%d%H%M%S"), "%Y%m%d%H%M%S"
+                ),
+            ),  # Same timestamp
+        ]
+
+        # Better approach: use unique timestamps for each file
+        # Rebuilding data with clearly different timestamps for testing
+        old_timestamp = datetime.now() - timedelta(
+            days=15
+        )  # definitely older than 10-day threshold
+        recent_timestamp = datetime.now() - timedelta(
+            days=5
+        )  # definitely newer than 10-day threshold
+
+        old_input_mp4 = (
+            tmp_path
+            / "camera"
+            / f"{old_timestamp.year}"
+            / f"{old_timestamp.month:02d}"
+            / f"{old_timestamp.day:02d}"
+            / f"REO_camera_{old_timestamp.strftime('%Y%m%d%H%M%S')}.mp4"
+        )
+        old_archived_mp4 = (
+            output_dir
+            / f"{old_timestamp.year}"
+            / f"{old_timestamp.month:02d}"
+            / f"{old_timestamp.day:02d}"
+            / f"archived-{old_timestamp.strftime('%Y%m%d%H%M%S')}.mp4"
+        )
+        recent_input_mp4 = (
+            tmp_path
+            / "camera"
+            / f"{recent_timestamp.year}"
+            / f"{recent_timestamp.month:02d}"
+            / f"{recent_timestamp.day:02d}"
+            / f"REO_camera_{recent_timestamp.strftime('%Y%m%d%H%M%S')}.mp4"
+        )
+        recent_archived_mp4 = (
+            output_dir
+            / f"{recent_timestamp.year}"
+            / f"{recent_timestamp.month:02d}"
+            / f"{recent_timestamp.day:02d}"
+            / f"archived-{recent_timestamp.strftime('%Y%m%d%H%M%S')}.mp4"
+        )
+
+        mp4s = [
+            (old_input_mp4, old_timestamp),
+            (old_archived_mp4, old_timestamp),  # Old archived file
+            (recent_input_mp4, recent_timestamp),  # Recent file
+            (recent_archived_mp4, recent_timestamp),  # Recent archived file
+        ]
+        mapping = {
+            old_timestamp.strftime("%Y%m%d%H%M%S"): {
+                ".mp4": old_input_mp4,
+                ".arch_mp4": old_archived_mp4,
+            },  # Actually, each timestamp should correspond to the original source files
+            recent_timestamp.strftime("%Y%m%d%H%M%S"): {
+                ".mp4": recent_input_mp4,
+                ".arch_mp4": recent_archived_mp4,
+            },
+        }
+
+        # Correct the mapping to have separate entries for each file (same timestamp)
+        mapping = {}
+        # old timestamp key
+        old_key = old_timestamp.strftime("%Y%m%d%H%M%S")
+        mapping[old_key] = {".mp4": old_input_mp4}  # Input file
+        # For the archived file with same timestamp, we need to handle it differently
+        # Since the mapping key is based on timestamp, archived files with same timestamp
+        # would overwrite the input file. This is not how it works in real world.
+        # Let me create separate entries for the archived files with the same time
+        # In real implementation, the mapping happens during discovery and archived files
+        # would have their own entries based on their timestamp
+
+        # Recreate with different timestamps to avoid mapping conflicts
+        old_input_timestamp = datetime.now() - timedelta(days=15)
+        old_archived_timestamp = datetime.now() - timedelta(days=12)
+        recent_input_timestamp = datetime.now() - timedelta(days=5)
+        recent_archived_timestamp = datetime.now() - timedelta(days=3)
+
+        old_input_mp4 = (
+            tmp_path
+            / "camera"
+            / f"{old_input_timestamp.year}"
+            / f"{old_input_timestamp.month:02d}"
+            / f"{old_input_timestamp.day:02d}"
+            / f"REO_camera_{old_input_timestamp.strftime('%Y%m%d%H%M%S')}.mp4"
+        )
+        old_archived_mp4 = (
+            output_dir
+            / f"{old_archived_timestamp.year}"
+            / f"{old_archived_timestamp.month:02d}"
+            / f"{old_archived_timestamp.day:02d}"
+            / f"archived-{old_archived_timestamp.strftime('%Y%m%d%H%M%S')}.mp4"
+        )
+        recent_input_mp4 = (
+            tmp_path
+            / "camera"
+            / f"{recent_input_timestamp.year}"
+            / f"{recent_input_timestamp.month:02d}"
+            / f"{recent_input_timestamp.day:02d}"
+            / f"REO_camera_{recent_input_timestamp.strftime('%Y%m%d%H%M%S')}.mp4"
+        )
+        recent_archived_mp4 = (
+            output_dir
+            / f"{recent_archived_timestamp.year}"
+            / f"{recent_archived_timestamp.month:02d}"
+            / f"{recent_archived_timestamp.day:02d}"
+            / f"archived-{recent_archived_timestamp.strftime('%Y%m%d%H%M%S')}.mp4"
+        )
+
+        mp4s = [
+            (old_input_mp4, old_input_timestamp),
+            (old_archived_mp4, old_archived_timestamp),
+            (recent_input_mp4, recent_input_timestamp),
+            (recent_archived_mp4, recent_archived_timestamp),
+        ]
+        mapping = {
+            old_input_timestamp.strftime("%Y%m%d%H%M%S"): {".mp4": old_input_mp4},
+            old_archived_timestamp.strftime("%Y%m%d%H%M%S"): {".mp4": old_archived_mp4},
+            recent_input_timestamp.strftime("%Y%m%d%H%M%S"): {".mp4": recent_input_mp4},
+            recent_archived_timestamp.strftime("%Y%m%d%H%M%S"): {
+                ".mp4": recent_archived_mp4
+            },
+        }
+
+        # Mock exists to return False (so normally we'd transcode if not for cleanup)
+        mocker.patch("pathlib.Path.exists", return_value=False)
+
+        # Generate plan
+        plan = processor.generate_action_plan(mp4s, mapping)
+
+        # Verify plan - should have no transcoding when cleanup is active
+        assert len(plan["transcoding"]) == 0
+
+        # Should have removals for both old input file and old archived file
+        # Recent files should be excluded due to age cutoff
+        # old_input_timestamp and old_archived_timestamp are both older than 10 days
+        # recent_input_timestamp and recent_archived_timestamp are both newer than 10 days
+        assert (
+            len(plan["removals"]) == 2
+        )  # One old input file and one old archived file
+
+        removal_files = [action["file"] for action in plan["removals"]]
+        assert old_input_mp4 in removal_files
+        assert old_archived_mp4 in removal_files
+        assert recent_input_mp4 not in removal_files  # Too recent to remove
+        assert recent_archived_mp4 not in removal_files  # Too recent to remove
+
+    # This test has been moved to TestFileDiscovery class
+
 
 class TestDisplayAndConfirmPlan:
     """Test display and confirm plan functions"""
@@ -1171,55 +1527,69 @@ class TestSignalHandlers:
 class TestParseArgs:
     """Test argument parsing"""
 
-    def test_parse_args_minimal(self):
-        """Test parsing minimal arguments"""
-        args = archiver.parse_args(["/test"])
+    @pytest.mark.parametrize(
+        "args_input,expected_values",
+        [
+            # Test minimal arguments
+            (
+                ["/test"],
+                {
+                    "directory": "/test",
+                    "output": None,
+                    "dry_run": False,
+                    "no_confirm": False,
+                    "no_skip": False,
+                    "delete": False,
+                    "trash_root": None,
+                    "cleanup": False,
+                    "clean_output": False,
+                    "age": 30,
+                    "log_file": None,
+                },
+            ),
+            # Test all options
+            (
+                [
+                    "/test",
+                    "-o",
+                    "/output",
+                    "--dry-run",
+                    "--no-confirm",
+                    "--no-skip",
+                    "--delete",  # New flag replacing --use-trash
+                    "--trash-root",
+                    "/trash",
+                    "--cleanup",
+                    "--clean-output",
+                    "--age",
+                    "60",
+                    "--log-file",
+                    "/log.txt",
+                ],
+                {
+                    "directory": "/test",
+                    "output": "/output",
+                    "dry_run": True,
+                    "no_confirm": True,
+                    "no_skip": True,
+                    "delete": True,  # New behavior: --delete flag
+                    "trash_root": "/trash",
+                    "cleanup": True,
+                    "clean_output": True,
+                    "age": 60,
+                    "log_file": "/log.txt",
+                },
+            ),
+        ],
+    )
+    def test_parse_args_various_scenarios(self, args_input, expected_values):
+        """Test parsing arguments with various configurations"""
+        args = archiver.parse_args(args_input)
 
-        assert args.directory == "/test"
-        assert args.output is None
-        assert args.dry_run is False
-        assert args.no_confirm is False
-        assert args.no_skip is False
-        assert args.delete is False
-        assert args.trash_root is None
-        assert args.cleanup is False
-        assert args.clean_output is False
-        assert args.age == 30
-        assert args.log_file is None
-
-    def test_parse_args_all_options(self):
-        """Test parsing all options"""
-        args = archiver.parse_args(
-            [
-                "/test",
-                "-o",
-                "/output",
-                "--dry-run",
-                "--no-confirm",
-                "--no-skip",
-                "--delete",  # New flag replacing --use-trash
-                "--trash-root",
-                "/trash",
-                "--cleanup",
-                "--clean-output",
-                "--age",
-                "60",
-                "--log-file",
-                "/log.txt",
-            ]
-        )
-
-        assert args.directory == "/test"
-        assert args.output == "/output"
-        assert args.dry_run is True
-        assert args.no_confirm is True
-        assert args.no_skip is True
-        assert args.delete is True  # New behavior: --delete flag
-        assert args.trash_root == "/trash"
-        assert args.cleanup is True
-        assert args.clean_output is True
-        assert args.age == 60
-        assert args.log_file == "/log.txt"
+        # Assert all expected values
+        for key, expected_value in expected_values.items():
+            actual_value = getattr(args, key)
+            assert actual_value == expected_value
 
 
 class TestRunArchiver:

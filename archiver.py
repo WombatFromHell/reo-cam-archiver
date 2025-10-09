@@ -241,7 +241,10 @@ class FileDiscovery:
 
     @staticmethod
     def discover_files(
-        directory: FilePath, trash_root: Optional[FilePath] = None
+        directory: FilePath,
+        trash_root: Optional[FilePath] = None,
+        output_directory: Optional[FilePath] = None,
+        clean_output: bool = False,
     ) -> Tuple[
         List[Tuple[FilePath, Timestamp]], Dict[str, Dict[str, FilePath]], Set[FilePath]
     ]:
@@ -281,6 +284,41 @@ class FileDiscovery:
             if ext == ".mp4":
                 mp4s.append((p, ts))
 
+        # Scan output directory if clean_output is specified
+        if clean_output and output_directory and output_directory.exists():
+            for p in output_directory.rglob("*.*"):
+                if not p.is_file() or (trash_root and trash_root in p.parents):
+                    continue
+
+                # Check directory structure: /camera/archived/<YYYY>/<MM>/<DD>/*.*
+                try:
+                    rel_parts = p.relative_to(output_directory).parts
+                    if len(rel_parts) < 4:
+                        continue
+
+                    y, m, d = rel_parts[-4], rel_parts[-3], rel_parts[-2]
+                    y_int, m_int, d_int = int(y), int(m), int(d)
+
+                    if not (
+                        1000 <= y_int <= 9999 and 1 <= m_int <= 12 and 1 <= d_int <= 31
+                    ):
+                        continue
+                except (ValueError, AttributeError):
+                    continue
+
+                ts = FileDiscovery._parse_timestamp(p.name)
+                if not ts:
+                    # Also try to parse timestamp from archived files that have 'archived-' prefix
+                    ts = FileDiscovery._parse_timestamp_from_archived_filename(p.name)
+                    if not ts:
+                        continue
+
+                key = ts.strftime("%Y%m%d%H%M%S")
+                ext = p.suffix.lower()
+                mapping.setdefault(key, {})[ext] = p
+                if ext == ".mp4":
+                    mp4s.append((p, ts))
+
         # Scan trash directory if enabled
         if trash_root and trash_root.exists():
             for trash_type in ["input", "output"]:
@@ -308,6 +346,21 @@ class FileDiscovery:
         """Extract timestamp from filename"""
         TIMESTAMP_RE = re.compile(r"REO_.*_(\d{14})\.(mp4|jpg)$", re.IGNORECASE)
         m = TIMESTAMP_RE.search(filename)
+        if not m:
+            return None
+
+        try:
+            ts = datetime.strptime(m.group(1), "%Y%m%d%H%M%S")
+            return ts if 2000 <= ts.year <= 2099 else None
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _parse_timestamp_from_archived_filename(filename: str) -> Optional[Timestamp]:
+        """Extract timestamp from archived filename (e.g., archived-20230115120000.mp4)"""
+        # Pattern to match archived files: archived-YYYYMMDDHHMMSS.ext
+        ARCHIVED_RE = re.compile(r"archived-(\d{14})\.(mp4|jpg)$", re.IGNORECASE)
+        m = ARCHIVED_RE.search(filename)
         if not m:
             return None
 
@@ -963,7 +1016,7 @@ def run_archiver(config: Config) -> int:
 
         # Discover files
         mp4s, mapping, trash_files = FileDiscovery.discover_files(
-            config.directory, config.trash_root
+            config.directory, config.trash_root, config.output, config.clean_output
         )
 
         logger.info(f"Discovered {len(mp4s)} MP4 files")
