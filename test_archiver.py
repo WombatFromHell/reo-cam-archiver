@@ -14,6 +14,80 @@ import pytest
 import archiver
 
 
+@pytest.fixture
+def sample_config(tmp_path):
+    """Fixture to create a sample Config object for testing."""
+    args = archiver.parse_args([str(tmp_path)])
+    return archiver.Config(args)
+
+
+@pytest.fixture
+def sample_logger(mocker):
+    """Fixture to create a mocked logger for testing."""
+    return mocker.MagicMock()
+
+
+@pytest.fixture
+def sample_graceful_exit():
+    """Fixture to create a GracefulExit instance for testing."""
+    return archiver.GracefulExit()
+
+
+@pytest.fixture
+def sample_file_processor(tmp_path, sample_logger, sample_graceful_exit):
+    """Fixture to create a FileProcessor instance for testing."""
+    args = archiver.parse_args([str(tmp_path)])
+    config = archiver.Config(args)
+    return archiver.FileProcessor(config, sample_logger, sample_graceful_exit)
+
+
+@pytest.fixture
+def create_test_file(tmp_path):
+    """Factory fixture to create test files with specified content."""
+
+    def _create_test_file(dir_path, filename, content="", create_dirs=True):
+        if create_dirs:
+            dir_path.mkdir(parents=True, exist_ok=True)
+        file_path = dir_path / filename
+        file_path.write_text(content)
+        return file_path
+
+    return _create_test_file
+
+
+@pytest.fixture
+def create_test_video_file(create_test_file):
+    """Factory fixture to create test video files."""
+
+    def _create_test_video_file(dir_path, timestamp_str, content="", create_dirs=True):
+        filename = f"REO_camera_{timestamp_str}.mp4"
+        return create_test_file(dir_path, filename, content, create_dirs)
+
+    return _create_test_video_file
+
+
+@pytest.fixture
+def run_archiver_setup(tmp_path, mocker):
+    """Fixture to set up common components for run_archiver tests."""
+
+    def _setup_run_archiver_test(extra_args=None, mock_logger=None):
+        if mock_logger is None:
+            mock_logger = mocker.MagicMock()
+
+        args_list = [str(tmp_path)]
+        if extra_args:
+            args_list.extend(extra_args)
+
+        args = archiver.parse_args(args_list)
+        config = archiver.Config(args)
+
+        mocker.patch.object(archiver.Logger, "setup", return_value=mock_logger)
+
+        return config, mock_logger, mocker
+
+    return _setup_run_archiver_test
+
+
 class TestConfig:
     """Test the Config class"""
 
@@ -825,20 +899,14 @@ class TestTranscoder:
 class TestFileProcessor:
     """Test the FileProcessor class"""
 
-    def test_generate_action_plan(self, tmp_path, mocker):
+    def test_generate_action_plan(
+        self, tmp_path, sample_config, sample_logger, sample_graceful_exit, mocker
+    ):
         """Test generating an action plan"""
-        # Create config
-        args = archiver.parse_args([str(tmp_path)])
-        config = archiver.Config(args)
-
-        # Create logger
-        logger = mocker.MagicMock()
-
-        # Create graceful exit
-        graceful_exit = archiver.GracefulExit()
-
         # Create processor
-        processor = archiver.FileProcessor(config, logger, graceful_exit)
+        processor = archiver.FileProcessor(
+            sample_config, sample_logger, sample_graceful_exit
+        )
 
         # Create test data
         mp4_file = (
@@ -866,20 +934,14 @@ class TestFileProcessor:
         assert plan["transcoding"][0]["jpg_to_remove"] == jpg_file
         assert len(plan["removals"]) == 2  # One for MP4, one for JPG
 
-    def test_generate_action_plan_with_existing_archive(self, tmp_path, mocker):
+    def test_generate_action_plan_with_existing_archive(
+        self, tmp_path, sample_config, sample_logger, sample_graceful_exit, mocker
+    ):
         """Test generating an action plan when archive already exists"""
-        # Create config
-        args = archiver.parse_args([str(tmp_path)])
-        config = archiver.Config(args)
-
-        # Create logger
-        logger = mocker.MagicMock()
-
-        # Create graceful exit
-        graceful_exit = archiver.GracefulExit()
-
         # Create processor
-        processor = archiver.FileProcessor(config, logger, graceful_exit)
+        processor = archiver.FileProcessor(
+            sample_config, sample_logger, sample_graceful_exit
+        )
 
         # Create test data
         mp4_file = (
@@ -905,20 +967,16 @@ class TestFileProcessor:
         assert len(plan["transcoding"]) == 0
         assert len(plan["removals"]) == 2  # One for MP4, one for JPG
 
-    def test_generate_action_plan_with_age_cutoff(self, tmp_path, mocker):
+    def test_generate_action_plan_with_age_cutoff(
+        self, tmp_path, mocker, sample_logger, sample_graceful_exit
+    ):
         """Test generating an action plan with age cutoff"""
         # Create config with age of 30 days
         args = archiver.parse_args([str(tmp_path), "--age", "30"])
         config = archiver.Config(args)
 
-        # Create logger
-        logger = mocker.MagicMock()
-
-        # Create graceful exit
-        graceful_exit = archiver.GracefulExit()
-
         # Create processor
-        processor = archiver.FileProcessor(config, logger, graceful_exit)
+        processor = archiver.FileProcessor(config, sample_logger, sample_graceful_exit)
 
         # Create test data - recent file (should be skipped)
         recent_mp4 = (
@@ -948,20 +1006,14 @@ class TestFileProcessor:
         assert len(plan["transcoding"]) == 1
         assert plan["transcoding"][0]["input"] == old_mp4
 
-    def test_execute_plan(self, tmp_path, mocker):
+    def test_execute_plan(
+        self, tmp_path, sample_config, sample_logger, sample_graceful_exit, mocker
+    ):
         """Test executing an action plan"""
-        # Create config
-        args = archiver.parse_args([str(tmp_path)])
-        config = archiver.Config(args)
-
-        # Create logger
-        logger = mocker.MagicMock()
-
-        # Create graceful exit
-        graceful_exit = archiver.GracefulExit()
-
         # Create processor
-        processor = archiver.FileProcessor(config, logger, graceful_exit)
+        processor = archiver.FileProcessor(
+            sample_config, sample_logger, sample_graceful_exit
+        )
 
         # Create test plan
         input_path = tmp_path / "input.mp4"
@@ -1008,20 +1060,14 @@ class TestFileProcessor:
         # Should be 3 calls: 1 for JPG after transcode, 1 for MP4 source, 1 for JPG from removals
         assert mock_remove.call_count == 3
 
-    def test_cleanup_orphaned_files(self, tmp_path, mocker):
+    def test_cleanup_orphaned_files(
+        self, tmp_path, sample_config, sample_logger, sample_graceful_exit, mocker
+    ):
         """Test cleaning up orphaned JPG files"""
-        # Create config
-        args = archiver.parse_args([str(tmp_path)])
-        config = archiver.Config(args)
-
-        # Create logger
-        logger = mocker.MagicMock()
-
-        # Create graceful exit
-        graceful_exit = archiver.GracefulExit()
-
         # Create processor
-        processor = archiver.FileProcessor(config, logger, graceful_exit)
+        processor = archiver.FileProcessor(
+            sample_config, sample_logger, sample_graceful_exit
+        )
 
         # Create test data - orphaned JPG (no MP4)
         orphaned_jpg = (
@@ -1057,21 +1103,17 @@ class TestFileProcessor:
         assert mock_remove.call_args[0][0] == orphaned_jpg
         mock_clean_dirs.assert_called_once()
 
-    def test_cleanup_orphaned_files_from_output_directory(self, tmp_path, mocker):
+    def test_cleanup_orphaned_files_from_output_directory(
+        self, tmp_path, mocker, sample_logger, sample_graceful_exit
+    ):
         """Test cleaning up orphaned JPG files from output directory"""
         # Create config with output directory
         output_dir = tmp_path / "archived"
         args = archiver.parse_args([str(tmp_path), "-o", str(output_dir)])
         config = archiver.Config(args)
 
-        # Create logger
-        logger = mocker.MagicMock()
-
-        # Create graceful exit
-        graceful_exit = archiver.GracefulExit()
-
         # Create processor
-        processor = archiver.FileProcessor(config, logger, graceful_exit)
+        processor = archiver.FileProcessor(config, sample_logger, sample_graceful_exit)
 
         # Create test data - orphaned JPG in output directory (no MP4)
         orphaned_output_jpg = (
@@ -1100,20 +1142,14 @@ class TestFileProcessor:
         assert mock_remove.call_args[1]["is_output"] is True
         mock_clean_dirs.assert_called_once()
 
-    def test_output_path(self, tmp_path, mocker):
+    def test_output_path(
+        self, tmp_path, sample_config, sample_logger, sample_graceful_exit, mocker
+    ):
         """Test generating output path for archived file"""
-        # Create config
-        args = archiver.parse_args([str(tmp_path)])
-        config = archiver.Config(args)
-
-        # Create logger
-        logger = mocker.MagicMock()
-
-        # Create graceful exit
-        graceful_exit = archiver.GracefulExit()
-
         # Create processor
-        processor = archiver.FileProcessor(config, logger, graceful_exit)
+        processor = archiver.FileProcessor(
+            sample_config, sample_logger, sample_graceful_exit
+        )
 
         # Create test data
         input_file = (
@@ -1130,21 +1166,17 @@ class TestFileProcessor:
         )
         assert output_path == expected
 
-    def test_execute_plan_with_files_from_output_directory(self, tmp_path, mocker):
+    def test_execute_plan_with_files_from_output_directory(
+        self, tmp_path, mocker, sample_logger, sample_graceful_exit
+    ):
         """Test executing an action plan with files from output directory during cleanup"""
         # Create config with cleanup and clean_output
         output_dir = tmp_path / "archived"
         args = archiver.parse_args([str(tmp_path), "--cleanup", "--clean-output"])
         config = archiver.Config(args)
 
-        # Create logger
-        logger = mocker.MagicMock()
-
-        # Create graceful exit
-        graceful_exit = archiver.GracefulExit()
-
         # Create processor
-        processor = archiver.FileProcessor(config, logger, graceful_exit)
+        processor = archiver.FileProcessor(config, sample_logger, sample_graceful_exit)
 
         # Create test plan with a file from output directory
         archived_file = (
@@ -1179,20 +1211,16 @@ class TestFileProcessor:
         # Check that is_output was set to True because the file is in the output directory
         assert mock_remove.call_args[1]["is_output"] is True
 
-    def test_execute_plan_dry_run_with_cleanup(self, tmp_path, mocker):
+    def test_execute_plan_dry_run_with_cleanup(
+        self, tmp_path, mocker, sample_logger, sample_graceful_exit
+    ):
         """Test executing an action plan in dry-run mode with cleanup"""
         # Create config with cleanup and dry-run
         args = archiver.parse_args([str(tmp_path), "--cleanup", "--dry-run"])
         config = archiver.Config(args)
 
-        # Create logger
-        logger = mocker.MagicMock()
-
-        # Create graceful exit
-        graceful_exit = archiver.GracefulExit()
-
         # Create processor
-        processor = archiver.FileProcessor(config, logger, graceful_exit)
+        processor = archiver.FileProcessor(config, sample_logger, sample_graceful_exit)
 
         # Create test plan with removals (simulating cleanup)
         input_file = (
@@ -1227,20 +1255,160 @@ class TestFileProcessor:
         assert mock_remove.call_args[0][0] == input_file
         assert mock_remove.call_args[1]["dry_run"] is True  # This should be true
 
-    def test_cleanup_orphaned_files_dry_run(self, tmp_path, mocker):
+    def test_execute_plan_preserves_directory_structure_in_trash(
+        self, tmp_path, sample_config, sample_logger, sample_graceful_exit, mocker
+    ):
+        """Test that directory structure is preserved when files are moved to trash"""
+        # Create processor
+        processor = archiver.FileProcessor(
+            sample_config, sample_logger, sample_graceful_exit
+        )
+
+        # Create test files with directory structure
+        input_dir = tmp_path / "camera"
+        input_dir.mkdir(exist_ok=True)
+        input_file = input_dir / "2023" / "01" / "15" / "REO_camera_20230115120000.mp4"
+        input_file.parent.mkdir(parents=True, exist_ok=True)
+        input_file.touch()  # Create actual file for proper relative path operations
+        output_path = (
+            tmp_path / "archived" / "2023" / "01" / "15" / "archived-20230115120000.mp4"
+        )
+
+        # Create a paired JPG file
+        jpg_file = input_dir / "2023" / "01" / "15" / "REO_camera_20230115120000.jpg"
+        jpg_file.touch()
+
+        timestamp = datetime(2023, 1, 15, 12, 0, 0)
+
+        # Create test plan
+        plan = {
+            "transcoding": [
+                {
+                    "type": "transcode",
+                    "input": input_file,
+                    "output": output_path,
+                    "jpg_to_remove": jpg_file,
+                }
+            ],
+            "removals": [
+                {
+                    "type": "source_removal_after_transcode",
+                    "file": input_file,
+                    "reason": "Source file for transcoded archive",
+                },
+                {
+                    "type": "jpg_removal_after_transcode",
+                    "file": jpg_file,
+                    "reason": "Paired with transcoded MP4",
+                },
+            ],
+        }
+
+        # Mock successful transcoding
+        mocker.patch.object(archiver.Transcoder, "transcode_file", return_value=True)
+
+        # Mock FileManager.remove_file to capture the parameters
+        mock_remove_file = mocker.patch.object(archiver.FileManager, "remove_file")
+
+        # Create progress reporter
+        progress_reporter = mocker.MagicMock()
+
+        # Execute plan
+        result = processor.execute_plan(plan, progress_reporter)
+
+        # Verify execution
+        assert result is True
+
+        # Verify that remove_file was called for both the input file and the JPG file
+        assert (
+            mock_remove_file.call_count >= 2
+        )  # At least 2 removals: source MP4 and paired JPG
+
+        # Check that removals were called with correct source_root (should be the main directory)
+        for call in mock_remove_file.call_args_list:
+            # Extract the arguments: first is the file_path, then the logger, then keyword arguments
+            file_path = call[0][0]  # First positional argument is the file path
+            kwargs = call[1]  # Keyword arguments
+
+            # If this is a file removal from the input directory, check the source_root
+            if str(file_path).startswith(str(input_dir)):
+                # Verify that source_root is the main directory, not just the immediate parent
+                assert kwargs["source_root"] == sample_config.directory
+                # Verify that is_output is False for input files
+                assert kwargs["is_output"] is False
+
+    def test_execute_plan_with_output_files_uses_correct_source_root(
+        self, tmp_path, mocker, sample_logger, sample_graceful_exit
+    ):
+        """Test that output files use correct source root when being removed"""
+        # Create config with output directory and clean_output flag
+        output_dir = tmp_path / "archived"
+        args = archiver.parse_args(
+            [str(tmp_path), "-o", str(output_dir), "--clean-output"]
+        )
+        config = archiver.Config(args)
+
+        # Create processor
+        processor = archiver.FileProcessor(config, sample_logger, sample_graceful_exit)
+
+        # Create test files: one input and one output (archived) file
+        input_dir = tmp_path / "camera"
+        input_dir.mkdir(exist_ok=True)
+        archived_file = (
+            output_dir / "2023" / "01" / "15" / "archived-20230115120000.mp4"
+        )
+        archived_file.parent.mkdir(parents=True, exist_ok=True)
+        archived_file.touch()  # Create actual file
+
+        # Create test plan with a removal of an output file (e.g., during cleanup)
+        plan = {
+            "transcoding": [],
+            "removals": [
+                {
+                    "type": "output_removal",
+                    "file": archived_file,
+                    "reason": "Cleanup old archived file",
+                },
+            ],
+        }
+
+        # Mock FileManager.remove_file to capture the parameters
+        mock_remove_file = mocker.patch.object(archiver.FileManager, "remove_file")
+
+        # Create progress reporter
+        progress_reporter = mocker.MagicMock()
+
+        # Execute plan
+        result = processor.execute_plan(plan, progress_reporter)
+
+        # Verify execution
+        assert result is True
+
+        # Check that removal was called with correct source_root for output file
+        remove_calls = mock_remove_file.call_args_list
+        assert len(remove_calls) == 1
+
+        call = remove_calls[0]
+        file_path = call[0][0]  # First positional argument is the file path
+        kwargs = call[1]  # Keyword arguments
+
+        # Verify that this is the archived file
+        assert file_path == archived_file
+        # Verify that is_output is True for output files (only when clean_output is enabled)
+        assert kwargs["is_output"] is True
+        # Verify that source_root is the output directory for output files
+        assert kwargs["source_root"] == config.output
+
+    def test_cleanup_orphaned_files_dry_run(
+        self, tmp_path, mocker, sample_logger, sample_graceful_exit
+    ):
         """Test cleanup of orphaned files in dry-run mode"""
         # Create config with dry-run
         args = archiver.parse_args([str(tmp_path), "--dry-run"])
         config = archiver.Config(args)
 
-        # Create logger
-        logger = mocker.MagicMock()
-
-        # Create graceful exit
-        graceful_exit = archiver.GracefulExit()
-
         # Create processor
-        processor = archiver.FileProcessor(config, logger, graceful_exit)
+        processor = archiver.FileProcessor(config, sample_logger, sample_graceful_exit)
 
         # Create test mapping with an orphaned JPG file
         orphaned_jpg = (
@@ -1270,20 +1438,16 @@ class TestFileProcessor:
         mock_clean_dirs.assert_called_once()
         assert mock_clean_dirs.call_args[1]["dry_run"] is True
 
-    def test_generate_action_plan_with_cleanup_flag(self, tmp_path, mocker):
+    def test_generate_action_plan_with_cleanup_flag(
+        self, tmp_path, mocker, sample_logger, sample_graceful_exit
+    ):
         """Test that cleanup flag disables transcoding and only generates removal actions"""
         # Create config with cleanup flag
         args = archiver.parse_args([str(tmp_path), "--cleanup"])
         config = archiver.Config(args)
 
-        # Create logger
-        logger = mocker.MagicMock()
-
-        # Create graceful exit
-        graceful_exit = archiver.GracefulExit()
-
         # Create processor
-        processor = archiver.FileProcessor(config, logger, graceful_exit)
+        processor = archiver.FileProcessor(config, sample_logger, sample_graceful_exit)
 
         # Create test data
         mp4_file = (
@@ -1310,7 +1474,9 @@ class TestFileProcessor:
         for removal in plan["removals"]:
             assert "cleanup mode enabled" in removal["reason"]
 
-    def test_generate_action_plan_with_clean_output_flag(self, tmp_path, mocker):
+    def test_generate_action_plan_with_clean_output_flag(
+        self, tmp_path, mocker, sample_logger, sample_graceful_exit
+    ):
         """Test that clean_output flag works with cleanup to include output directory files"""
         # Create config with cleanup and clean_output flags
         output_dir = tmp_path / "archived"
@@ -1319,14 +1485,8 @@ class TestFileProcessor:
         )
         config = archiver.Config(args)
 
-        # Create logger
-        logger = mocker.MagicMock()
-
-        # Create graceful exit
-        graceful_exit = archiver.GracefulExit()
-
         # Create processor
-        processor = archiver.FileProcessor(config, logger, graceful_exit)
+        processor = archiver.FileProcessor(config, sample_logger, sample_graceful_exit)
 
         # Calculate dates based on current time for accurate age testing
         ten_days_ago = datetime.now() - timedelta(days=10)

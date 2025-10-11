@@ -780,7 +780,7 @@ class FileProcessor:
                         delete=self.config.delete,
                         trash_root=self.config.trash_root,
                         is_output=False,
-                        source_root=jpg.parent,
+                        source_root=self.config.directory,
                     )
 
                 # Remove source file after successful transcoding
@@ -801,7 +801,7 @@ class FileProcessor:
                         delete=self.config.delete,
                         trash_root=self.config.trash_root,
                         is_output=False,
-                        source_root=source_removal_action["file"].parent,
+                        source_root=self.config.directory,
                     )
                     removal_actions.remove(source_removal_action)
             else:
@@ -825,6 +825,12 @@ class FileProcessor:
                     # File is not within output directory
                     is_output_file = False
 
+            # Determine the appropriate source root based on whether it's input or output
+            if is_output_file:
+                source_root = self.config.output
+            else:
+                source_root = self.config.directory
+
             FileManager.remove_file(
                 file_path,
                 self.logger,
@@ -832,7 +838,7 @@ class FileProcessor:
                 delete=self.config.delete,
                 trash_root=self.config.trash_root,
                 is_output=is_output_file,
-                source_root=file_path.parent,
+                source_root=source_root,
             )
 
         return True
@@ -861,6 +867,12 @@ class FileProcessor:
                     # File is not within output directory
                     is_output_file = False
 
+            # Determine the appropriate source root based on whether it's input or output
+            if is_output_file:
+                source_root = self.config.output
+            else:
+                source_root = self.config.directory
+
             FileManager.remove_file(
                 jpg,
                 self.logger,
@@ -868,7 +880,7 @@ class FileProcessor:
                 delete=self.config.delete,
                 trash_root=self.config.trash_root,
                 is_output=is_output_file,
-                source_root=jpg.parent,
+                source_root=source_root,
             )
             count += 1
 
