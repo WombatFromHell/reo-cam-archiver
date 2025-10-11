@@ -1,8 +1,19 @@
-# Camera Archiver - System Design Documentation
+# AGENTS.md
 
 ## Overview
 
 The Camera Archiver is a Python application designed to automatically transcode and archive camera footage based on timestamp parsing. It intelligently manages storage by transcoding videos to a smaller format and cleaning up old files based on size and age thresholds. The application supports dry-run mode, graceful shutdown, and configurable trash management.
+
+## Commands
+
+- To run the full test suite with code coverage: `uv run slipcover -m pytest -v ./test_archiver.py`
+- To run just the test suite: `uv run pytest -v ./test_archiver.py`
+- Use `ruff check ./archiver.py` and `pyright ./archiver.py` for syntax, type checking, and linting
+- Use `ruff format ./archiver.py` to ensure standardized formatting
+
+## Code Style
+
+- Avoid the use of decorators on functions/classes where possible (test suite decorators are okay)
 
 ## High-Level Architecture
 
@@ -204,11 +215,6 @@ Default behavior:
 
 ## Testing Methodologies
 
-### Test Execution Commands
-
-- To run the full test suite with code coverage: `uv run slipcover -m pytest -v ./test_archiver.py`
-- To run just the test suite: `uv run pytest -v ./test_archiver.py`
-
 ### Testing Design Philosophy
 
 - **Primary Focus**: Integration and end-to-end tests that verify the complete workflow
@@ -221,7 +227,7 @@ Default behavior:
 - **pytest-mock Integration**: Leverages the `mocker` fixture for creating mocks and `monkeypatch` for modifying behavior during tests
 - **Reusable Test Fixtures**: Uses pytest fixtures like `tmp_path` for creating temporary directories for test isolation
 - **Comprehensive Coverage**: Tests cover various scenarios including edge cases, error conditions, and different configuration combinations
-- Code Coverage Focus: Code coverage reports should be run every time archiver.py is significantly changed to ensure the best and most comprehensive code coverage of new tests
+- Code Coverage Focus: Code coverage reports should be run before and after 'archiver.py' is significantly changed to ensure the code coverage is not negatively impacted
 
 ### Test Organization
 
