@@ -554,17 +554,39 @@ def test_remove_unsupported_file_type(mocker, logger):
     logger.warning.assert_called_with(f"Unsupported file type for removal: {file_path}")
 
 
-def test_calculate_trash_destination_relative_to_failure(tmp_path):
-    """Test FileManager._calculate_trash_destination when relative_to fails."""
-    file_path = tmp_path / "some" / "arbitrary" / "path" / "file.mp4"
-    source_root = tmp_path / "camera"  # Different root, so relative_to will fail
-    trash_root = tmp_path / "trash"
+def test_calculate_trash_destination_double_nesting_prevention(tmp_path):
+    """Test FileManager._calculate_trash_destination prevents double nesting when file is already in trash."""
+    # This test verifies that the fix prevents double nesting
+    file_path = (
+        tmp_path / "camera" / ".deleted" / "input" / "2023" / "01" / "15" / "file.mp4"
+    )
+    source_root = tmp_path / "camera"  # Should be camera, not camera/.deleted
+    trash_root = tmp_path / "camera" / ".deleted"
 
     dest = archiver.FileManager._calculate_trash_destination(
         file_path, source_root, trash_root, is_output=False
     )
 
-    # When relative_to fails, it should use just the filename
+    # After fix: should be /camera/.deleted/input/2023/01/15/file.mp4 (not nested)
+    expected = trash_root / "input" / "2023" / "01" / "15" / "file.mp4"
+    assert dest == expected
+
+    # Verify it doesn't contain the double nesting pattern
+    assert ".deleted/input/.deleted" not in str(dest)
+    assert ".deleted/output/.deleted" not in str(dest)
+
+
+def test_calculate_trash_destination_double_nesting_prevention_edge_case(tmp_path):
+    """Test edge case where trash file has only directory name after .deleted/input."""
+    file_path = tmp_path / "camera" / ".deleted" / "input" / "file.mp4"
+    source_root = tmp_path / "camera"
+    trash_root = tmp_path / "camera" / ".deleted"
+
+    dest = archiver.FileManager._calculate_trash_destination(
+        file_path, source_root, trash_root, is_output=False
+    )
+
+    # Should just be the filename in the trash since there were only 2 extra parts
     expected = trash_root / "input" / "file.mp4"
     assert dest == expected
 

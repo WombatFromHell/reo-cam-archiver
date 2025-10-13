@@ -420,10 +420,36 @@ class FileManager:
     ) -> FilePath:
         """Calculate the destination path in trash for a given file"""
         dest_sub = "output" if is_output else "input"
+
+        # To prevent double nesting when files are already in trash directories,
+        # we need to make sure we don't create paths like .deleted/input/.deleted/input/...
+        # The issue occurs when the file_path is already within the trash structure
+        # relative to the source_root.
+
         try:
             rel_path = file_path.relative_to(source_root)
         except ValueError:
+            # If file_path is not relative to source_root, use just the filename
             rel_path = Path(file_path.name)
+        else:
+            # Check if the relative path contains the trash directory structure.
+            # If the rel_path starts with ".deleted/input" or ".deleted/output",
+            # this means the file was already in trash, and we need to avoid double nesting.
+            rel_parts = rel_path.parts
+            if (
+                len(rel_parts) >= 2
+                and rel_parts[0] == ".deleted"
+                and rel_parts[1] in ("input", "output")
+            ):
+                # The file is already in trash structure. Remove the ".deleted/input" or
+                # ".deleted/output" prefix to avoid double nesting
+                if len(rel_parts) > 2:
+                    # Keep the rest of the path after .deleted/(input|output)
+                    rel_path = Path(*rel_parts[2:])
+                else:
+                    # If there are only 2 parts (just ".deleted/input" or ".deleted/output"),
+                    # use just the filename
+                    rel_path = Path(file_path.name)
 
         base_dest = trash_root / dest_sub / rel_path
         counter = 0
