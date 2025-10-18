@@ -408,8 +408,12 @@ class FileManager:
                 else:
                     logger.warning(f"Unsupported file type for removal: {file_path}")
                 logger.info(f"Removed: {file_path}")
-        except Exception as e:
+        except FileNotFoundError:
+            logger.debug(f"File already removed (during cleanup): {file_path}")
+        except OSError as e:
             logger.error(f"Failed to remove {file_path}: {e}")
+        except Exception as e:
+            logger.error(f"Unexpected error removing {file_path}: {e}")
 
     @staticmethod
     def _calculate_trash_destination(

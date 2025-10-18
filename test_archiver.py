@@ -554,6 +554,48 @@ def test_remove_unsupported_file_type(mocker, logger):
     logger.warning.assert_called_with(f"Unsupported file type for removal: {file_path}")
 
 
+def test_remove_file_already_deleted_handling(mocker, logger):
+    """Test FileManager.remove_file gracefully handles FileNotFoundError."""
+    p = Path("/tmp/testfile_that_disappears.mp4")
+    # Mock the path to appear as a file initially
+    mocker.patch.object(Path, "is_file", return_value=True)
+    mocker.patch.object(Path, "is_dir", return_value=False)
+    # Mock the unlink method to raise FileNotFoundError, simulating the file being deleted externally
+    mock_unlink = mocker.patch.object(
+        Path, "unlink", side_effect=FileNotFoundError("No such file or directory")
+    )
+
+    # Call remove_file with delete=True (should attempt unlink)
+    archiver.FileManager.remove_file(p, logger, dry_run=False, delete=True)
+
+    # Verify that unlink was attempted
+    mock_unlink.assert_called_once_with()
+    # Verify that the specific FileNotFoundError case was handled:
+    # Check if a debug/info message about the file being missing was logged (or no error logged)
+    # This depends on how you implement the logging in the refactored code.
+    # If using logger.debug:
+    # logger.debug.assert_called_with(f"File already removed (during cleanup): {p}")
+    # If using logger.info:
+    # logger.info.assert_called_with(f"Skipped removal, file not found: {p}")
+    # If logging nothing for this case, ensure logger.error was NOT called:
+    logger.error.assert_not_called()  # This assertion checks that the general error handler wasn't triggered
+
+
+def test_remove_file_directory_already_deleted_handling(mocker, logger):
+    """Test FileManager.remove_file gracefully handles FileNotFoundError for directories."""
+    p = Path("/tmp/testdir_that_disappears")
+    mocker.patch.object(Path, "is_file", return_value=False)
+    mocker.patch.object(Path, "is_dir", return_value=True)
+    mock_rmdir = mocker.patch.object(
+        Path, "rmdir", side_effect=FileNotFoundError("No such file or directory")
+    )
+
+    archiver.FileManager.remove_file(p, logger, dry_run=False, delete=True)
+
+    mock_rmdir.assert_called_once_with()
+    logger.error.assert_not_called()  # Assuming error logging is skipped for FileNotFoundError
+
+
 def test_calculate_trash_destination_double_nesting_prevention(tmp_path):
     """Test FileManager._calculate_trash_destination prevents double nesting when file is already in trash."""
     # This test verifies that the fix prevents double nesting
