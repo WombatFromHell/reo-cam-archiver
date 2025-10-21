@@ -1,237 +1,358 @@
-# AGENTS.md
+# Camera Archiver - Agent Guidelines and Best Practices
 
 ## Overview
 
-The Camera Archiver is a Python application designed to automatically transcode and archive camera footage based on timestamp parsing. It intelligently manages storage by transcoding videos to a smaller format and cleaning up old files based on size and age thresholds. The application supports dry-run mode, graceful shutdown, and configurable trash management.
+This document outlines the best practices and guidelines for agents working with the Camera Archiver system. It covers development, testing, deployment, and maintenance procedures to ensure the system remains reliable, secure, and maintainable.
 
-## Commands
+## Development Guidelines
 
-- To run the full test suite with code coverage: `uv run slipcover -m pytest -v ./test_archiver.py`
-- To run just the test suite: `uv run pytest -v ./test_archiver.py`
-- Use `ruff check ./archiver.py` and `pyright ./archiver.py` for syntax, type checking, and linting
-- Use `ruff format ./archiver.py` to ensure standardized formatting
+### Code Structure and Organization
 
-## Code Style
+1. **Modular Architecture**
+   - Maintain clear separation of concerns between components
+   - Each class should have a single, well-defined responsibility
+   - Avoid circular dependencies between modules
+   - Keep functions and methods focused on a single task
 
-- Avoid the use of decorators on functions/classes where possible (test suite decorators are okay)
+2. **Type Hints and Documentation**
+   - Use strict type hints for all function parameters and return values
+   - Document all public methods and classes with comprehensive docstrings
+   - Include examples in docstrings for complex functionality
+   - Use consistent naming conventions (snake_case for variables, PascalCase for classes)
 
-## High-Level Architecture
+3. **Error Handling**
+   - Implement comprehensive error handling at all levels
+   - Use specific exception types rather than generic ones
+   - Ensure resources are properly cleaned up in error cases
+   - Log errors with sufficient context for debugging
 
-The system is organized into distinct, single-responsibility classes that work together in a pipeline:
+4. **Thread Safety**
+   - Use locks when accessing shared resources across threads
+   - Avoid global mutable state when possible
+   - Ensure all public methods are thread-safe
+   - Test concurrent access patterns
 
-```
-[User Input] -> [Config] -> [FileDiscovery] -> [FileProcessor] -> [Transcoder/FileManager] -> [Cleanup]
-```
+### Component-Specific Guidelines
 
-### Core Components
+#### Config Class
 
-#### 1. Config
+- Validate all configuration values during initialization
+- Provide clear error messages for invalid configurations
+- Use immutable objects where possible
+- Document all configuration options with examples
 
-- **Purpose**: Manages command-line arguments and application configuration
-- **Responsibilities**: Parse and store user input, validate paths, manage flags (dry-run, delete, etc.)
-- **Dependencies**: argparse, Path objects
+#### FileDiscovery Class
 
-#### 2. FileDiscovery
+- Handle various directory structures gracefully
+- Implement robust timestamp parsing with clear error messages
+- Use efficient file system traversal methods
+- Consider performance when scanning large directory trees
 
-- **Purpose**: Discovers camera files matching timestamp-based naming patterns
-- **Responsibilities**:
-  - Recursively scan directories for video files (MP4) and metadata (JPG)
-  - Parse timestamps from filenames (e.g., `REO_..._YYYYMMDDHHMMSS.mp4`)
-  - Map files by timestamp for pairing MP4/JPG files
-  - Include trash files in discovery when applicable
-- **Dependencies**: Path, re, datetime
+#### FileManager Class
 
-#### 3. FileProcessor
+- Implement atomic file operations where possible
+- Handle file system errors gracefully
+- Use appropriate permissions for created files and directories
+- Ensure trash destinations don't conflict with existing files
 
-- **Purpose**: Orchestrates the archiving pipeline and manages execution
-- **Responsibilities**:
-  - Generate action plans (transcoding, removals)
-  - Execute plans with progress reporting
-  - Handle cleanup operations for orphaned files
-- **Dependencies**: Config, Logger, Transcoder, FileManager, GracefulExit
+#### Transcoder Class
 
-#### 4. Transcoder
+- Validate all inputs before executing external processes
+- Implement proper resource cleanup for subprocesses
+- Handle various ffmpeg output formats
+- Monitor transcoding progress accurately
 
-- **Purpose**: Handles video transcoding operations using ffmpeg
-- **Responsibilities**:
-  - Execute ffmpeg processes with QSV hardware acceleration
-  - Monitor transcoding progress and report to UI
-  - Extract video duration for progress calculations
-  - Handle process lifecycle and graceful termination
-- **Dependencies**: subprocess, shutil, re, Path
+#### FileProcessor Class
 
-#### 5. FileManager
+- Generate clear, verifiable action plans
+- Execute operations in a logical sequence
+- Handle partial failures gracefully
+- Maintain state consistency throughout operations
 
-- **Purpose**: Manages file system operations including deletion and trash
-- **Responsibilities**:
-  - Remove files with optional trash management
-  - Calculate trash destinations to prevent conflicts
-  - Clean empty date-structured directories
-- **Dependencies**: Path, shutil, os, time
+## Testing Guidelines
 
-#### 6. ProgressReporter
+### Test Structure
 
-- **Purpose**: Provides real-time progress updates to the user
-- **Responsibilities**:
-  - Track progress of transcoding operations
-  - Render progress bars to stderr
-  - Coordinate with logging to avoid output conflicts
-  - Support graceful exit during operations
-- **Dependencies**: threading, time, sys
+1. **Test Organization**
+   - Organize tests by component, with separate test classes for each
+   - Use descriptive test names that explain what is being tested
+   - Group related tests using pytest markers
+   - Implement fixtures for common test scenarios
+   - Explicitly do NOT use `unittest`, instead rely on `pytest` and `pytest-mock` facilities for testing, patching, and mocking
+   - When `MagicMock` would be required for typing use `pytest_mock.MockerFixture` from `pytest-mock` instead
+   - Leverage `pytest` parametrization to reduce boilerplate when dealing with tests that cover similar cases
+   - When a test's name would shadow or be substantially similar to another existing test concisely rename it based on what it actually is testing rather than whatever function name is being tested
+   - In the event two tests reside in different test category files and are substantially the same one of them should be renamed based on what category of test it is (based on its implementation) and the other should be removed to address the shadowing conflict
 
-#### 7. Logger
+2. **Test Coverage**
+   - Aim for high test coverage (>90%) for critical components
+   - Test both happy paths and error conditions
+   - Include edge cases and boundary conditions
+   - Test thread safety for concurrent operations
 
-- **Purpose**: Sets up application logging with rotation
-- **Responsibilities**:
-  - Configure file and console logging
-  - Handle log rotation based on file size
-  - Provide thread-safe logging output
-- **Dependencies**: logging, Path, shutil
+3. **Mocking and Fixtures**
+   - Mock external dependencies (file system, subprocesses)
+   - Use fixtures for creating consistent test environments
+   - Implement realistic test data that mirrors production scenarios
+   - Ensure mocks accurately represent the behavior of real dependencies
 
-#### 8. GracefulExit
+### Test Categories
 
-- **Purpose**: Manages application shutdown signals
-- **Responsibilities**:
-  - Handle SIGINT, SIGTERM, SIGHUP signals
-  - Coordinate graceful shutdown across components
-  - Signal cancellation to long-running operations
-- **Dependencies**: signal, threading
+1. **Unit Tests**
+   - Test individual components in isolation
+   - Verify correct behavior with various inputs
+   - Test error handling paths
+   - Ensure proper resource cleanup
 
-## Component Interactions
+2. **Integration Tests**
+   - Test component interactions
+   - Verify end-to-end workflows
+   - Test with realistic file structures
+   - Validate data flow between components
 
-### Discovery Phase
+3. **Performance Tests**
+   - Test with large file sets
+   - Verify memory usage stays within bounds
+   - Measure processing throughput
+   - Identify and address performance bottlenecks
 
-1. `FileDiscovery` scans input directory and optional trash/output directories
-2. Discovers MP4 files with valid timestamps in expected date-based directory structure
-3. Maps files by timestamp to enable MP4/JPG pairing
-4. Returns list of MP4 files, timestamp mapping, and trash files
+### Test Data Management
 
-### Planning Phase
+1. **Test File Creation**
+   - Use fixtures to create realistic test file structures
+   - Implement helper functions for creating test files with specific timestamps
+   - Ensure test data is properly cleaned up after tests
+   - Use temporary directories for all file operations
 
-1. `FileProcessor` receives discovery results
-2. Generates action plan with two categories:
-   - Transcoding actions: input MP4 → transcoded output
-   - Removal actions: source files, paired JPGs, or cleanup-only entries
-3. Considers age thresholds, existing archives, and skip settings
+2. **Mocking External Processes**
+   - Create realistic mocks for ffmpeg and ffprobe
+   - Simulate various process behaviors (success, failure, timeout)
+   - Ensure mocks accurately represent the real process outputs
+   - Test with different process execution scenarios
 
-### Execution Phase
+## Deployment Guidelines
 
-1. `FileProcessor` executes transcoding actions via `Transcoder`
-2. Each successful transcoding triggers source file removal via `FileManager`
-3. Progress is reported through `ProgressReporter`
-4. Remaining removal actions are executed after transcoding
-5. Cleanup operations remove orphaned files and empty directories
+### Environment Setup
 
-## Standard Workflows
+1. **Dependencies**
+   - Pin all dependency versions in requirements.txt
+   - Document all system dependencies (ffmpeg, etc.)
+   - Use virtual environments to isolate dependencies
+   - Implement dependency checking at startup
 
-### 1. Basic Archiving Workflow
+2. **Configuration Management**
+   - Use environment-specific configuration files
+   - Store sensitive configuration in secure locations
+   - Implement configuration validation at startup
+   - Document all configuration options with examples
 
-```
-Input: Directory path
-1. Parse command-line arguments into Config
-2. Discover files using FileDiscovery
-3. Generate action plan using FileProcessor
-4. Display plan and request confirmation (unless --no-confirm)
-5. Execute transcoding and removal actions
-6. Report progress in real-time
-7. Complete with cleanup if requested
-```
+3. **File System Structure**
+   - Ensure proper permissions on all directories
+   - Implement appropriate directory structure for input/output
+   - Set up log rotation to prevent disk space issues
+   - Configure monitoring for disk space usage
 
-### 2. Cleanup-Only Workflow
+### Monitoring and Logging
 
-```
-Input: --cleanup flag with age threshold
-1. Execute discovery phase
-2. Generate removal-only action plan
-3. Execute removal actions without transcoding
-4. Clean orphaned files and empty directories
-```
+1. **Logging Configuration**
+   - Implement appropriate log levels for different environments
+   - Use structured logging for easier parsing
+   - Include sufficient context in log messages
+   - Implement log rotation to prevent disk space issues
 
-### 3. Dry Run Workflow
+2. **Monitoring Metrics**
+   - Track processing success/failure rates
+   - Monitor disk space usage
+   - Measure processing times
+   - Alert on error conditions
 
-```
-Input: --dry-run flag
-1. Execute discovery phase
-2. Generate full action plan
-3. Display plan without requesting confirmation
-4. Execute plan with dry-run mode (no actual file changes)
-5. Log what would have been performed
-```
+3. **Health Checks**
+   - Implement health check endpoints
+   - Monitor system resource usage
+   - Check for stuck processes
+   - Validate configuration integrity
 
-### 4. Trash Management Workflow
+## Maintenance Guidelines
 
-```
-Default behavior:
-1. Files marked for deletion are moved to trash directory
-2. Trash destination calculated to prevent conflicts
-3. Original file path structure preserved in trash
-4. Trash can be disabled with --delete flag for permanent removal
-```
+### Regular Maintenance Tasks
 
-## Key Features
+1. **Log Management**
+   - Regularly review and archive old logs
+   - Monitor log file sizes
+   - Implement automated log cleanup
+   - Review error logs for recurring issues
 
-### Hardware Acceleration
+2. **File System Maintenance**
+   - Monitor disk space usage
+   - Clean up temporary files
+   - Verify directory permissions
+   - Check for orphaned files
 
-- Uses QSV (Intel Quick Sync Video) hardware acceleration via ffmpeg
-- Maintains good performance while reducing CPU load
+3. **Performance Monitoring**
+   - Track processing times over time
+   - Monitor memory usage
+   - Identify performance regressions
+   - Optimize resource usage
 
-### Thread Safety
+### Updates and Upgrades
 
-- Global OUTPUT_LOCK coordinates progress updates and logging
-- ThreadSafeStreamHandler prevents output conflicts
-- GracefulExit supports cancellation during operations
+1. **Dependency Updates**
+   - Regularly update dependencies
+   - Test updates in a staging environment
+   - Document any breaking changes
+   - Implement rollback procedures
 
-### Signal Handling
+2. **Code Updates**
+   - Follow semantic versioning
+   - Document all changes in release notes
+   - Test thoroughly before deployment
+   - Implement gradual rollout for major changes
 
-- Responds to SIGINT (Ctrl+C), SIGTERM, SIGHUP for graceful shutdown
-- Cancels long-running operations when shutdown is requested
-- Cleans up resources before termination
+## Security Guidelines
 
-### File Organization
+### File System Security
 
-- Maintains date-based directory structure (YYYY/MM/DD)
-- Predictable archived filenames (archived-YYYYMMDDHHMMSS.mp4)
-- Automatic cleanup of empty date directories
+1. **Path Validation**
+   - Validate all file paths to prevent directory traversal
+   - Use absolute paths for all operations
+   - Implement proper permission checks
+   - Sanitize user-provided paths
 
-### Trash Management with Directory Preservation
+2. **Process Execution**
+   - Validate all parameters before executing external processes
+   - Use whitelists for allowed parameters
+   - Implement proper resource limits
+   - Monitor for suspicious process behavior
 
-- Files are moved to trash with their original directory structure preserved
-- Source root directory is properly passed to removal functions to maintain path integrity
-- Uses subdirectories (`input` and `output`) within trash to separate file types
+### Data Protection
 
-### Error Recovery
+1. **Access Control**
+   - Implement appropriate file permissions
+   - Restrict access to sensitive footage
+   - Use secure authentication for remote access
+   - Audit access to archived footage
 
-- Robust error handling in subprocess execution
-- Process monitoring with timeout and force-kill capabilities
-- Logging of error details for debugging
+2. **Data Integrity**
+   - Verify file integrity after operations
+   - Implement checksums for critical files
+   - Detect and handle corruption
+   - Maintain backup copies of important data
 
-## Known Issues and Fixes
+## Troubleshooting Guidelines
 
-### Directory Structure Preservation in Trash
+### Common Issues
 
-- **Issue**: Previously, when files were moved to trash, they weren't preserving the full input directory structure (e.g., `/camera/<YYYY>/<MM>/<DD>/...`).
-- **Root Cause**: The `source_root` parameter was incorrectly being set to `file_path.parent` instead of the main directory root when calling `FileManager.remove_file`.
-- **Fix**: Updated all calls to `FileManager.remove_file` to pass the correct `source_root` (either `config.directory` for input files or `config.output` for output files) to ensure the full directory structure is preserved in trash.
+1. **Transcoding Failures**
+   - Check ffmpeg installation and version
+   - Verify input file integrity
+   - Monitor system resources during transcoding
+   - Review ffmpeg error logs
 
-## Testing Methodologies
+2. **File System Issues**
+   - Check disk space availability
+   - Verify directory permissions
+   - Look for file system errors in logs
+   - Check for file locking issues
 
-### Testing Design Philosophy
+3. **Performance Issues**
+   - Monitor system resource usage
+   - Check for I/O bottlenecks
+   - Review processing logs for delays
+   - Analyze memory usage patterns
 
-- **Primary Focus**: Integration and end-to-end tests that verify the complete workflow
-- **Secondary Focus**: Unit tests for specific functions/classes that are difficult to cover through integration tests
-- Tertiary Focus: Written tests should not overlap with existing tests or testing concerns, if a newly written test can be extended from an existing test with a similar concern (by using 'parameterization', 'mocker', or 'monkeypatch' features of pytest/pytest-mock) this should always be preferred over a separate test
+### Debugging Procedures
 
-### Testing Tools and Features
+1. **Log Analysis**
+   - Use structured logging queries
+   - Correlate events across components
+   - Look for error patterns
+   - Check for warning signs
 
-- **pytest Parameterization**: Extensive use of `@pytest.mark.parametrize` to test multiple scenarios with different input combinations
-- **pytest-mock Integration**: Leverages the `mocker` fixture for creating mocks and `monkeypatch` for modifying behavior during tests
-- **Reusable Test Fixtures**: Uses pytest fixtures like `tmp_path` for creating temporary directories for test isolation
-- **Comprehensive Coverage**: Tests cover various scenarios including edge cases, error conditions, and different configuration combinations
-- Code Coverage Focus: Code coverage reports should be run before and after 'archiver.py' is significantly changed to ensure the code coverage is not negatively impacted
+2. **System Monitoring**
+   - Monitor system resources
+   - Check process status
+   - Analyze network traffic
+   - Review system logs
 
-### Test Organization
+## Agent Responsibilities
 
-- Tests are organized by class corresponding to each main component in archiver.py
-- Each test method follows the pattern of setting up mocks, executing the code under test, and asserting expected outcomes
-- Integration tests validate the interaction between multiple components
-- Special attention given to testing thread safety and signal handling scenarios
+### Development Agents
+
+1. **Code Quality**
+   - Write clean, maintainable code
+   - Explicitly avoid destructive changes unless the user is prompted and confirms that prompt
+   - Follow established coding standards
+   - Implement comprehensive tests
+   - Document all changes
+
+2. **Testing**
+   - Write tests for all new functionality
+   - Ensure tests pass before submitting changes
+   - Maintain high test coverage
+   - Fix failing tests promptly
+
+3. Command usage
+   - The test suite should be run with: `uv run pytest -v`
+   - Code coverage reports can be gathered with: `uv run slipcover -m pytest -v`
+
+### Operations Agents
+
+1. **Monitoring**
+   - Monitor system health
+   - Respond to alerts promptly
+   - Track performance metrics
+   - Identify and address issues
+
+2. **Maintenance**
+   - Perform regular maintenance tasks
+   - Keep systems updated
+   - Manage log files
+   - Optimize performance
+
+### Security Agents
+
+1. **Security Monitoring**
+   - Monitor for security threats
+   - Implement security best practices
+   - Respond to security incidents
+   - Regular security audits
+
+2. **Access Control**
+   - Manage user permissions
+   - Review access logs
+   - Implement secure authentication
+   - Regularly update security measures
+
+## Communication Guidelines
+
+### Reporting Issues
+
+1. **Bug Reports**
+   - Include detailed reproduction steps
+   - Provide system information
+   - Attach relevant logs
+   - Describe expected vs. actual behavior
+
+2. **Feature Requests**
+   - Clearly describe the desired functionality
+   - Explain the use case and benefits
+   - Consider implementation complexity
+   - Propose potential solutions
+
+### Documentation
+
+1. **Code Documentation**
+   - Document all public interfaces
+   - Include usage examples
+   - Explain design decisions
+   - Keep documentation up to date
+
+2. **Process Documentation**
+   - Document operational procedures
+   - Create troubleshooting guides
+   - Maintain configuration guides
+   - Update documentation regularly
+
+## Conclusion
+
+Following these guidelines will help ensure the Camera Archiver system remains reliable, secure, and maintainable. Regular review and updates to these practices will help the system evolve to meet changing requirements while maintaining high quality standards.
