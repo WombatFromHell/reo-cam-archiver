@@ -78,8 +78,7 @@ This document outlines the best practices and guidelines for agents working with
    - Use descriptive test names that explain what is being tested
    - Group related tests using pytest markers
    - Implement fixtures for common test scenarios
-   - Explicitly do NOT use `unittest`, instead rely on `pytest` and `pytest-mock` facilities for testing, patching, and mocking
-   - When `MagicMock` would be required for typing use `pytest_mock.MockerFixture` from `pytest-mock` instead
+   - Explicitly do NOT use `unittest` or `unittest.mock`, instead rely on `pytest` and `pytest-mock` for the `mocker`, `mocker.patch`, `MockerFixture`, and `monkeypatch` fixtures for testing, patching, and mocking
    - Leverage `pytest` parametrization to reduce boilerplate when dealing with tests that cover similar cases
    - When a test's name would shadow or be substantially similar to another existing test concisely rename it based on what it actually is testing rather than whatever function name is being tested
    - In the event two tests reside in different test category files and are substantially the same one of them should be renamed based on what category of test it is (based on its implementation) and the other should be removed to address the shadowing conflict
