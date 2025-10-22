@@ -359,3 +359,121 @@ class TestEndToEndWorkflow:
             / f"archived-{timestamp.strftime('%Y%m%d%H%M%S')}.mp4"
         )
         assert output_file.exists()
+
+
+class TestEndToEndWithUncoveredPaths:
+    """End-to-end tests for scenarios involving uncovered code paths."""
+
+    def test_e2e_with_nonexistent_input_directory(self, mock_args):
+        """End-to-end test for run_archiver with nonexistent input directory."""
+        from archiver import Config, run_archiver
+
+        # Set directory to a non-existent path
+        mock_args.directory = "/nonexistent/directory"
+        config = Config(mock_args)
+
+        # This should return error code 1
+        result = run_archiver(config)
+        assert result == 1
+
+    def test_e2e_with_exception_handling(self, mock_args, temp_dir, mocker):
+        """End-to-end test for exception handling in run_archiver."""
+        from archiver import Config, run_archiver, FileDiscovery
+
+        # Set directory to an existing path
+        mock_args.directory = str(temp_dir)
+        config = Config(mock_args)
+
+        # Mock FileDiscovery to raise an exception
+        mocker.patch.object(
+            FileDiscovery, "discover_files", side_effect=Exception("Test error")
+        )
+
+        # This should catch the exception and return error code 1
+        result = run_archiver(config)
+        assert result == 1
+
+    def test_e2e_with_user_cancellation(
+        self, mock_args, camera_dir, sample_files, mocker
+    ):
+        """End-to-end test for user cancellation during confirmation."""
+        from archiver import Config, run_archiver, FileDiscovery
+
+        # Set up directory and sample files
+        mock_args.directory = str(camera_dir)
+        mock_args.no_confirm = False  # Require confirmation
+        config = Config(mock_args)
+
+        # Mock discovery to return sample files
+        mp4s = [(sample_files["mp4"], sample_files["timestamp"])]
+        mapping = {
+            sample_files["timestamp"].strftime("%Y%m%d%H%M%S"): {
+                ".mp4": sample_files["mp4"],
+                ".jpg": sample_files["jpg"],
+            }
+        }
+        mocker.patch.object(
+            FileDiscovery, "discover_files", return_value=(mp4s, mapping, set())
+        )
+
+        # Mock confirm_plan to return False (user cancels)
+        mocker.patch("archiver.confirm_plan", return_value=False)
+
+        result = run_archiver(config)
+        assert result == 0  # Should return 0 when user cancels
+
+    def test_e2e_with_log_rotation_and_error_handling(
+        self, mock_args, temp_dir, mocker
+    ):
+        """End-to-end test for log rotation error handling."""
+        from archiver import Config, run_archiver
+
+        # Set up with a log file in a non-existent directory to trigger error handling
+        log_file = temp_dir / "nonexistent" / "log.log"
+        mock_args.directory = str(temp_dir)
+        mock_args.log_file = str(log_file)
+        config = Config(mock_args)
+
+        # Mock discovery to return empty list to avoid file processing
+        mocker.patch(
+            "archiver.FileDiscovery.discover_files", return_value=([], {}, set())
+        )
+
+        # This should handle the log setup error gracefully
+        result = run_archiver(config)
+        # Should return 0 since no files to process
+        assert result == 0
+
+    def test_e2e_with_signal_handling_and_interruption(
+        self, mock_args, camera_dir, sample_files, mocker
+    ):
+        """End-to-end test for signal handling during processing."""
+        from archiver import Config, run_archiver, FileDiscovery, GracefulExit
+
+        # Set up directory and sample files
+        mock_args.directory = str(camera_dir)
+        mock_args.no_confirm = True  # Skip confirmation to focus on signal handling
+        config = Config(mock_args)
+
+        # Mock discovery to return sample files
+        mp4s = [(sample_files["mp4"], sample_files["timestamp"])]
+        mapping = {
+            sample_files["timestamp"].strftime("%Y%m%d%H%M%S"): {
+                ".mp4": sample_files["mp4"],
+                ".jpg": sample_files["jpg"],
+            }
+        }
+        mocker.patch.object(
+            FileDiscovery, "discover_files", return_value=(mp4s, mapping, set())
+        )
+
+        # Mock the processor to request graceful exit immediately
+        graceful_exit = GracefulExit()
+        graceful_exit.request_exit()
+
+        # Replace the graceful exit creation in run_archiver
+        mocker.patch("archiver.GracefulExit", return_value=graceful_exit)
+
+        result = run_archiver(config)
+        # Should return 0 even with interruption
+        assert result == 0

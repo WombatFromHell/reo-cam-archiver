@@ -732,3 +732,92 @@ class TestParseArgsIntegration:
         assert args.clean_output is True
         assert args.age == 60
         assert args.log_file == "/custom/log.log"
+
+
+class TestIntegrationWithUncoveredPaths:
+    """Integration tests for scenarios involving uncovered code paths."""
+
+    def test_logger_with_exception_handling_during_setup(self, temp_dir, mocker):
+        """Integration test for Logger setup with exception scenarios."""
+        from archiver import Config, Logger
+        from argparse import Namespace
+
+        # Create args with a problematic log file path
+        args = Namespace()
+        args.directory = str(temp_dir)
+        args.output = str(temp_dir / "archived")
+        args.dry_run = False
+        args.no_confirm = False
+        args.no_skip = False
+        args.delete = False
+        args.trash_root = str(temp_dir / ".deleted")
+        args.cleanup = False
+        args.clean_output = False
+        args.age = 30
+        args.log_file = str(
+            temp_dir / "nonexistent" / "log.log"
+        )  # Non-existent directory
+
+        config = Config(args)
+
+        # This should handle the exception gracefully in Logger setup
+        logger = Logger.setup(config)
+        assert logger.name == "camera_archiver"
+
+    def test_file_discovery_with_archived_files_integration(
+        self, temp_dir, archived_dir, sample_files
+    ):
+        """Integration test for discovering both regular and archived files."""
+        # Create archived file in output directory
+        timestamp = sample_files["timestamp"]
+        archived_file = (
+            archived_dir
+            / str(timestamp.year)
+            / f"{timestamp.month:02d}"
+            / f"{timestamp.day:02d}"
+            / f"archived-{timestamp.strftime('%Y%m%d%H%M%S')}.mp4"
+        )
+        archived_file.parent.mkdir(parents=True)
+        archived_file.touch()
+
+        # Discover files with clean_output enabled to scan output directory too
+        mp4s, mapping, trash_files = FileDiscovery.discover_files(
+            temp_dir, output_directory=archived_dir, clean_output=True
+        )
+
+        # Should find both the original sample files and the archived file
+        assert len(mp4s) >= 2  # At least original and archived files
+
+    def test_file_manager_remove_with_exception_paths(self, temp_dir, logger, mocker):
+        """Integration test for FileManager remove with exception scenarios."""
+        from archiver import FileManager
+
+        # Create a test file
+        test_file = temp_dir / "test.mp4"
+        test_file.touch()
+
+        # Mock shutil.move to raise an exception to test exception handling
+        mocker.patch("shutil.move", side_effect=OSError("Permission denied"))
+
+        # Attempt to remove file to trash (will trigger the exception handling)
+        FileManager.remove_file(
+            test_file, logger, delete=False, trash_root=temp_dir / ".trash"
+        )
+
+        # File should still exist since operation failed
+        assert test_file.exists()
+
+    def test_transcoder_error_integration(self, sample_files, logger, mocker):
+        """Integration test for Transcoder error handling scenarios."""
+        from archiver import Transcoder
+
+        # Mock subprocess.Popen to raise an OSError to test error handling
+        mocker.patch(
+            "archiver.subprocess.Popen", side_effect=OSError("Command not found")
+        )
+
+        # Should handle the error gracefully
+        result = Transcoder.transcode_file(
+            sample_files["mp4"], sample_files["mp4"].parent / "output.mp4", logger
+        )
+        assert result is False
