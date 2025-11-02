@@ -11,6 +11,8 @@ graph TB
     subgraph "Main Application"
         main[main function] --> parse_args[parse_args]
         main --> run_archiver[run_archiver]
+        run_archiver --> display_plan[display_plan]
+        run_archiver --> confirm_plan[confirm_plan]
         run_archiver --> Config[Config]
         run_archiver --> Logger[Logger]
         run_archiver --> GracefulExit[GracefulExit]
@@ -22,6 +24,10 @@ graph TB
     subgraph "Core Components"
         FileProcessor --> Transcoder[Transcoder]
         FileProcessor --> FileManager[FileManager]
+        FileProcessor --> output_path[_output_path]
+        FileProcessor --> determine_source[_determine_source_root]
+        FileProcessor --> cleanup_orphans[cleanup_orphaned_files]
+        FileProcessor --> handle_action[_handle_action_type]
         Transcoder --> ffmpeg[ffmpeg subprocess]
         Transcoder --> helpers[Helper Methods]
         FileManager --> trash[Trash Management]
@@ -31,8 +37,23 @@ graph TB
     subgraph "Utilities"
         Logger --> ThreadSafeStreamHandler[ThreadSafeStreamHandler]
         GracefulExit --> signal_handlers[Signal Handlers]
+        run_archiver --> setup_signal_handlers[setup_signal_handlers]
     end
 ```
+
+## Core Data Structures and Constants
+
+The application uses several key constants and type definitions:
+
+- **Constants**:
+  - `MIN_ARCHIVE_SIZE_BYTES`: Minimum file size (1MB) to skip transcoding if archive already exists
+  - `LOG_ROTATION_SIZE`: Log file rotation threshold (4MB)
+  - `OUTPUT_LOCK`: Global threading lock for coordinating logging and progress updates
+
+- **Type Definitions**:
+  - `TranscodeAction`: TypedDict for transcoding operations with input, output, and paired JPG file
+  - `RemovalAction`: TypedDict for file removal operations with file path and reason
+  - `ActionPlan`: TypedDict for action plans containing transcoding and removal lists
 
 ## System Components
 
@@ -43,6 +64,7 @@ Configuration holder that processes command-line arguments and provides a centra
 - Handles special case where delete flag overrides trash root setting
 - Manages output directory path resolution
 - Processes multiple configuration sources (defaults, command-line args, etc.)
+- Includes helper methods `_resolve_trash_root()` and `_resolve_output_path()` for path resolution
 
 ### FileDiscovery
 
@@ -52,6 +74,7 @@ Discovers camera files with valid timestamps in the expected directory structure
 - Implements thorough timestamp validation (year range 2000-2099)
 - Scans multiple directory locations: input, trash, and output directories when clean_output is enabled
 - Handles complex directory path validation to ensure proper YYYY/MM/DD structure
+- Implements `_parse_timestamp_from_archived_filename()` method specifically for parsing timestamps from archived files like `archived-YYYYMMDDHHMMSS.mp4`
 
 ### Transcoder
 
@@ -78,6 +101,7 @@ Manages file operations including moving to trash, permanent deletion, and clean
 - Includes automatic cleanup of empty date-structured directories
 - Extracted helper methods for improved testability and code organization:
   - `_calculate_trash_subdirectory()`: Calculates trash subdirectory based on file type (input/output)
+  - `_calculate_trash_destination()`: Calculates destination path in trash with logic to prevent double nesting when files are already in trash directories, including conflict resolution with timestamp-counter suffixes
 
 ### FileProcessor
 
@@ -88,6 +112,12 @@ Orchestrates the file processing workflow, generating action plans and executing
 - Handles paired JPG file management with orphaned file detection
 - Coordinates transcoding success/failure with appropriate file removal strategies
 - Manages output path generation with proper directory structure
+- Implements `_determine_source_root()` method to determine if a file is from the output directory and returns both source root and output flag
+- Implements `_output_path()` method to generate output paths in format `output/YYYY/MM/DD/archived-YYYYMMDDHHMMSS.mp4`
+- Implements `cleanup_orphaned_files()` method to remove orphaned JPG files and clean empty directories
+- Implements `_handle_action_type()` method that uses pattern matching (match statement) to handle different action types
+- Includes logic to prevent removal of source files and paired JPGs when transcoding fails
+- Uses ExceptionGroup for handling multiple removal failures in batch operations
 
 ### ProgressReporter
 
@@ -458,6 +488,8 @@ The system implements comprehensive error handling at multiple levels:
 5. **Configuration**: Handles path validation, directory existence checks, and argument validation
 6. **Network/Process**: Handles subprocess execution failures, dependency availability checks, and resource cleanup during interruptions
 7. **Path Operations**: Handles relative path resolution failures, directory nesting issues, and file system access problems
+8. **Batch Operations**: Uses ExceptionGroup to handle multiple removal failures in batch operations, allowing the system to continue processing while logging individual failures
+9. **Transcoding Failures**: Implements logic to prevent removal of source files and paired JPGs when transcoding fails, ensuring data integrity
 
 ## Configuration
 
@@ -484,3 +516,14 @@ The system accepts the following command-line arguments:
 - pyright for type checking
 - uv for package management
 - ffmpeg with QSV hardware acceleration support
+
+## Utility Functions
+
+The application includes several standalone utility functions that orchestrate the main workflow:
+
+- `display_plan()`: Displays the action plan to the user with detailed information about transcoding and removal operations
+- `confirm_plan()`: Handles user confirmation prompts before executing operations
+- `setup_signal_handlers()`: Sets up signal handlers for graceful shutdown on SIGINT, SIGTERM, and SIGHUP
+- `parse_args()`: Parses command-line arguments using argparse
+- `run_archiver()`: Main pipeline function that orchestrates the entire archiving process through discovery, planning, processing, and cleanup stages
+- `main()`: Entry point function that parses arguments and runs the archiver

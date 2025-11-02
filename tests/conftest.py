@@ -24,6 +24,14 @@ from archiver import (  # noqa: E402
 )
 
 
+@pytest.fixture(scope="module")
+def persistent_camera_dir():
+    """Module-scoped camera directory for read-only tests."""
+    temp_path = Path(tempfile.mkdtemp())
+    yield temp_path
+    shutil.rmtree(temp_path)
+
+
 @pytest.fixture
 def temp_dir():
     """Create a temporary directory for tests."""
@@ -110,6 +118,76 @@ def make_file_set(make_camera_file):
     return _make
 
 
+class FileSetBuilder:
+    """Builder pattern for complex file structures."""
+
+    def __init__(self, temp_dir):
+        self.temp_dir = temp_dir
+        self.timestamps = []
+        self.include_archives = False
+        self.include_orphaned_jpgs = False
+
+    def with_timestamps(self, *timestamps):
+        """Add timestamps to the file set."""
+        self.timestamps.extend(timestamps)
+        return self
+
+    def with_archives(self):
+        """Include archive files in the build."""
+        self.include_archives = True
+        return self
+
+    def with_orphaned_jpgs(self):
+        """Include orphaned JPG files in the build."""
+        self.include_orphaned_jpgs = True
+        return self
+
+    def build(self):
+        """Build the file set according to specifications."""
+        from datetime import datetime
+        from pathlib import Path
+
+        result = {"files": [], "archived_files": [], "orphaned_jpgs": []}
+
+        # Create regular file sets
+        for ts in self.timestamps:
+            year_dir = self.temp_dir / str(ts.year)
+            month_dir = year_dir / f"{ts.month:02d}"
+            day_dir = month_dir / f"{ts.day:02d}"
+            day_dir.mkdir(parents=True, exist_ok=True)
+
+            # Create MP4 and JPG files
+            mp4_path = day_dir / f"REO_camera_{ts.strftime('%Y%m%d%H%M%S')}.mp4"
+            jpg_path = day_dir / f"REO_camera_{ts.strftime('%Y%m%d%H%M%S')}.jpg"
+            mp4_path.touch()
+            jpg_path.touch()
+
+            result["files"].append({"mp4": mp4_path, "jpg": jpg_path, "timestamp": ts})
+
+            # Create archive files if requested
+            if self.include_archives:
+                archived_path = day_dir / f"archived-{ts.strftime('%Y%m%d%H%M%S')}.mp4"
+                archived_path.touch()
+                result["archived_files"].append(archived_path)
+
+        # Create orphaned JPG files if requested
+        if self.include_orphaned_jpgs:
+            orphaned_ts = datetime.now()
+            orphaned_jpg = (
+                self.temp_dir / f"REO_camera_{orphaned_ts.strftime('%Y%m%d%H%M%S')}.jpg"
+            )
+            orphaned_jpg.touch()
+            result["orphaned_jpgs"].append(orphaned_jpg)
+
+        return result
+
+
+@pytest.fixture
+def file_set_builder(temp_dir):
+    """Builder pattern for complex file structures."""
+    return FileSetBuilder(temp_dir)
+
+
 @pytest.fixture
 def sample_files(camera_dir):
     """Create sample camera files for testing."""
@@ -152,6 +230,18 @@ def mock_args():
 def config(mock_args):
     """Create a Config instance from mock arguments."""
     return Config(mock_args)
+
+
+@pytest.fixture
+def complete_test_environment(camera_dir, archived_dir, trash_dir, logger, config):
+    """Provides complete test environment in one fixture."""
+    return {
+        "camera_dir": camera_dir,
+        "archived_dir": archived_dir,
+        "trash_dir": trash_dir,
+        "logger": logger,
+        "config": config,
+    }
 
 
 @pytest.fixture

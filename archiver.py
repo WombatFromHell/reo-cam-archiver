@@ -16,7 +16,18 @@ import threading
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    List,
+    Literal,
+    Optional,
+    Set,
+    Tuple,
+    TypedDict,
+    Union,
+)
 
 # Constants
 MIN_ARCHIVE_SIZE_BYTES = 1_048_576  # 1MB
@@ -38,31 +49,83 @@ FileSize = int
 ProgressCallback = Callable[[float], None]
 
 
+# Type aliases for complex return types
+# Return type for FileDiscovery.discover_files method
+DiscoveredFiles = Tuple[
+    List[Tuple[FilePath, Timestamp]],  # List of (file_path, timestamp) tuples
+    Dict[
+        str, Dict[str, FilePath]
+    ],  # Mapping of timestamp keys to file extensions and paths
+    Set[FilePath],  # Set of trash file paths
+]
+
+# Type alias for timestamp-to-file mapping (common pattern in the codebase)
+TimestampFileMapping = Dict[str, Dict[str, FilePath]]
+
+# Type definitions for action plans
+GenericAction = Dict[str, Any]
+
+
+class TranscodeAction(TypedDict):
+    type: Literal["transcode"]
+    input: FilePath
+    output: FilePath
+    jpg_to_remove: Optional[FilePath]
+
+
+class RemovalAction(TypedDict):
+    type: str
+    file: FilePath
+    reason: str
+
+
+# Union type for action items to allow both TypedDict and generic dict
+ActionItem = Union[TranscodeAction, RemovalAction, GenericAction]
+
+
+class ActionPlan(TypedDict):
+    transcoding: List[TranscodeAction]
+    removals: List[RemovalAction]
+
+
+# Type alias for action plan that's compatible with both TypedDict and dict
+ActionPlanType = Union[ActionPlan, Dict[str, List[Dict[str, Any]]]]
+
+
 class Config:
     """Configuration holder with strict typing"""
 
     def __init__(self, args: argparse.Namespace):
         self.directory: FilePath = Path(args.directory)
-        self.output: FilePath = (
-            Path(args.output) if args.output else self.directory / "archived"
-        )
+        self.output: FilePath = self._resolve_output_path(args)
         self.dry_run: bool = args.dry_run
         self.no_confirm: bool = args.no_confirm
         self.no_skip: bool = args.no_skip
         self.delete: bool = args.delete
-        self.trash_root: Optional[FilePath] = (
-            None
-            if args.delete  # If delete flag is set, don't use trash regardless
-            else Path(args.trash_root)
-            if args.trash_root
-            else (self.directory / ".deleted")
-        )
+        self.trash_root: Optional[FilePath] = self._resolve_trash_root(args)
         self.cleanup: bool = args.cleanup
         self.clean_output: bool = args.clean_output
         self.age: int = args.age
         self.log_file: Optional[FilePath] = (
             Path(args.log_file) if args.log_file else self.directory / "archiver.log"
         )
+
+    @staticmethod
+    def _resolve_trash_root(args) -> Optional[FilePath]:
+        """Resolve trash root based on delete flag and args."""
+        if args.delete:  # If delete flag is set, don't use trash regardless
+            return None
+        else:
+            return (
+                Path(args.trash_root)
+                if args.trash_root
+                else Path(args.directory) / ".deleted"
+            )
+
+    @staticmethod
+    def _resolve_output_path(args) -> FilePath:
+        """Resolve output directory path."""
+        return Path(args.output) if args.output else Path(args.directory) / "archived"
 
 
 class GracefulExit:
@@ -100,6 +163,25 @@ class ProgressReporter:
             self.current += 1
             self.current_file_start_time = time.time()
 
+    def format_time(self, elapsed):
+        """Format time with hours only when needed.
+
+        Args:
+            elapsed: Elapsed time in seconds
+
+        Returns:
+            Formatted time string in 'MM:SS' format if hours <= 0,
+            or 'HH:MM:SS' format if hours > 0
+        """
+        hours = int(elapsed // 3600)
+        minutes = int((elapsed % 3600) // 60)
+        seconds = int(elapsed % 60)
+        return (
+            f"{hours:02}:{minutes:02}:{seconds:02}"
+            if hours > 0
+            else f"{minutes:02}:{seconds:02}"
+        )
+
     def update_progress(self, pct: float) -> None:
         if self.silent or self.graceful_exit.should_exit():
             return
@@ -109,19 +191,8 @@ class ProgressReporter:
                 total_elapsed = time.time() - self.start_time
                 file_elapsed = time.time() - self.current_file_start_time
 
-                # Format time with hours only when needed
-                def format_time(elapsed):
-                    hours = int(elapsed // 3600)
-                    minutes = int((elapsed % 3600) // 60)
-                    seconds = int(elapsed % 60)
-                    return (
-                        f"{hours:02}:{minutes:02}:{seconds:02}"
-                        if hours > 0
-                        else f"{minutes:02}:{seconds:02}"
-                    )
-
-                total_elapsed_str = format_time(total_elapsed)
-                file_elapsed_str = format_time(file_elapsed)
+                total_elapsed_str = self.format_time(total_elapsed)
+                file_elapsed_str = self.format_time(file_elapsed)
                 bar_length = 20
                 filled = int(bar_length * pct / 100)
                 bar = "|" * filled + "-" * (bar_length - filled)
@@ -269,12 +340,10 @@ class FileDiscovery:
         trash_root: Optional[FilePath] = None,
         output_directory: Optional[FilePath] = None,
         clean_output: bool = False,
-    ) -> Tuple[
-        List[Tuple[FilePath, Timestamp]], Dict[str, Dict[str, FilePath]], Set[FilePath]
-    ]:
+    ) -> DiscoveredFiles:
         """Discover camera files with valid timestamps"""
         mp4s: List[Tuple[FilePath, Timestamp]] = []
-        mapping: Dict[str, Dict[str, FilePath]] = {}
+        mapping: TimestampFileMapping = {}
         trash_files: Set[FilePath] = set()
 
         # Scan base directory
@@ -621,6 +690,63 @@ class Transcoder:
         return current_pct
 
     @staticmethod
+    def _process_ffmpeg_output(
+        proc,
+        total_duration: Optional[float],
+        progress_cb: Optional[ProgressCallback],
+        graceful_exit: GracefulExit,
+        logger: logging.Logger,
+    ) -> bool:
+        """Process ffmpeg output stream and report progress."""
+        log_lines: List[str] = []
+        prev_pct = -1.0
+        cur_pct = 0.0
+        debug_ffmpeg = logger.isEnabledFor(logging.DEBUG)
+
+        if proc.stdout is None:
+            logger.error("Failed to capture ffmpeg output")
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+            return False
+
+        stdout_iter = iter(proc.stdout.readline, "")
+
+        for line in stdout_iter:
+            if graceful_exit.should_exit():
+                logger.info("Cancellation requested, terminating ffmpeg process...")
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait()
+                return False
+
+            if not line:
+                break
+
+            if debug_ffmpeg:
+                logger.debug(f"FFmpeg output: {line.strip()}")
+
+            log_lines.append(line)
+
+            cur_pct = Transcoder._calculate_progress(line, total_duration, cur_pct)
+
+            if progress_cb and cur_pct != prev_pct:
+                progress_cb(cur_pct)
+                prev_pct = cur_pct
+
+        rc = proc.wait()
+        if rc != 0 and not graceful_exit.should_exit():
+            msg = f"FFmpeg failed (code {rc})\n" + "".join(log_lines)
+            logger.error(msg)
+
+        return rc == 0 and not graceful_exit.should_exit()
+
+    @staticmethod
     def transcode_file(
         input_path: FilePath,
         output_path: FilePath,
@@ -659,56 +785,11 @@ class Transcoder:
             logger.error(f"Failed to start ffmpeg process: {e}")
             return False
 
-        log_lines: List[str] = []
-        prev_pct = -1.0
-        cur_pct = 0.0
-
         try:
-            if proc.stdout is None:
-                logger.error("Failed to capture ffmpeg output")
-                try:
-                    proc.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-                    proc.wait()
-                return False
-
-            stdout_iter = iter(proc.stdout.readline, "")
-
-            for line in stdout_iter:
-                if graceful_exit.should_exit():
-                    logger.info("Cancellation requested, terminating ffmpeg process...")
-                    proc.terminate()
-                    try:
-                        proc.wait(timeout=5)
-                    except subprocess.TimeoutExpired:
-                        proc.kill()
-                        proc.wait()
-                    return False
-
-                if not line:
-                    break
-
-                if debug_ffmpeg:
-                    logger.debug(f"FFmpeg output: {line.strip()}")
-
-                log_lines.append(line)
-
-                cur_pct = Transcoder._calculate_progress(line, total_duration, cur_pct)
-
-                if progress_cb and cur_pct != prev_pct:
-                    progress_cb(cur_pct)
-                    prev_pct = cur_pct
-
-            rc = proc.wait()
-            if rc != 0 and not graceful_exit.should_exit():
-                msg = (
-                    f"FFmpeg failed (code {rc}) for {input_path} -> {output_path}\n"
-                    + "".join(log_lines)
-                )
-                logger.error(msg)
-
-            return rc == 0 and not graceful_exit.should_exit()
+            success = Transcoder._process_ffmpeg_output(
+                proc, total_duration, progress_cb, graceful_exit, logger
+            )
+            return success
         finally:
             if proc and proc.stdout:
                 try:
@@ -750,7 +831,7 @@ class FileProcessor:
     def generate_action_plan(
         self,
         mp4s: List[Tuple[FilePath, Timestamp]],
-        mapping: Dict[str, Dict[str, FilePath]],
+        mapping: TimestampFileMapping,
     ) -> Dict[str, List[Dict[str, Any]]]:
         """Generate a plan of all transcoding and removal actions to be performed.
 
@@ -761,8 +842,11 @@ class FileProcessor:
         Returns:
             Dictionary containing lists of transcoding and removal actions
         """
-        transcoding_actions: List[Dict[str, Any]] = []
-        removal_actions: List[Dict[str, Any]] = []
+        # Use TypedDict internally for type safety but return compatible type
+        # Note: We use the specific action types for internal type safety,
+        # but the return type is compatible with Dict[str, List[Dict[str, Any]]]
+        transcoding_actions: List[TranscodeAction] = []
+        removal_actions: List[RemovalAction] = []
 
         # Calculate age cutoff
         age_cutoff = None
@@ -845,13 +929,33 @@ class FileProcessor:
                         }
                     )
 
-        return {
-            "transcoding": transcoding_actions,
-            "removals": removal_actions,
+        # Cast to maintain compatibility with expected return type
+        # While preserving the benefits of TypedDict internally
+        result: Dict[str, List[Dict[str, Any]]] = {
+            "transcoding": transcoding_actions,  # type: ignore
+            "removals": removal_actions,  # type: ignore
         }
+        return result
+
+    def _determine_source_root(self, file_path: FilePath) -> Tuple[FilePath, bool]:
+        """Determine source root and output flag for a file."""
+        # Determine if this file is from the output directory
+        # by checking if it's within the output directory path
+        is_output_file = False
+        if self.config.output and self.config.clean_output:
+            try:
+                file_path.relative_to(self.config.output)
+                is_output_file = True
+            except ValueError:
+                # File is not within output directory
+                is_output_file = False
+
+        # Determine the appropriate source root based on whether it's input or output
+        source_root = self.config.output if is_output_file else self.config.directory
+        return source_root, is_output_file
 
     def execute_plan(
-        self, plan: Dict[str, List[Dict[str, Any]]], progress_reporter: ProgressReporter
+        self, plan: ActionPlanType, progress_reporter: ProgressReporter
     ) -> bool:
         """Execute the action plan generated by generate_action_plan.
 
@@ -862,8 +966,9 @@ class FileProcessor:
         Returns:
             bool: True if execution completed successfully, False otherwise
         """
-        transcoding_actions = plan.get("transcoding", [])
-        removal_actions = plan.get("removals", [])
+        # Cast to specific types to maintain internal type safety
+        transcoding_actions = plan["transcoding"]  # type: ignore
+        removal_actions = plan["removals"]  # type: ignore
 
         # Track failed transcodes to avoid removing their source files and paired JPGs
         failed_transcodes = set()
@@ -934,7 +1039,7 @@ class FileProcessor:
                         is_output=False,
                         source_root=self.config.directory,
                     )
-                    removal_actions.remove(source_removal_action)
+                    removal_actions.remove(source_removal_action)  # type: ignore
             else:
                 self.logger.error(f"Failed to transcode {input_path}")
                 failed_transcodes.add(input_path)
@@ -966,42 +1071,60 @@ class FileProcessor:
                 continue
             remaining_removal_actions.append(action)
 
-        # Execute the filtered removal actions
+        # Execute the filtered removal actions with ExceptionGroup for batch operations
+        exceptions = []
         for action in remaining_removal_actions:
             if self.graceful_exit.should_exit():
                 break
 
             file_path = action["file"]
-            # Determine if this file is from the output directory
-            # by checking if it's within the output directory path
-            is_output_file = False
-            if self.config.output and self.config.clean_output:
-                try:
-                    file_path.relative_to(self.config.output)
-                    is_output_file = True
-                except ValueError:
-                    # File is not within output directory
-                    is_output_file = False
+            source_root, is_output_file = self._determine_source_root(file_path)
 
-            # Determine the appropriate source root based on whether it's input or output
-            if is_output_file:
-                source_root = self.config.output
-            else:
-                source_root = self.config.directory
+            try:
+                FileManager.remove_file(
+                    file_path,
+                    self.logger,
+                    dry_run=self.config.dry_run,
+                    delete=self.config.delete,
+                    trash_root=self.config.trash_root,
+                    is_output=is_output_file,
+                    source_root=source_root,
+                )
+            except Exception as e:
+                exceptions.append(e)
 
-            FileManager.remove_file(
-                file_path,
-                self.logger,
-                dry_run=self.config.dry_run,
-                delete=self.config.delete,
-                trash_root=self.config.trash_root,
-                is_output=is_output_file,
-                source_root=source_root,
-            )
+        if exceptions:
+            try:
+                raise ExceptionGroup("Removal failures", exceptions)
+            except ExceptionGroup:
+                # Log the exception group but continue processing
+                self.logger.error(
+                    f"Multiple removal failures occurred: {len(exceptions)} total"
+                )
+                for exc in exceptions:
+                    self.logger.error(f"  - {str(exc)}")
 
         return True
 
-    def cleanup_orphaned_files(self, mapping: Dict[str, Dict[str, FilePath]]) -> None:
+    def _handle_action_type(self, action_type: str) -> str:
+        """Handle action types using pattern matching."""
+        # Use match statement for action types (Python 3.10+ feature)
+        match action_type:
+            case "transcode":
+                return "Processing transcoding action"
+            case "source_removal_after_transcode":
+                return "Processing source removal after transcode"
+            case "jpg_removal_after_transcode":
+                return "Processing JPG removal after transcode"
+            case "source_removal_after_skip":
+                return "Processing source removal after skip"
+            case "jpg_removal_after_skip":
+                return "Processing JPG removal after skip"
+            case _:
+                self.logger.warning(f"Unknown action type: {action_type}")
+                return f"Processing unknown action type: {action_type}"
+
+    def cleanup_orphaned_files(self, mapping: TimestampFileMapping) -> None:
         """Remove orphaned JPG files and clean empty directories.
 
         Args:
@@ -1065,9 +1188,7 @@ class FileProcessor:
         )
 
 
-def display_plan(
-    plan: Dict[str, List[Dict[str, Any]]], logger: logging.Logger, config: Config
-) -> None:
+def display_plan(plan: ActionPlanType, logger: logging.Logger, config: Config) -> None:
     """Display the action plan to the user"""
     logger.info("=== ACTION PLAN ===")
     logger.info(f"Transcoding {len(plan['transcoding'])} files:")
@@ -1097,9 +1218,7 @@ def display_plan(
     logger.info("=== END PLAN ===")
 
 
-def confirm_plan(
-    plan: Dict[str, List[Dict[str, Any]]], config: Config, logger: logging.Logger
-) -> bool:
+def confirm_plan(plan: ActionPlanType, config: Config, logger: logging.Logger) -> bool:
     """Ask for user confirmation"""
     if config.no_confirm:
         return True
