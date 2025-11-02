@@ -273,7 +273,7 @@ graph TB
 
 The test suite relies heavily on fixtures defined in `conftest.py`, including factory fixtures, mock presets, and helper classes:
 
-````mermaid
+```mermaid
 graph TB
     subgraph "Fixture Hierarchy"
         temp_dir[temp_dir<br/>Temporary directory]
@@ -312,6 +312,8 @@ graph TB
     make_camera_file --> make_file_set
     temp_dir --> logger
 
+```
+
 ### Parametrization Strategy
 
 The test suite uses parametrization extensively to test multiple scenarios efficiently:
@@ -340,7 +342,7 @@ graph TB
     FileRemovalParams --> Maintainability
     IntegrationScenarios --> ReducedDuplication
     E2EScenarios --> ComprehensiveCoverage
-````
+```
 
 ### Mocking Strategy
 
