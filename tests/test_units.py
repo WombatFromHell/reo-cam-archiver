@@ -28,20 +28,26 @@ from archiver import (  # noqa: E402
 class TestConfig:
     """Test cases for the Config class."""
 
-    def test_config_initialization(self, mock_args):
-        """Test that Config initializes correctly with default arguments."""
+    @pytest.mark.parametrize(
+        "field,expected",
+        [
+            ("directory", Path("/camera")),
+            ("output", Path("/camera/archived")),
+            ("dry_run", False),
+            ("no_confirm", False),
+            ("no_skip", False),
+            ("delete", False),
+            ("trash_root", Path("/camera/.deleted")),
+            ("cleanup", False),
+            ("clean_output", False),
+            ("age", 30),
+            ("log_file", Path("/camera/archiver.log")),
+        ],
+    )
+    def test_config_fields(self, mock_args, field, expected):
+        """Test Config field initialization with default values."""
         config = Config(mock_args)
-        assert config.directory == Path("/camera")
-        assert config.output == Path("/camera/archived")
-        assert config.dry_run is False
-        assert config.no_confirm is False
-        assert config.no_skip is False
-        assert config.delete is False
-        assert config.trash_root == Path("/camera/.deleted")
-        assert config.cleanup is False
-        assert config.clean_output is False
-        assert config.age == 30
-        assert config.log_file == Path("/camera/archiver.log")
+        assert getattr(config, field) == expected
 
     @pytest.mark.parametrize(
         "attr_name,new_value,expected_value",
@@ -598,6 +604,7 @@ class TestLogger:
         assert logger.name == "camera_archiver"
 
 
+@pytest.mark.file_operations
 class TestFileDiscovery:
     """Test cases for the FileDiscovery class."""
 
@@ -653,35 +660,6 @@ class TestFileDiscovery:
         assert len(mp4s) == 2  # One in camera, one in trash
         assert len(trash_files) == 1
         assert trash_file in trash_files
-
-    @pytest.mark.parametrize(
-        "filename,expected_result",
-        [
-            ("REO_camera_20230115120000.mp4", datetime(2023, 1, 15, 12, 0, 0)),
-            ("invalid_filename.mp4", None),
-            ("REO_camera_18000115120000.mp4", None),
-        ],
-    )
-    def test_parse_timestamp(self, filename, expected_result):
-        """Test parsing timestamps from filenames with various formats."""
-        timestamp = FileDiscovery._parse_timestamp(filename)
-        assert timestamp == expected_result
-
-    @pytest.mark.parametrize(
-        "archived_filename,expected_result",
-        [
-            ("archived-20230115120000.mp4", datetime(2023, 1, 15, 12, 0, 0)),
-            ("invalid_archived.mp4", None),
-        ],
-    )
-    def test_parse_timestamp_from_archived_filename(
-        self, archived_filename, expected_result
-    ):
-        """Test parsing timestamps from archived filenames."""
-        timestamp = FileDiscovery._parse_timestamp_from_archived_filename(
-            archived_filename
-        )
-        assert timestamp == expected_result
 
     def test_discover_files_with_invalid_directory_structure(self, temp_dir):
         """Test discovering files with deeply nested invalid directory structure."""
@@ -774,27 +752,53 @@ class TestFileDiscovery:
         assert found_archived
 
     @pytest.mark.parametrize(
+        "filename,expected",
+        [
+            # Valid cases
+            ("REO_camera_20230115120000.mp4", datetime(2023, 1, 15, 12, 0, 0)),
+            ("REO_camera_20231231235959.mp4", datetime(2023, 12, 31, 23, 59, 59)),
+            # Invalid format
+            ("invalid_filename.mp4", None),
+            ("REO_camera_invalid.mp4", None),
+            # Year out of range
+            ("REO_camera_18000115120000.mp4", None),
+            ("REO_camera_21000115120000.mp4", None),
+        ],
+        ids=lambda x: str(x) if isinstance(x, str) else "timestamp",
+    )
+    @pytest.mark.parsing
+    def test_parse_timestamp_comprehensive(self, filename, expected):
+        """Test timestamp parsing with comprehensive edge cases."""
+        assert FileDiscovery._parse_timestamp(filename) == expected
+
+    @pytest.mark.parametrize(
         "archived_filename,expected_result",
         [
+            # Valid cases
             ("archived-20230115120000.mp4", datetime(2023, 1, 15, 12, 0, 0)),
             ("archived-20230115120000.jpg", datetime(2023, 1, 15, 12, 0, 0)),
+            # Invalid format
             ("archived-invalid.mp4", None),
-            ("archived-18000115120000.mp4", None),  # Year out of range
-            ("archived-21000115120000.mp4", None),  # Year out of range
             ("invalid-format.mp4", None),
             ("", None),
+            # Year out of range
+            ("archived-18000115120000.mp4", None),  # Year out of range
+            ("archived-21000115120000.mp4", None),  # Year out of range
         ],
+        ids=lambda x: str(x) if isinstance(x, str) else "timestamp",
     )
-    def test_parse_timestamp_from_archived_filename_parametrized(
+    @pytest.mark.parsing
+    def test_parse_timestamp_from_archived_filename_comprehensive(
         self, archived_filename, expected_result
     ):
-        """Test parsing timestamps from archived filenames with parametrization."""
-        timestamp = FileDiscovery._parse_timestamp_from_archived_filename(
-            archived_filename
+        """Test parsing timestamps from archived filenames with comprehensive cases."""
+        assert (
+            FileDiscovery._parse_timestamp_from_archived_filename(archived_filename)
+            == expected_result
         )
-        assert timestamp == expected_result
 
 
+@pytest.mark.file_operations
 class TestFileManager:
     """Test cases for the FileManager class."""
 
@@ -1079,6 +1083,7 @@ class TestFileManager:
         assert "REO_camera_20230115120000_" in dest.name
 
 
+@pytest.mark.transcoding
 class TestTranscoder:
     """Test cases for the Transcoder class."""
 

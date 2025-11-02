@@ -294,7 +294,7 @@ This document outlines the best practices and guidelines for agents working with
 3. Command usage
    - The test suite should be run with: `uv run pytest -v`
    - Code coverage reports can be gathered with: `uv run slipcover -m pytest -v`
-   - Code linting/formatting should be run after any code changes by using: `ruff format ; ruff check --select I --fix; pyright`
+   - Code linting/formatting should be run after any code changes by using: `ruff check --select I --fix; ruff format; pyright`
    - Markdown files should be formatted after changes by using: `prettier --cache -c -w *.md`
    - When modifying our test suite we should ensure we grab an updated code coverage report by running the code coverage command listed above
 
