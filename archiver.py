@@ -114,10 +114,11 @@ class ProgressReporter:
                     hours = int(elapsed // 3600)
                     minutes = int((elapsed % 3600) // 60)
                     seconds = int(elapsed % 60)
-                    if hours > 0:
-                        return f"{hours:02}:{minutes:02}:{seconds:02}"
-                    else:
-                        return f"{minutes:02}:{seconds:02}"
+                    return (
+                        f"{hours:02}:{minutes:02}:{seconds:02}"
+                        if hours > 0
+                        else f"{minutes:02}:{seconds:02}"
+                    )
 
                 total_elapsed_str = format_time(total_elapsed)
                 file_elapsed_str = format_time(file_elapsed)
@@ -398,6 +399,18 @@ class FileManager:
     """Handles file operations with strict typing"""
 
     @staticmethod
+    def _calculate_trash_subdirectory(is_output: bool) -> str:
+        """Calculate the trash subdirectory based on whether it's an output file.
+
+        Args:
+            is_output: True if the file is from the output directory, False otherwise
+
+        Returns:
+            Subdirectory name ('output' or 'input')
+        """
+        return "output" if is_output else "input"
+
+    @staticmethod
     def remove_file(
         file_path: FilePath,
         logger: logging.Logger,
@@ -446,7 +459,7 @@ class FileManager:
         is_output: bool = False,
     ) -> FilePath:
         """Calculate the destination path in trash for a given file"""
-        dest_sub = "output" if is_output else "input"
+        dest_sub = FileManager._calculate_trash_subdirectory(is_output)
 
         # To prevent double nesting when files are already in trash directories,
         # we need to make sure we don't create paths like .deleted/input/.deleted/input/...
@@ -470,13 +483,9 @@ class FileManager:
             ):
                 # The file is already in trash structure. Remove the ".deleted/input" or
                 # ".deleted/output" prefix to avoid double nesting
-                if len(rel_parts) > 2:
-                    # Keep the rest of the path after .deleted/(input|output)
-                    rel_path = Path(*rel_parts[2:])
-                else:
-                    # If there are only 2 parts (just ".deleted/input" or ".deleted/output"),
-                    # use just the filename
-                    rel_path = Path(file_path.name)
+                rel_path = (
+                    Path(*rel_parts[2:]) if len(rel_parts) > 2 else Path(file_path.name)
+                )
 
         base_dest = trash_root / dest_sub / rel_path
         counter = 0
@@ -541,6 +550,77 @@ class Transcoder:
             return None
 
     @staticmethod
+    def _build_ffmpeg_command(input_path: FilePath, output_path: FilePath) -> List[str]:
+        """Build the ffmpeg command with appropriate parameters.
+
+        Args:
+            input_path: Path to the input video file
+            output_path: Path for the output transcoded file
+
+        Returns:
+            List of command arguments for ffmpeg subprocess
+        """
+        return [
+            "ffmpeg",
+            "-hide_banner",
+            "-hwaccel",
+            "qsv",
+            "-hwaccel_output_format",
+            "qsv",
+            "-y",
+            "-i",
+            str(input_path),
+            "-vf",
+            "scale_qsv=w=1024:h=768:mode=hq",
+            "-global_quality",
+            "26",
+            "-c:v",
+            "h264_qsv",
+            "-an",
+            str(output_path),
+        ]
+
+    @staticmethod
+    def _parse_ffmpeg_time(time_str: str) -> float:
+        """Parse time string from ffmpeg output and convert to seconds.
+
+        Args:
+            time_str: Time string in format 'HH:MM:SS' or just seconds
+
+        Returns:
+            Time in seconds
+        """
+        if ":" in time_str:
+            h, mn, s = map(float, time_str.split(":")[:3])
+            return h * 3600 + mn * 60 + s
+        else:
+            return float(time_str)
+
+    @staticmethod
+    def _calculate_progress(
+        line: str, total_duration: Optional[float], current_pct: float
+    ) -> float:
+        """Calculate the current progress percentage based on ffmpeg output.
+
+        Args:
+            line: Line of output from ffmpeg process
+            total_duration: Total duration of the video if known, None otherwise
+            current_pct: Current progress percentage
+
+        Returns:
+            Updated progress percentage
+        """
+        if total_duration and total_duration > 0:
+            time_match = re.search(r"time=([0-9:.]+)", line)
+            if time_match:
+                time_str = time_match.group(1)
+                elapsed_seconds = Transcoder._parse_ffmpeg_time(time_str)
+                return min(elapsed_seconds / total_duration * 100, 100.0)
+        else:
+            return min(current_pct + 0.5, 99.0)
+        return current_pct
+
+    @staticmethod
     def transcode_file(
         input_path: FilePath,
         output_path: FilePath,
@@ -561,25 +641,7 @@ class Transcoder:
 
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
-        cmd = [
-            "ffmpeg",
-            "-hide_banner",
-            "-hwaccel",
-            "qsv",
-            "-hwaccel_output_format",
-            "qsv",
-            "-y",
-            "-i",
-            str(input_path),
-            "-vf",
-            "scale_qsv=w=1024:h=768:mode=hq",
-            "-global_quality",
-            "26",
-            "-c:v",
-            "h264_qsv",
-            "-an",
-            str(output_path),
-        ]
+        cmd = Transcoder._build_ffmpeg_command(input_path, output_path)
 
         # Get video duration
         total_duration = Transcoder.get_video_duration(input_path)
@@ -632,18 +694,7 @@ class Transcoder:
 
                 log_lines.append(line)
 
-                if total_duration and total_duration > 0:
-                    time_match = re.search(r"time=([0-9:.]+)", line)
-                    if time_match:
-                        time_str = time_match.group(1)
-                        if ":" in time_str:
-                            h, mn, s = map(float, time_str.split(":")[:3])
-                            elapsed_seconds = h * 3600 + mn * 60 + s
-                        else:
-                            elapsed_seconds = float(time_str)
-                        cur_pct = min(elapsed_seconds / total_duration * 100, 100.0)
-                else:
-                    cur_pct = min(cur_pct + 0.5, 99.0)
+                cur_pct = Transcoder._calculate_progress(line, total_duration, cur_pct)
 
                 if progress_cb and cur_pct != prev_pct:
                     progress_cb(cur_pct)
@@ -680,11 +731,18 @@ class Transcoder:
 
 
 class FileProcessor:
-    """Handles file processing operations with strict typing"""
+    """Handles file processing operations with strict typing including plan generation and execution."""
 
     def __init__(
         self, config: Config, logger: logging.Logger, graceful_exit: GracefulExit
     ):
+        """Initialize the FileProcessor with configuration and dependencies.
+
+        Args:
+            config: Configuration object with archiving settings
+            logger: Logger instance for logging operations
+            graceful_exit: GracefulExit instance for handling shutdown signals
+        """
         self.config: Config = config
         self.logger: logging.Logger = logger
         self.graceful_exit: GracefulExit = graceful_exit
@@ -694,7 +752,15 @@ class FileProcessor:
         mp4s: List[Tuple[FilePath, Timestamp]],
         mapping: Dict[str, Dict[str, FilePath]],
     ) -> Dict[str, List[Dict[str, Any]]]:
-        """Generate a plan of all actions to be performed"""
+        """Generate a plan of all transcoding and removal actions to be performed.
+
+        Args:
+            mp4s: List of tuples containing file paths and timestamps
+            mapping: Dictionary mapping timestamps to file extensions and paths
+
+        Returns:
+            Dictionary containing lists of transcoding and removal actions
+        """
         transcoding_actions: List[Dict[str, Any]] = []
         removal_actions: List[Dict[str, Any]] = []
 
@@ -787,7 +853,15 @@ class FileProcessor:
     def execute_plan(
         self, plan: Dict[str, List[Dict[str, Any]]], progress_reporter: ProgressReporter
     ) -> bool:
-        """Execute the action plan"""
+        """Execute the action plan generated by generate_action_plan.
+
+        Args:
+            plan: Dictionary containing transcoding and removal actions
+            progress_reporter: ProgressReporter instance for tracking progress
+
+        Returns:
+            bool: True if execution completed successfully, False otherwise
+        """
         transcoding_actions = plan.get("transcoding", [])
         removal_actions = plan.get("removals", [])
 
@@ -928,7 +1002,11 @@ class FileProcessor:
         return True
 
     def cleanup_orphaned_files(self, mapping: Dict[str, Dict[str, FilePath]]) -> None:
-        """Remove orphaned JPG files and clean empty directories"""
+        """Remove orphaned JPG files and clean empty directories.
+
+        Args:
+            mapping: Dictionary mapping timestamps to file extensions and paths
+        """
         count = 0
         for key, files in mapping.items():
             if self.graceful_exit.should_exit():
@@ -1123,7 +1201,14 @@ def parse_args(args: Optional[List[str]] = None) -> argparse.Namespace:
 
 
 def run_archiver(config: Config) -> int:
-    """Main pipeline function with strict typing"""
+    """Main pipeline function that orchestrates the archiving process.
+
+    Args:
+        config: Configuration object containing all settings for the archiving process
+
+    Returns:
+        int: Exit code (0 for success, non-zero for errors)
+    """
     # Setup logging
     logger = Logger.setup(config)
 
@@ -1218,7 +1303,13 @@ def run_archiver(config: Config) -> int:
 
 
 def main() -> int:
-    """Main entry point"""
+    """Main entry point for the Camera Archiver application.
+
+    Parses command line arguments, creates configuration, and runs the archiver.
+
+    Returns:
+        int: Exit code (0 for success, non-zero for errors)
+    """
     args = parse_args()
     config = Config(args)
     return run_archiver(config)

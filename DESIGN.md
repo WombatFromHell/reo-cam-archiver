@@ -23,7 +23,9 @@ graph TB
         FileProcessor --> Transcoder[Transcoder]
         FileProcessor --> FileManager[FileManager]
         Transcoder --> ffmpeg[ffmpeg subprocess]
+        Transcoder --> helpers[Helper Methods]
         FileManager --> trash[Trash Management]
+        FileManager --> helpers[Helper Methods]
     end
 
     subgraph "Utilities"
@@ -60,6 +62,10 @@ Handles video transcoding using ffmpeg with QSV hardware acceleration. It provid
 - Provides cancellation support during transcoding operations
 - Handles stdout streaming and progress calculation based on elapsed time vs total duration
 - Includes proper resource cleanup for subprocess management
+- Extracted helper methods for improved testability and code organization:
+  - `_build_ffmpeg_command()`: Builds the ffmpeg command with appropriate parameters
+  - `_parse_ffmpeg_time()`: Parses time string from ffmpeg output and converts to seconds
+  - `_calculate_progress()`: Calculates current progress percentage based on ffmpeg output
 
 ### FileManager
 
@@ -70,6 +76,8 @@ Manages file operations including moving to trash, permanent deletion, and clean
 - Supports atomic file operations with proper error handling
 - Handles both input and output file categorization for trash management
 - Includes automatic cleanup of empty date-structured directories
+- Extracted helper methods for improved testability and code organization:
+  - `_calculate_trash_subdirectory()`: Calculates trash subdirectory based on file type (input/output)
 
 ### FileProcessor
 
@@ -439,24 +447,6 @@ graph TB
     ExceptionRecovery --> ScenarioBased
 ```
 
-### Current Coverage Status
-
-The test suite provides comprehensive coverage of the application:
-
-- **Overall Coverage**: 91% (2,730 lines covered out of 2,995 total lines)
-- **Unit Tests**: 98% coverage (1,129 out of 1,147 lines tested)
-- **Integration Tests**: 99% coverage (426 out of 430 lines tested)
-- **End-to-End Tests**: 100% coverage (243 out of 243 lines tested)
-- **Test Suite**: 164 individual test cases across all categories
-
-The test suite includes comprehensive error handling tests for:
-
-- File system operations and permission errors
-- Missing dependencies and subprocess failures
-- Log rotation and file access issues
-- Network/interrupt handling scenarios
-- Configuration validation and edge cases
-
 ## Error Handling
 
 The system implements comprehensive error handling at multiple levels:
@@ -494,4 +484,3 @@ The system accepts the following command-line arguments:
 - pyright for type checking
 - uv for package management
 - ffmpeg with QSV hardware acceleration support
-- Standard library modules: argparse, logging, os, re, shutil, signal, subprocess, sys, threading, time, datetime, pathlib, typing
