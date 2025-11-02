@@ -4,20 +4,24 @@ Integration tests for component interactions in the Camera Archiver system.
 
 import os
 import signal
+import sys
 import time
 from pathlib import Path
 
-from archiver import (
+parent_dir = Path(__file__).parent.parent
+sys.path.insert(0, str(parent_dir))
+
+from archiver import (  # noqa: E402
     Config,
-    GracefulExit,
-    ProgressReporter,
-    Logger,
-    FileManager,
     FileDiscovery,
-    Transcoder,
+    FileManager,
     FileProcessor,
-    run_archiver,
+    GracefulExit,
+    Logger,
+    ProgressReporter,
+    Transcoder,
     parse_args,
+    run_archiver,
 )
 
 
@@ -739,8 +743,9 @@ class TestIntegrationWithUncoveredPaths:
 
     def test_logger_with_exception_handling_during_setup(self, temp_dir, mocker):
         """Integration test for Logger setup with exception scenarios."""
-        from archiver import Config, Logger
         from argparse import Namespace
+
+        from archiver import Config, Logger
 
         # Create args with a problematic log file path
         args = Namespace()

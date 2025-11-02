@@ -3,20 +3,25 @@ Unit tests for individual components of the Camera Archiver system.
 """
 
 import subprocess
-from pathlib import Path
+import sys
 from datetime import datetime
+from pathlib import Path
+
 import pytest
 from pytest_mock import MockerFixture
 
-from archiver import (
+parent_dir = Path(__file__).parent.parent
+sys.path.insert(0, str(parent_dir))
+
+from archiver import (  # noqa: E402
     Config,
-    GracefulExit,
-    ProgressReporter,
-    Logger,
     FileDiscovery,
     FileManager,
-    Transcoder,
     FileProcessor,
+    GracefulExit,
+    Logger,
+    ProgressReporter,
+    Transcoder,
 )
 
 
@@ -243,9 +248,10 @@ class TestLogger:
         self, config, mocker
     ):
         """Test ThreadSafeStreamHandler.emit method when there's an active progress reporter."""
-        from archiver import ThreadSafeStreamHandler
         import logging
         import sys
+
+        from archiver import ThreadSafeStreamHandler
 
         # Create a ThreadSafeStreamHandler instance
         handler = ThreadSafeStreamHandler(sys.stderr)
@@ -443,7 +449,7 @@ class TestLogger:
         self, temp_dir, mocker: MockerFixture
     ):
         """Test Logger._rotate_log_file when OSError occurs during file creation."""
-        from archiver import Logger, LOG_ROTATION_SIZE
+        from archiver import LOG_ROTATION_SIZE, Logger
 
         log_file = temp_dir / "test.log"
 
@@ -480,7 +486,7 @@ class TestLogger:
         self, temp_dir, mocker: MockerFixture
     ):
         """Test Logger._rotate_log_file when AttributeError occurs during file creation."""
-        from archiver import Logger, LOG_ROTATION_SIZE
+        from archiver import LOG_ROTATION_SIZE, Logger
 
         log_file = temp_dir / "test.log"
 
@@ -1834,8 +1840,9 @@ class TestParseArgs:
 
     def test_parse_args_with_none_argument(self, mocker):
         """Test parse_args when args parameter is None."""
-        from archiver import parse_args
         import sys
+
+        from archiver import parse_args
 
         # Patch sys.argv to have only the script name to avoid test runner args
         mocker.patch.object(sys, "argv", ["archiver.py"])
@@ -1875,7 +1882,7 @@ class TestRunArchiver:
 
     def test_run_archiver_with_nonexistent_directory(self, mock_args):
         """Test run_archiver when input directory doesn't exist."""
-        from archiver import run_archiver, Config
+        from archiver import Config, run_archiver
 
         # Set directory to a non-existent path
         mock_args.directory = "/nonexistent/directory"
@@ -1886,7 +1893,7 @@ class TestRunArchiver:
 
     def test_run_archiver_with_no_files(self, mock_args, temp_dir, mocker):
         """Test run_archiver when no files are discovered."""
-        from archiver import run_archiver, Config, FileDiscovery
+        from archiver import Config, FileDiscovery, run_archiver
 
         # Set up directory that exists but has no files
         mock_args.directory = str(temp_dir)
@@ -1902,7 +1909,7 @@ class TestRunArchiver:
 
     def test_run_archiver_with_exception(self, mock_args, temp_dir, mocker):
         """Test run_archiver when an exception occurs."""
-        from archiver import run_archiver, Config, FileDiscovery
+        from archiver import Config, FileDiscovery, run_archiver
 
         # Set up directory that exists
         mock_args.directory = str(temp_dir)
@@ -1920,7 +1927,7 @@ class TestRunArchiver:
         self, mock_args, temp_dir, sample_files, mocker
     ):
         """Test run_archiver when user cancels the operation."""
-        from archiver import run_archiver, Config, FileDiscovery
+        from archiver import Config, FileDiscovery, run_archiver
 
         # Set up directory that exists
         mock_args.directory = str(temp_dir)

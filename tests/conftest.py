@@ -2,14 +2,23 @@
 Fixtures and utility functions for the Camera Archiver test suite.
 """
 
-import tempfile
 import shutil
-from pathlib import Path
+import sys
+import tempfile
 from datetime import datetime
+from pathlib import Path
 from unittest.mock import MagicMock
+
 import pytest
 
-from archiver import Config, GracefulExit, Logger
+parent_dir = Path(__file__).parent.parent
+sys.path.insert(0, str(parent_dir))
+
+from archiver import (  # noqa: E402
+    Config,
+    GracefulExit,
+    Logger,
+)
 
 
 @pytest.fixture

@@ -2,8 +2,19 @@
 End-to-end tests for the Camera Archiver system.
 """
 
+import sys
 from datetime import datetime
-from archiver import Config, Transcoder, run_archiver, main
+from pathlib import Path
+
+parent_dir = Path(__file__).parent.parent
+sys.path.insert(0, str(parent_dir))
+
+from archiver import (  # noqa: E402
+    Config,
+    Transcoder,
+    main,
+    run_archiver,
+)
 
 
 class TestEndToEndWorkflow:
@@ -378,7 +389,7 @@ class TestEndToEndWithUncoveredPaths:
 
     def test_e2e_with_exception_handling(self, mock_args, temp_dir, mocker):
         """End-to-end test for exception handling in run_archiver."""
-        from archiver import Config, run_archiver, FileDiscovery
+        from archiver import Config, FileDiscovery, run_archiver
 
         # Set directory to an existing path
         mock_args.directory = str(temp_dir)
@@ -397,7 +408,7 @@ class TestEndToEndWithUncoveredPaths:
         self, mock_args, camera_dir, sample_files, mocker
     ):
         """End-to-end test for user cancellation during confirmation."""
-        from archiver import Config, run_archiver, FileDiscovery
+        from archiver import Config, FileDiscovery, run_archiver
 
         # Set up directory and sample files
         mock_args.directory = str(camera_dir)
@@ -448,7 +459,7 @@ class TestEndToEndWithUncoveredPaths:
         self, mock_args, camera_dir, sample_files, mocker
     ):
         """End-to-end test for signal handling during processing."""
-        from archiver import Config, run_archiver, FileDiscovery, GracefulExit
+        from archiver import Config, FileDiscovery, GracefulExit, run_archiver
 
         # Set up directory and sample files
         mock_args.directory = str(camera_dir)
