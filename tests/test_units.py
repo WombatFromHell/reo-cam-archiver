@@ -528,41 +528,16 @@ class TestLogger:
         assert (log_file.with_suffix(log_file.suffix + ".1")).exists()  # Backup exists
         assert log_file.with_name(f"{log_file.name}.1").exists()  # Check backup exists
 
-    def test_logger_setup_with_oserror(self, temp_dir, mocker: MockerFixture):
-        """Test Logger.setup when OSError occurs during directory creation."""
-        log_file = temp_dir / "test" / "log.log"  # Non-existent directory
-
-        # Create real args
-        from argparse import Namespace
-
-        args = Namespace()
-        args.directory = str(temp_dir)
-        args.output = str(temp_dir / "archived")
-        args.dry_run = False
-        args.no_confirm = False
-        args.no_skip = False
-        args.delete = False
-        args.trash_root = str(temp_dir / ".deleted")
-        args.cleanup = False
-        args.clean_output = False
-        args.age = 30
-        args.log_file = str(log_file)
-
-        config = Config(args)
-
-        # This should handle the OSError gracefully when trying to create the directory
-        logger = Logger.setup(config)
-        assert logger.name == "camera_archiver"
-
     @pytest.mark.parametrize(
-        "exception_type",
+        "exception_type,exception_msg,mock_targets",
         [
-            OSError,
-            AttributeError,
+            (OSError, "Permission denied", [("mkdir", "mkdir")]),
+            (AttributeError, "Mock doesn't have proper Path behavior", [("mkdir", "mkdir")]),
+            (AttributeError, "Mock doesn't have proper Path behavior", [("mkdir", "mkdir"), ("touch", "touch"), ("exists", "exists"), ("stat", "stat")]),
         ],
     )
-    def test_logger_setup_with_different_exceptions(
-        self, temp_dir, mocker: MockerFixture, exception_type
+    def test_logger_setup_with_exceptions(
+        self, temp_dir, mocker: MockerFixture, exception_type, exception_msg, mock_targets
     ):
         """Test Logger.setup when different exceptions occur during setup."""
         log_file = temp_dir / "test" / "log.log"  # Non-existent directory
@@ -586,70 +561,14 @@ class TestLogger:
         config = Config(args)
 
         # Mock the operations inside Logger.setup that might cause exceptions
-        if exception_type == OSError:
-            mocker.patch.object(Path, "mkdir", side_effect=OSError("Permission denied"))
-        elif exception_type == AttributeError:
+        for target_method, path_method in mock_targets:
             mocker.patch.object(
                 Path,
-                "mkdir",
-                side_effect=AttributeError("Mock doesn't have proper Path behavior"),
+                path_method,
+                side_effect=exception_type(exception_msg),
             )
 
         # This should handle the exception gracefully
-        logger = Logger.setup(config)
-        assert logger.name == "camera_archiver"
-
-    def test_logger_setup_with_attributeerror_on_mock(
-        self, temp_dir, mocker: MockerFixture
-    ):
-        """Test Logger.setup when AttributeError occurs with mock objects."""
-        # Create a real Path object to avoid the MagicMock directory creation issue
-        # but then patch the internal operations to cause AttributeError
-        log_file_path = temp_dir / "test.log"
-
-        # Create real args but with a real log_file path
-        from argparse import Namespace
-
-        args = Namespace()
-        args.directory = str(temp_dir)
-        args.output = str(temp_dir / "archived")
-        args.dry_run = False
-        args.no_confirm = False
-        args.no_skip = False
-        args.delete = False
-        args.trash_root = str(temp_dir / ".deleted")
-        args.cleanup = False
-        args.clean_output = False
-        args.age = 30
-        args.log_file = str(log_file_path)  # Use string to avoid Path conversion issues
-
-        config = Config(args)
-
-        # Mock the operations inside Logger.setup that might cause AttributeError
-        # to simulate a scenario where Path operations fail
-        mocker.patch.object(
-            Path,
-            "mkdir",
-            side_effect=AttributeError("Mock doesn't have proper Path behavior"),
-        )
-        mocker.patch.object(
-            Path,
-            "touch",
-            side_effect=AttributeError("Mock doesn't have proper Path behavior"),
-        )
-        mocker.patch.object(
-            Path,
-            "exists",
-            side_effect=AttributeError("Mock doesn't have proper Path behavior"),
-        )
-        # Also mock the stat operation that's called in _rotate_log_file
-        mocker.patch.object(
-            Path,
-            "stat",
-            side_effect=AttributeError("Mock doesn't have proper Path behavior"),
-        )
-
-        # This should handle the AttributeError gracefully
         logger = Logger.setup(config)
         assert logger.name == "camera_archiver"
 
@@ -697,10 +616,17 @@ class TestLogger:
             f"{log_file.name}.3"
         ).exists()  # New .1 file (was original)
 
-    def test_log_rotation_with_oserror_in_creation(
-        self, temp_dir, mocker: MockerFixture
+    @pytest.mark.parametrize(
+        "exception_type,exception_msg,operation",
+        [
+            (OSError, "Permission denied", "mkdir"),
+            (AttributeError, "Mock doesn't have proper Path behavior", "touch"),
+        ],
+    )
+    def test_log_rotation_with_exceptions(
+        self, temp_dir, mocker: MockerFixture, exception_type, exception_msg, operation
     ):
-        """Test Logger._rotate_log_file when OSError occurs during file creation."""
+        """Test Logger rotation when different exceptions occur during file operations."""
         from archiver import LOG_ROTATION_SIZE, Logger
 
         log_file = temp_dir / "test.log"
@@ -727,125 +653,10 @@ class TestLogger:
 
         config = Config(args)
 
-        # Mock mkdir to raise OSError
-        mocker.patch.object(Path, "mkdir", side_effect=OSError("Permission denied"))
+        # Mock specific operations to raise exceptions
+        mocker.patch.object(Path, operation, side_effect=exception_type(exception_msg))
 
-        # This should handle the OSError gracefully
-        logger = Logger.setup(config)
-        assert logger.name == "camera_archiver"
-
-    def test_log_rotation_with_attributeerror_in_creation(
-        self, temp_dir, mocker: MockerFixture
-    ):
-        """Test Logger._rotate_log_file when AttributeError occurs during file creation."""
-        from archiver import LOG_ROTATION_SIZE, Logger
-
-        log_file = temp_dir / "test.log"
-
-        # Create a log file larger than the rotation size to trigger rotation
-        with open(log_file, "w") as f:
-            f.write("x" * (LOG_ROTATION_SIZE + 100))  # Exceed rotation size
-
-        # Create real args
-        from argparse import Namespace
-
-        args = Namespace()
-        args.directory = str(temp_dir)
-        args.output = str(temp_dir / "archived")
-        args.dry_run = False
-        args.no_confirm = False
-        args.no_skip = False
-        args.delete = False
-        args.trash_root = str(temp_dir / ".deleted")
-        args.cleanup = False
-        args.clean_output = False
-        args.age = 30
-        args.log_file = str(log_file)
-
-        config = Config(args)
-
-        # Mock touch to raise AttributeError
-        mocker.patch.object(
-            Path,
-            "touch",
-            side_effect=AttributeError("Mock doesn't have proper Path behavior"),
-        )
-
-        # This should handle the AttributeError gracefully
-        logger = Logger.setup(config)
-        assert logger.name == "camera_archiver"
-
-    def test_logger_setup_with_new_log_file_oserror(
-        self, temp_dir, mocker: MockerFixture
-    ):
-        """Test Logger._rotate_log_file when creating a new log file and OSError occurs."""
-        from archiver import Logger
-
-        log_file = (
-            temp_dir / "nonexistent_dir" / "test.log"
-        )  # Non-existent parent directory
-
-        # Create real args
-        from argparse import Namespace
-
-        args = Namespace()
-        args.directory = str(temp_dir)
-        args.output = str(temp_dir / "archived")
-        args.dry_run = False
-        args.no_confirm = False
-        args.no_skip = False
-        args.delete = False
-        args.trash_root = str(temp_dir / ".deleted")
-        args.cleanup = False
-        args.clean_output = False
-        args.age = 30
-        args.log_file = str(log_file)
-
-        config = Config(args)
-
-        # Mock mkdir to raise OSError
-        mocker.patch.object(Path, "mkdir", side_effect=OSError("Permission denied"))
-
-        # This should handle the OSError gracefully when file doesn't exist initially
-        logger = Logger.setup(config)
-        assert logger.name == "camera_archiver"
-
-    def test_logger_setup_with_new_log_file_attributeerror(
-        self, temp_dir, mocker: MockerFixture
-    ):
-        """Test Logger._rotate_log_file when creating a new log file and AttributeError occurs."""
-        from archiver import Logger
-
-        log_file = (
-            temp_dir / "nonexistent_dir" / "test.log"
-        )  # Non-existent parent directory
-
-        # Create real args
-        from argparse import Namespace
-
-        args = Namespace()
-        args.directory = str(temp_dir)
-        args.output = str(temp_dir / "archived")
-        args.dry_run = False
-        args.no_confirm = False
-        args.no_skip = False
-        args.delete = False
-        args.trash_root = str(temp_dir / ".deleted")
-        args.cleanup = False
-        args.clean_output = False
-        args.age = 30
-        args.log_file = str(log_file)
-
-        config = Config(args)
-
-        # Mock touch to raise AttributeError
-        mocker.patch.object(
-            Path,
-            "touch",
-            side_effect=AttributeError("Mock doesn't have proper Path behavior"),
-        )
-
-        # This should handle the AttributeError gracefully when file doesn't exist initially
+        # This should handle the exception gracefully
         logger = Logger.setup(config)
         assert logger.name == "camera_archiver"
 
@@ -1092,45 +903,9 @@ class TestFileManager:
         # Should not raise an exception
         FileManager.remove_file(non_existent, logger)
 
-    def test_calculate_trash_destination(self, temp_dir, trash_dir):
-        """Test calculating trash destination for a file."""
-        source_root = temp_dir / "source"
-        source_root.mkdir()
 
-        file_path = source_root / "2023" / "01" / "15" / "REO_camera_20230115120000.mp4"
-        file_path.parent.mkdir(parents=True)
-        file_path.touch()
 
-        dest = FileManager._calculate_trash_destination(
-            file_path, source_root, trash_dir, is_output=False
-        )
 
-        expected = (
-            trash_dir / "input" / "2023" / "01" / "15" / "REO_camera_20230115120000.mp4"
-        )
-        assert dest == expected
-
-    def test_calculate_trash_destination_with_conflict(self, temp_dir, trash_dir):
-        """Test calculating trash destination when a conflict exists."""
-        source_root = temp_dir / "source"
-        source_root.mkdir()
-
-        file_path = source_root / "REO_camera_20230115120000.mp4"
-        file_path.touch()
-
-        # Create the expected destination in advance
-        expected = trash_dir / "input" / "REO_camera_20230115120000.mp4"
-        expected.parent.mkdir(parents=True)
-        expected.touch()
-
-        dest = FileManager._calculate_trash_destination(
-            file_path, source_root, trash_dir, is_output=False
-        )
-
-        # Destination should be different to avoid conflict
-        assert dest != expected
-        assert dest.parent == expected.parent
-        assert dest.name.startswith("REO_camera_20230115120000_")
 
     def test_clean_empty_directories(self, temp_dir, logger):
         """Test cleaning empty directories."""
@@ -1196,118 +971,13 @@ class TestFileManager:
         # Directory should still exist in dry-run mode
         assert empty_dir.exists()
 
-    def test_calculate_trash_destination_with_trash_already_in_path(
-        self, temp_dir, trash_dir
-    ):
-        """Test calculating trash destination when file path already contains trash structure."""
-        from archiver import FileManager
 
-        source_root = temp_dir / "source"
-        source_root.mkdir()
 
-        # Create a file in a path that already looks like trash (has .deleted/input in path)
-        file_path = (
-            source_root
-            / ".deleted"
-            / "input"
-            / "somefile"
-            / "REO_camera_20230115120000.mp4"
-        )
-        file_path.parent.mkdir(parents=True)
-        file_path.touch()
 
-        # Calculate trash destination - should handle the double nesting issue
-        dest = FileManager._calculate_trash_destination(
-            file_path, source_root, trash_dir, is_output=False
-        )
 
-        # Should avoid double nesting like .deleted/input/.deleted/input/
-        expected = trash_dir / "input" / "somefile" / "REO_camera_20230115120000.mp4"
-        assert dest == expected
 
-    def test_calculate_trash_destination_with_trash_path_edge_case(
-        self, temp_dir, trash_dir
-    ):
-        """Test calculating trash destination with edge case of just .deleted/input."""
-        from archiver import FileManager
 
-        source_root = temp_dir / "source"
-        source_root.mkdir()
 
-        # Create a file at the exact .deleted/input path level
-        file_path = source_root / ".deleted" / "input"
-        file_path.mkdir(parents=True)
-
-        # Create an actual file inside it
-        actual_file = file_path / "REO_camera_20230115120000.mp4"
-        actual_file.touch()
-
-        # Calculate trash destination
-        dest = FileManager._calculate_trash_destination(
-            actual_file, source_root, trash_dir, is_output=False
-        )
-
-        # Should handle the case where path starts with .deleted/input
-        expected = trash_dir / "input" / "REO_camera_20230115120000.mp4"
-        assert dest == expected
-
-    def test_calculate_trash_destination_with_value_error(self, temp_dir, trash_dir):
-        """Test calculating trash destination when file is not relative to source_root."""
-        from archiver import FileManager
-
-        source_root = temp_dir / "source"
-        source_root.mkdir()
-
-        # Create a file that's not inside the source_root
-        file_path = temp_dir / "outside" / "REO_camera_20230115120000.mp4"
-        file_path.parent.mkdir(exist_ok=True)
-        file_path.touch()
-
-        # Calculate trash destination - should handle ValueError from relative_to
-        dest = FileManager._calculate_trash_destination(
-            file_path, source_root, trash_dir, is_output=False
-        )
-
-        # Should use just the filename when relative_to fails
-        expected = trash_dir / "input" / "REO_camera_20230115120000.mp4"
-        assert dest == expected
-
-    def test_calculate_trash_destination_with_counter_reaching_high_values(
-        self, temp_dir, trash_dir
-    ):
-        """Test calculating trash destination when counter reaches high values (>100)."""
-        from archiver import FileManager
-
-        # For this test, we'll test with a smaller counter to make it simpler
-        # but test the counter increment logic thoroughly
-        source_root = temp_dir / "source"
-        source_root.mkdir()
-
-        file_path = source_root / "2023" / "01" / "15" / "REO_camera_20230115120000.mp4"
-        file_path.parent.mkdir(parents=True)
-        file_path.touch()
-
-        # Create a single conflicting file to trigger counter increment
-        base_dest = (
-            trash_dir / "input" / "2023" / "01" / "15" / "REO_camera_20230115120000.mp4"
-        )
-        base_dest.parent.mkdir(parents=True)
-        # Create the base destination file so the counter will be incremented
-        base_dest.touch()
-
-        # Calculate trash destination - should handle existing file by incrementing counter
-        dest = FileManager._calculate_trash_destination(
-            file_path, source_root, trash_dir, is_output=False
-        )
-
-        # Should create a path with a counter suffix (e.g., with _timestamp_1)
-        assert dest != base_dest
-        assert dest.parent == base_dest.parent
-        assert base_dest.stem in str(
-            dest
-        )  # The original name should be in the new name
-        # Should include the counter suffix
-        assert "_" in dest.stem and str(base_dest.suffix) in str(dest)
 
     @pytest.mark.parametrize(
         "delete_mode,error_type",
@@ -1339,80 +1009,206 @@ class TestFileManager:
         # File should still exist since the operation failed
         assert file_path.exists()
 
-    def test_calculate_trash_destination_with_race_condition(
-        self, temp_dir, trash_dir, mocker
+
+
+    @pytest.mark.parametrize(
+        "scenario",
+        [
+            "normal_path",  # Basic functionality test
+            "conflict",  # Test when destination already exists
+            "trash_in_path",  # Test path with .deleted/input already in structure
+            "edge_case",  # Test edge case with .deleted/input structure
+            "value_error",  # Test when file is not relative to source_root
+            "counter_high",  # Test counter increment for conflicts
+            "race_condition",  # Test race condition handling
+            "oserror_during_mkdir",  # Test OSError during parent.mkdir()
+        ],
+    )
+    def test_calculate_trash_destination_scenarios(
+        self, temp_dir, trash_dir, scenario, mocker
     ):
-        """Test calculating trash destination with race condition: file created between exists() check and move."""
+        """Test calculating trash destination for various scenarios."""
         from archiver import FileManager
 
         source_root = temp_dir / "source"
         source_root.mkdir()
 
-        file_path = source_root / "2023" / "01" / "15" / "REO_camera_20230115120000.mp4"
-        file_path.parent.mkdir(parents=True)
-        file_path.touch()
+        if scenario == "normal_path":
+            # Test calculating trash destination for a file
+            file_path = source_root / "2023" / "01" / "15" / "REO_camera_20230115120000.mp4"
+            file_path.parent.mkdir(parents=True)
+            file_path.touch()
 
-        # Create the destination file after the exists() check but before the move
-        base_dest = (
-            trash_dir / "input" / "2023" / "01" / "15" / "REO_camera_20230115120000.mp4"
-        )
-        base_dest.parent.mkdir(parents=True, exist_ok=True)
-        base_dest.touch()  # Create the conflict file
-
-        # Calculate trash destination - should handle existing file by adding counter
-        dest = FileManager._calculate_trash_destination(
-            file_path, source_root, trash_dir, is_output=False
-        )
-
-        # Should create a path with a counter suffix to avoid conflict
-        assert dest != base_dest
-        assert dest.parent == base_dest.parent
-        assert "REO_camera_20230115120000_" in dest.name
-
-    def test_calculate_trash_destination_with_oserror_during_parent_mkdir(
-        self, temp_dir, trash_dir, mocker
-    ):
-        """Test calculating trash destination when OSError occurs during parent.mkdir()."""
-        import time
-
-        from archiver import FileManager
-
-        source_root = temp_dir / "source"
-        source_root.mkdir()
-
-        file_path = source_root / "2023" / "01" / "15" / "REO_camera_20230115120000.mp4"
-        file_path.parent.mkdir(parents=True)
-        file_path.touch()
-
-        # Create the destination file to trigger the counter logic
-        base_dest = (
-            trash_dir / "input" / "2023" / "01" / "15" / "REO_camera_20230115120000.mp4"
-        )
-        base_dest.parent.mkdir(parents=True, exist_ok=True)
-        base_dest.touch()  # Create the conflict file
-
-        # The counter will create a new path; we'll mock mkdir to raise OSError for that path
-        # Mock Path.mkdir to raise OSError for the conflict resolution path
-        original_mkdir = Path.mkdir
-
-        def mock_mkdir(self, *args, **kwargs):
-            if "REO_camera_20230115120000_" in str(self):
-                raise OSError("Permission denied")
-            return original_mkdir(self, *args, **kwargs)
-
-        mocker.patch.object(Path, "mkdir", side_effect=mock_mkdir)
-
-        # This should still work or handle the error appropriately
-        # Since this is testing an error path from the PLAN, we're checking that the
-        # function doesn't crash when OSError occurs during mkdir
-        try:
             dest = FileManager._calculate_trash_destination(
                 file_path, source_root, trash_dir, is_output=False
             )
-            # If it doesn't raise an exception, that's good
-        except OSError:
-            # If it properly raises OSError, that's also acceptable behavior
-            pass
+
+            expected = (
+                trash_dir / "input" / "2023" / "01" / "15" / "REO_camera_20230115120000.mp4"
+            )
+            assert dest == expected
+
+        elif scenario == "conflict":
+            # Test calculating trash destination when a conflict exists
+            file_path = source_root / "REO_camera_20230115120000.mp4"
+            file_path.touch()
+
+            # Create the expected destination in advance
+            expected = trash_dir / "input" / "REO_camera_20230115120000.mp4"
+            expected.parent.mkdir(parents=True)
+            expected.touch()
+
+            dest = FileManager._calculate_trash_destination(
+                file_path, source_root, trash_dir, is_output=False
+            )
+
+            # Destination should be different to avoid conflict
+            assert dest != expected
+            assert dest.parent == expected.parent
+            assert dest.name.startswith("REO_camera_20230115120000_")
+
+        elif scenario == "trash_in_path":
+            # Test calculating trash destination when file path already contains trash structure
+            # Create a file in a path that already looks like trash (has .deleted/input in path)
+            file_path = (
+                source_root
+                / ".deleted"
+                / "input"
+                / "somefile"
+                / "REO_camera_20230115120000.mp4"
+            )
+            file_path.parent.mkdir(parents=True)
+            file_path.touch()
+
+            # Calculate trash destination - should handle the double nesting issue
+            dest = FileManager._calculate_trash_destination(
+                file_path, source_root, trash_dir, is_output=False
+            )
+
+            # Should avoid double nesting like .deleted/input/.deleted/input/
+            expected = trash_dir / "input" / "somefile" / "REO_camera_20230115120000.mp4"
+            assert dest == expected
+
+        elif scenario == "edge_case":
+            # Test calculating trash destination with edge case of just .deleted/input
+            # Create a file at the exact .deleted/input path level
+            file_path = source_root / ".deleted" / "input"
+            file_path.mkdir(parents=True)
+
+            # Create an actual file inside it
+            actual_file = file_path / "REO_camera_20230115120000.mp4"
+            actual_file.touch()
+
+            # Calculate trash destination
+            dest = FileManager._calculate_trash_destination(
+                actual_file, source_root, trash_dir, is_output=False
+            )
+
+            # Should handle the case where path starts with .deleted/input
+            expected = trash_dir / "input" / "REO_camera_20230115120000.mp4"
+            assert dest == expected
+
+        elif scenario == "value_error":
+            # Test calculating trash destination when file is not relative to source_root
+            # Create a file that's not inside the source_root
+            file_path = temp_dir / "outside" / "REO_camera_20230115120000.mp4"
+            file_path.parent.mkdir(exist_ok=True)
+            file_path.touch()
+
+            # Calculate trash destination - should handle ValueError from relative_to
+            dest = FileManager._calculate_trash_destination(
+                file_path, source_root, trash_dir, is_output=False
+            )
+
+            # Should use just the filename when relative_to fails
+            expected = trash_dir / "input" / "REO_camera_20230115120000.mp4"
+            assert dest == expected
+
+        elif scenario == "counter_high":
+            # Test calculating trash destination when counter reaches high values (>100)
+            file_path = source_root / "2023" / "01" / "15" / "REO_camera_20230115120000.mp4"
+            file_path.parent.mkdir(parents=True)
+            file_path.touch()
+
+            # Create a single conflicting file to trigger counter increment
+            base_dest = (
+                trash_dir / "input" / "2023" / "01" / "15" / "REO_camera_20230115120000.mp4"
+            )
+            base_dest.parent.mkdir(parents=True)
+            # Create the base destination file so the counter will be incremented
+            base_dest.touch()
+
+            # Calculate trash destination - should handle existing file by incrementing counter
+            dest = FileManager._calculate_trash_destination(
+                file_path, source_root, trash_dir, is_output=False
+            )
+
+            # Should create a path with a counter suffix (e.g., with _timestamp_1)
+            assert dest != base_dest
+            assert dest.parent == base_dest.parent
+            assert base_dest.stem in str(
+                dest
+            )  # The original name should be in the new name
+            # Should include the counter suffix
+            assert "_" in dest.stem and str(base_dest.suffix) in str(dest)
+
+        elif scenario == "race_condition":
+            # Test calculating trash destination with race condition
+            file_path = source_root / "2023" / "01" / "15" / "REO_camera_20230115120000.mp4"
+            file_path.parent.mkdir(parents=True)
+            file_path.touch()
+
+            # Create the destination file after the exists() check but before the move
+            base_dest = (
+                trash_dir / "input" / "2023" / "01" / "15" / "REO_camera_20230115120000.mp4"
+            )
+            base_dest.parent.mkdir(parents=True, exist_ok=True)
+            base_dest.touch()  # Create the conflict file
+
+            # Calculate trash destination - should handle existing file by adding counter
+            dest = FileManager._calculate_trash_destination(
+                file_path, source_root, trash_dir, is_output=False
+            )
+
+            # Should create a path with a counter suffix to avoid conflict
+            assert dest != base_dest
+            assert dest.parent == base_dest.parent
+            assert "REO_camera_20230115120000_" in dest.name
+
+        elif scenario == "oserror_during_mkdir":
+            # Test calculating trash destination when OSError occurs during parent.mkdir().
+            # Create the destination file to trigger the counter logic
+            file_path = source_root / "2023" / "01" / "15" / "REO_camera_20230115120000.mp4"
+            file_path.parent.mkdir(parents=True)
+            file_path.touch()
+
+            base_dest = (
+                trash_dir / "input" / "2023" / "01" / "15" / "REO_camera_20230115120000.mp4"
+            )
+            base_dest.parent.mkdir(parents=True, exist_ok=True)
+            base_dest.touch()  # Create the conflict file
+
+            # Mock Path.mkdir to raise OSError for the conflict resolution path
+            original_mkdir = Path.mkdir
+
+            def mock_mkdir(self, *args, **kwargs):
+                if "REO_camera_20230115120000_" in str(self):
+                    raise OSError("Permission denied")
+                return original_mkdir(self, *args, **kwargs)
+
+            mocker.patch.object(Path, "mkdir", side_effect=mock_mkdir)
+
+            # This should still work or handle the error appropriately
+            # Since this is testing an error path from the PLAN, we're checking that the
+            # function doesn't crash when OSError occurs during mkdir
+            try:
+                dest = FileManager._calculate_trash_destination(
+                    file_path, source_root, trash_dir, is_output=False
+                )
+                # If it doesn't raise an exception, that's good
+            except OSError:
+                # If it properly raises OSError, that's also acceptable behavior
+                pass
 
     def test_remove_file_with_trash_directory_readonly(
         self, sample_files, logger, temp_dir, mocker
@@ -1763,54 +1559,27 @@ class TestTranscoder:
         # Should have tried to terminate the process
         mock_proc.terminate.assert_called()
 
-    def test_parse_ffmpeg_time_with_valid_hh_mm_ss_format(self):
-        """Test Transcoder._parse_ffmpeg_time with valid HH:MM:SS format."""
-        result = Transcoder._parse_ffmpeg_time(
-            "01:25:30"
-        )  # 1 hour 25 minutes 30 seconds
-        assert result == 5130.0  # (1*3600) + (25*60) + 30 = 5130
-
-    def test_parse_ffmpeg_time_with_insufficient_colon_parts(self):
-        """Test Transcoder._parse_ffmpeg_time when there are not enough colon-separated parts."""
-        with pytest.raises(ValueError):
-            Transcoder._parse_ffmpeg_time("25:30")  # Only 2 parts, need 3
-
-    def test_parse_ffmpeg_time_with_just_seconds(self):
-        """Test Transcoder._parse_ffmpeg_time with just seconds."""
-        result = Transcoder._parse_ffmpeg_time("125.5")  # Just seconds
-        assert result == 125.5
-
-    def test_parse_ffmpeg_time_with_zero_time(self):
-        """Test Transcoder._parse_ffmpeg_time with zero time."""
-        result = Transcoder._parse_ffmpeg_time("00:00:00")
-        assert result == 0.0
-
-    def test_parse_ffmpeg_time_with_invalid_format_raises_value_error(self):
-        """Test that _parse_ffmpeg_time raises ValueError for completely invalid format."""
-        with pytest.raises(ValueError):
-            Transcoder._parse_ffmpeg_time("not-a-time-format")
-
-    def test_parse_ffmpeg_time_with_missing_colons_treated_as_seconds(self):
-        """Test Transcoder._parse_ffmpeg_time with missing colons (treated as seconds)."""
-        result = Transcoder._parse_ffmpeg_time("125.5")  # Just seconds
-        assert result == 125.5
-
-    def test_parse_ffmpeg_time_with_too_many_colons(self):
-        """Test Transcoder._parse_ffmpeg_time with too many colons (uses first 3)."""
-        # The function uses map(float, time_str.split(':')[:3]), so it takes first 3 parts
-        result = Transcoder._parse_ffmpeg_time(
-            "01:25:30:45"
-        )  # Uses only first 3: 01:25:30
-        assert result == 5130.0  # (1*3600) + (25*60) + 30 = 5130
-
-    def test_parse_ffmpeg_time_with_negative_values(self):
-        """Test Transcoder._parse_ffmpeg_time with negative values."""
-        # Negative values can be parsed as floats, so this should not raise an error
-        result = Transcoder._parse_ffmpeg_time(
-            "-01:25:30"
-        )  # -1 hour, 25 minutes, 30 seconds
-        # Calculated as: -1*3600 + 25*60 + 30 = -3600 + 1500 + 30 = -2070
-        assert result == -2070.0
+    @pytest.mark.parametrize(
+        "time_str,expected_result,should_raise",
+        [
+            ("01:25:30", 5130.0, False),  # 1 hour 25 minutes 30 seconds
+            ("125.5", 125.5, False),  # Just seconds
+            ("00:00:00", 0.0, False),  # Zero time
+            ("125.5", 125.5, False),  # Missing colons (treated as seconds)
+            ("01:25:30:45", 5130.0, False),  # Too many colons (uses first 3: 01:25:30)
+            ("-01:25:30", -2070.0, False),  # Negative values: -1*3600 + 25*60 + 30 = -2070
+            ("25:30", None, True),  # Insufficient colon parts (Only 2 parts, need 3)
+            ("not-a-time-format", None, True),  # Invalid format
+        ],
+    )
+    def test_parse_ffmpeg_time_scenarios(self, time_str, expected_result, should_raise):
+        """Test Transcoder._parse_ffmpeg_time with various time formats."""
+        if should_raise:
+            with pytest.raises(ValueError):
+                Transcoder._parse_ffmpeg_time(time_str)
+        else:
+            result = Transcoder._parse_ffmpeg_time(time_str)
+            assert result == expected_result
 
 
 class TestFileProcessor:

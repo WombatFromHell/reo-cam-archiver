@@ -382,9 +382,9 @@ The test suite is organized into three main categories with enhanced structure:
    - Focus on business logic and error handling
    - New pytest markers: `@pytest.mark.parsing`, `@pytest.mark.file_operations`, `@pytest.mark.transcoding`, etc.
    - Comprehensive parametrized tests for Config, FileDiscovery, and error handling paths
-   - 98% coverage with 18 missed lines across 1147 lines of test code
    - Tests for exception handling in Logger, FileManager, and Transcoder components
    - Signal handling and graceful exit tests
+   - Consolidated exception tests using parametrization to reduce code duplication
 
 2. **Integration Tests** (`test_integrations.py`):
    - Test component interactions
@@ -392,7 +392,6 @@ The test suite is organized into three main categories with enhanced structure:
    - Focus on data flow between components
    - Test error propagation across components
    - Use of `integration_scenario` fixture for standardized scenarios
-   - 99% coverage with 4 missed lines across 430 lines of test code
    - Tests for FileManager with output directory, Transcoder with ProgressReporter
    - Integration tests for Config, Logger, and GracefulExit with other components
    - Tests for run_archiver function with various configurations
@@ -403,7 +402,6 @@ The test suite is organized into three main categories with enhanced structure:
    - Focus on user-facing functionality
    - Test system-level error handling
    - Use of `e2e_scenario` fixture and `E2EOutcomeValidator` for consistent validation
-   - 100% coverage across 243 lines of test code
    - Tests for complete workflows with transcoding, cleanup, dry-run, and failure scenarios
    - Tests for user cancellation and exception handling in main execution path
 
@@ -441,12 +439,14 @@ The test suite is organized into three main categories with enhanced structure:
    - Document complex test scenarios
    - Keep tests focused and independent
    - Leverage auto-use fixtures for test isolation
+   - Consolidate similar test scenarios using parametrization to reduce code duplication
 
 6. **Advanced pytest Features**:
    - Use `reset_globals` auto-use fixture for state isolation
    - Apply pytest markers (`parsing`, `file_operations`, `transcoding`, etc.) for test categorization
    - Use indirect parametrization with fixtures like `integration_scenario`
    - Leverage session-scoped fixtures for expensive operations
+   - Use parametrized tests to efficiently cover multiple scenarios in fewer test methods
 
 ### Test Coverage Strategy
 
