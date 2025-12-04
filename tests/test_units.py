@@ -5,7 +5,7 @@ Unit tests for individual components of the Camera Archiver system.
 import subprocess
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -532,12 +532,30 @@ class TestLogger:
         "exception_type,exception_msg,mock_targets",
         [
             (OSError, "Permission denied", [("mkdir", "mkdir")]),
-            (AttributeError, "Mock doesn't have proper Path behavior", [("mkdir", "mkdir")]),
-            (AttributeError, "Mock doesn't have proper Path behavior", [("mkdir", "mkdir"), ("touch", "touch"), ("exists", "exists"), ("stat", "stat")]),
+            (
+                AttributeError,
+                "Mock doesn't have proper Path behavior",
+                [("mkdir", "mkdir")],
+            ),
+            (
+                AttributeError,
+                "Mock doesn't have proper Path behavior",
+                [
+                    ("mkdir", "mkdir"),
+                    ("touch", "touch"),
+                    ("exists", "exists"),
+                    ("stat", "stat"),
+                ],
+            ),
         ],
     )
     def test_logger_setup_with_exceptions(
-        self, temp_dir, mocker: MockerFixture, exception_type, exception_msg, mock_targets
+        self,
+        temp_dir,
+        mocker: MockerFixture,
+        exception_type,
+        exception_msg,
+        mock_targets,
     ):
         """Test Logger.setup when different exceptions occur during setup."""
         log_file = temp_dir / "test" / "log.log"  # Non-existent directory
@@ -903,10 +921,6 @@ class TestFileManager:
         # Should not raise an exception
         FileManager.remove_file(non_existent, logger)
 
-
-
-
-
     def test_clean_empty_directories(self, temp_dir, logger):
         """Test cleaning empty directories."""
         # Create a directory structure with some empty directories
@@ -971,14 +985,6 @@ class TestFileManager:
         # Directory should still exist in dry-run mode
         assert empty_dir.exists()
 
-
-
-
-
-
-
-
-
     @pytest.mark.parametrize(
         "delete_mode,error_type",
         [
@@ -1009,8 +1015,6 @@ class TestFileManager:
         # File should still exist since the operation failed
         assert file_path.exists()
 
-
-
     @pytest.mark.parametrize(
         "scenario",
         [
@@ -1035,7 +1039,9 @@ class TestFileManager:
 
         if scenario == "normal_path":
             # Test calculating trash destination for a file
-            file_path = source_root / "2023" / "01" / "15" / "REO_camera_20230115120000.mp4"
+            file_path = (
+                source_root / "2023" / "01" / "15" / "REO_camera_20230115120000.mp4"
+            )
             file_path.parent.mkdir(parents=True)
             file_path.touch()
 
@@ -1044,7 +1050,12 @@ class TestFileManager:
             )
 
             expected = (
-                trash_dir / "input" / "2023" / "01" / "15" / "REO_camera_20230115120000.mp4"
+                trash_dir
+                / "input"
+                / "2023"
+                / "01"
+                / "15"
+                / "REO_camera_20230115120000.mp4"
             )
             assert dest == expected
 
@@ -1086,7 +1097,9 @@ class TestFileManager:
             )
 
             # Should avoid double nesting like .deleted/input/.deleted/input/
-            expected = trash_dir / "input" / "somefile" / "REO_camera_20230115120000.mp4"
+            expected = (
+                trash_dir / "input" / "somefile" / "REO_camera_20230115120000.mp4"
+            )
             assert dest == expected
 
         elif scenario == "edge_case":
@@ -1126,13 +1139,20 @@ class TestFileManager:
 
         elif scenario == "counter_high":
             # Test calculating trash destination when counter reaches high values (>100)
-            file_path = source_root / "2023" / "01" / "15" / "REO_camera_20230115120000.mp4"
+            file_path = (
+                source_root / "2023" / "01" / "15" / "REO_camera_20230115120000.mp4"
+            )
             file_path.parent.mkdir(parents=True)
             file_path.touch()
 
             # Create a single conflicting file to trigger counter increment
             base_dest = (
-                trash_dir / "input" / "2023" / "01" / "15" / "REO_camera_20230115120000.mp4"
+                trash_dir
+                / "input"
+                / "2023"
+                / "01"
+                / "15"
+                / "REO_camera_20230115120000.mp4"
             )
             base_dest.parent.mkdir(parents=True)
             # Create the base destination file so the counter will be incremented
@@ -1154,13 +1174,20 @@ class TestFileManager:
 
         elif scenario == "race_condition":
             # Test calculating trash destination with race condition
-            file_path = source_root / "2023" / "01" / "15" / "REO_camera_20230115120000.mp4"
+            file_path = (
+                source_root / "2023" / "01" / "15" / "REO_camera_20230115120000.mp4"
+            )
             file_path.parent.mkdir(parents=True)
             file_path.touch()
 
             # Create the destination file after the exists() check but before the move
             base_dest = (
-                trash_dir / "input" / "2023" / "01" / "15" / "REO_camera_20230115120000.mp4"
+                trash_dir
+                / "input"
+                / "2023"
+                / "01"
+                / "15"
+                / "REO_camera_20230115120000.mp4"
             )
             base_dest.parent.mkdir(parents=True, exist_ok=True)
             base_dest.touch()  # Create the conflict file
@@ -1178,12 +1205,19 @@ class TestFileManager:
         elif scenario == "oserror_during_mkdir":
             # Test calculating trash destination when OSError occurs during parent.mkdir().
             # Create the destination file to trigger the counter logic
-            file_path = source_root / "2023" / "01" / "15" / "REO_camera_20230115120000.mp4"
+            file_path = (
+                source_root / "2023" / "01" / "15" / "REO_camera_20230115120000.mp4"
+            )
             file_path.parent.mkdir(parents=True)
             file_path.touch()
 
             base_dest = (
-                trash_dir / "input" / "2023" / "01" / "15" / "REO_camera_20230115120000.mp4"
+                trash_dir
+                / "input"
+                / "2023"
+                / "01"
+                / "15"
+                / "REO_camera_20230115120000.mp4"
             )
             base_dest.parent.mkdir(parents=True, exist_ok=True)
             base_dest.touch()  # Create the conflict file
@@ -1567,7 +1601,11 @@ class TestTranscoder:
             ("00:00:00", 0.0, False),  # Zero time
             ("125.5", 125.5, False),  # Missing colons (treated as seconds)
             ("01:25:30:45", 5130.0, False),  # Too many colons (uses first 3: 01:25:30)
-            ("-01:25:30", -2070.0, False),  # Negative values: -1*3600 + 25*60 + 30 = -2070
+            (
+                "-01:25:30",
+                -2070.0,
+                False,
+            ),  # Negative values: -1*3600 + 25*60 + 30 = -2070
             ("25:30", None, True),  # Insufficient colon parts (Only 2 parts, need 3)
             ("not-a-time-format", None, True),  # Invalid format
         ],
@@ -1962,7 +2000,7 @@ class TestFileProcessor:
         self, config, logger, graceful_exit, temp_dir
     ):
         """Test FileProcessor._determine_source_root with output file."""
-        from datetime import datetime
+        from datetime import datetime, timedelta
 
         # Set up config with output directory
         output_dir = temp_dir / "archived"
@@ -1994,7 +2032,7 @@ class TestFileProcessor:
         self, config, logger, graceful_exit, temp_dir
     ):
         """Test FileProcessor._determine_source_root with input file."""
-        from datetime import datetime
+        from datetime import datetime, timedelta
 
         # Set up config with input and output directories
         input_dir = temp_dir / "input"
@@ -2024,6 +2062,349 @@ class TestFileProcessor:
         # Should detect that the file is in input directory
         assert is_output_file is False
         assert source_root == input_dir
+
+    def test_size_based_cleanup_skipped_when_max_size_not_set(
+        self, config, logger, graceful_exit, mocker: MockerFixture
+    ):
+        """Test that size_based_cleanup is skipped when max_size is not set."""
+        processor = FileProcessor(config, logger, graceful_exit)
+
+        # Ensure max_size is None
+        config.max_size = None
+
+        # Mock the logger to check if any cleanup messages are logged
+        mock_logger_info = mocker.patch.object(logger, "info")
+
+        # Call size_based_cleanup with empty trash files
+        processor.size_based_cleanup(set())
+
+        # Since max_size is None, no cleanup should happen
+        mock_logger_info.assert_not_called()
+
+    def test_size_based_cleanup_with_invalid_max_size(
+        self, config, logger, graceful_exit, mocker: MockerFixture
+    ):
+        """Test that size_based_cleanup handles invalid max-size values."""
+        processor = FileProcessor(config, logger, graceful_exit)
+
+        # Set invalid max_size
+        config.max_size = "invalid_size"
+
+        # Mock the logger to check for error messages
+        mock_logger_error = mocker.patch.object(logger, "error")
+
+        # Call size_based_cleanup with empty trash files
+        processor.size_based_cleanup(set())
+
+        # Should log an error for invalid size
+        assert mock_logger_error.called
+        assert "Invalid max-size value" in str(mock_logger_error.call_args)
+
+    def test_size_based_cleanup_when_within_limit(
+        self, config, logger, graceful_exit, temp_dir, mocker: MockerFixture
+    ):
+        """Test that size_based_cleanup does nothing when current size is within limit."""
+        processor = FileProcessor(config, logger, graceful_exit)
+
+        # Set max_size to a large value
+        config.max_size = "100MB"
+
+        # Create a small file to simulate directory content
+        small_file = temp_dir / "small_file.mp4"
+        small_file.write_text("x" * 100)  # 100 bytes
+
+        # Mock the logger to check for info messages
+        mock_logger_info = mocker.patch.object(logger, "info")
+
+        # Call size_based_cleanup
+        processor.size_based_cleanup(set())
+
+        # Should log that we're within limit
+        info_messages = [call[0][0] for call in mock_logger_info.call_args_list]
+        within_limit_found = any(
+            "within limit" in msg or "no size-based cleanup needed" in msg
+            for msg in info_messages
+        )
+        assert within_limit_found, "Should have logged that we're within limit"
+
+    def test_size_based_cleanup_removes_trash_files_first(
+        self, config, logger, graceful_exit, temp_dir, mocker: MockerFixture
+    ):
+        """Test that size_based_cleanup removes trash files first."""
+        processor = FileProcessor(config, logger, graceful_exit)
+
+        # Set up the config to use temp_dir as the input directory
+        config.directory = temp_dir
+        config.trash_root = temp_dir / ".deleted"
+        config.trash_root.mkdir()
+
+        # Set a small max size to trigger cleanup
+        config.max_size = "800B"  # 800 bytes
+
+        # Create a trash directory structure with files
+        trash_input_dir = config.trash_root / "input"
+        trash_input_dir.mkdir(parents=True)
+
+        # Create a file in trash with a timestamp in its name
+        trash_timestamp = datetime(2023, 1, 1, 12, 0, 0)
+        trash_file = (
+            trash_input_dir
+            / f"REO_camera_{trash_timestamp.strftime('%Y%m%d%H%M%S')}.mp4"
+        )
+        trash_file.write_bytes(b"x" * 500)  # 500 bytes
+
+        # Also create source files to ensure trash files are prioritized
+        source_timestamp = datetime(2023, 2, 1, 12, 0, 0)
+        source_file = (
+            config.directory
+            / str(source_timestamp.year)
+            / f"{source_timestamp.month:02d}"
+            / f"{source_timestamp.day:02d}"
+            / f"REO_camera_{source_timestamp.strftime('%Y%m%d%H%M%S')}.mp4"
+        )
+        source_file.parent.mkdir(parents=True)
+        source_file.write_bytes(b"x" * 400)  # 400 bytes, total 900 bytes > 800B
+
+        # Mock the FileManager.remove_file to track what gets removed
+        mock_remove_file = mocker.patch(
+            "archiver.FileManager.remove_file", side_effect=lambda *args, **kwargs: None
+        )
+
+        # Call size_based_cleanup
+        processor.size_based_cleanup({trash_file})
+
+        # Verify that the trash file was removed (prioritized)
+        assert mock_remove_file.called
+        # The trash file should be among the removed files (first argument in call)
+        removed_files = [call[0][0] for call in mock_remove_file.call_args_list]
+        assert trash_file in removed_files
+
+    def test_size_based_cleanup_removes_oldest_files(
+        self, config, logger, graceful_exit, temp_dir, mocker: MockerFixture
+    ):
+        """Test that size_based_cleanup removes oldest files first."""
+        processor = FileProcessor(config, logger, graceful_exit)
+
+        # Set up the config to use temp_dir as the input directory
+        config.directory = temp_dir
+
+        # Set a small max size to trigger cleanup
+        config.max_size = "700B"  # 700 bytes
+
+        # Create source directory structure with files of different ages
+        # Create an older file (should be removed first)
+        old_timestamp = datetime(2023, 1, 1, 12, 0, 0)  # Old file
+        old_file = (
+            config.directory
+            / str(old_timestamp.year)
+            / f"{old_timestamp.month:02d}"
+            / f"{old_timestamp.day:02d}"
+            / f"REO_camera_{old_timestamp.strftime('%Y%m%d%H%M%S')}.mp4"
+        )
+        old_file.parent.mkdir(parents=True)
+        old_file.write_bytes(b"x" * 400)  # 400 bytes
+
+        # Create a newer file (should be kept)
+        new_timestamp = datetime(2023, 12, 1, 12, 0, 0)  # Newer file
+        new_file = (
+            config.directory
+            / str(new_timestamp.year)
+            / f"{new_timestamp.month:02d}"
+            / f"{new_timestamp.day:02d}"
+            / f"REO_camera_{new_timestamp.strftime('%Y%m%d%H%M%S')}.mp4"
+        )
+        new_file.parent.mkdir(parents=True)
+        new_file.write_bytes(b"x" * 400)  # 400 bytes
+        # Total is 800 bytes which is > 700 bytes limit, so oldest file should be removed
+
+        # Mock the FileManager.remove_file to track what gets removed
+        mock_remove_file = mocker.patch(
+            "archiver.FileManager.remove_file", side_effect=lambda *args, **kwargs: None
+        )
+
+        # Call size_based_cleanup
+        processor.size_based_cleanup(set())
+
+        # Verify that at least the old file was removed (since we're over the size limit)
+        assert mock_remove_file.called
+        # The old file should be among the removed files (first argument in call)
+        removed_files = [call[0][0] for call in mock_remove_file.call_args_list]
+        assert old_file in removed_files
+
+    def test_size_based_cleanup_respects_age_threshold(
+        self, config, logger, graceful_exit, temp_dir, mocker: MockerFixture
+    ):
+        """Test that size_based_cleanup respects the age threshold."""
+        processor = FileProcessor(config, logger, graceful_exit)
+
+        # Set up the config to use temp_dir as the input directory
+        config.directory = temp_dir
+
+        # Set a small max size and age threshold
+        config.max_size = "500B"  # 500 bytes
+        config.age = 5  # Only files older than 5 days
+
+        # Create a recent file (should NOT be removed due to age)
+        recent_timestamp = datetime.now() - timedelta(
+            days=1
+        )  # Recent file - only 1 day old
+        recent_file = (
+            config.directory
+            / str(recent_timestamp.year)
+            / f"{recent_timestamp.month:02d}"
+            / f"{recent_timestamp.day:02d}"
+            / f"REO_camera_{recent_timestamp.strftime('%Y%m%d%H%M%S')}.mp4"
+        )
+        recent_file.parent.mkdir(parents=True)
+        recent_file.write_bytes(
+            b"x" * 600
+        )  # 600 bytes - exceeds limit but too recent to be removed
+
+        # Mock the FileManager.remove_file to track what gets removed
+        mock_remove_file = mocker.patch(
+            "archiver.FileManager.remove_file", side_effect=lambda *args, **kwargs: None
+        )
+
+        # Call size_based_cleanup
+        processor.size_based_cleanup(set())
+
+        # Since the file is too recent, it should not be removed even though we're over the limit
+        # The call_args_list contains all calls made to the mock
+        if mock_remove_file.call_count > 0:
+            removed_files = [call[0][0] for call in mock_remove_file.call_args_list]
+            # Recent file should not be in the list of removed files
+            assert recent_file not in removed_files
+
+    def test_size_based_cleanup_with_cleanup_flag(
+        self, config, logger, graceful_exit, temp_dir, mocker: MockerFixture
+    ):
+        """Test that size_based_cleanup works properly in conjunction with cleanup flag."""
+        processor = FileProcessor(config, logger, graceful_exit)
+
+        # Set up the config to use temp_dir as the input directory
+        config.directory = temp_dir
+
+        # Enable both cleanup and max_size
+        config.cleanup = True
+        config.max_size = "400B"  # 400 bytes
+
+        # Create trash directory structure
+        config.trash_root = temp_dir / ".deleted"
+        config.trash_root.mkdir()
+
+        trash_input_dir = config.trash_root / "input"
+        trash_input_dir.mkdir(parents=True)
+
+        # Create an old file in trash
+        trash_timestamp = datetime(2023, 1, 1, 12, 0, 0)
+        trash_file = (
+            trash_input_dir
+            / f"REO_camera_{trash_timestamp.strftime('%Y%m%d%H%M%S')}.mp4"
+        )
+        trash_file.write_bytes(b"x" * 500)  # 500 bytes - will exceed limit
+
+        # Mock the FileManager.remove_file to track what gets removed
+        mock_remove_file = mocker.patch(
+            "archiver.FileManager.remove_file", side_effect=lambda *args, **kwargs: None
+        )
+
+        # Call size_based_cleanup
+        processor.size_based_cleanup({trash_file})
+
+        # Since max_size is set and we're over the limit, the trash file should be removed
+        assert mock_remove_file.called
+        removed_files = [call[0][0] for call in mock_remove_file.call_args_list]
+        assert trash_file in removed_files
+
+    def test_size_based_cleanup_with_graceful_exit(
+        self, config, logger, temp_dir, mocker: MockerFixture
+    ):
+        """Test that size_based_cleanup respects graceful exit."""
+        processor = FileProcessor(config, logger, GracefulExit())
+
+        # Set up the config to use temp_dir as the input directory
+        config.directory = temp_dir
+
+        # Set a small max size and add files to exceed it
+        config.max_size = "1KB"
+
+        # Create files to trigger cleanup
+        old_timestamp = datetime(2023, 1, 1, 12, 0, 0)
+        old_file = (
+            config.directory
+            / str(old_timestamp.year)
+            / f"{old_timestamp.month:02d}"
+            / f"{old_timestamp.day:02d}"
+            / f"REO_camera_{old_timestamp.strftime('%Y%m%d%H%M%S')}.mp4"
+        )
+        old_file.parent.mkdir(parents=True)
+        old_file.write_bytes(b"x" * 2000)  # 2000 bytes - exceeds 1KB
+
+        # Request exit before calling size_based_cleanup
+        processor.graceful_exit.request_exit()
+
+        # Mock the FileManager.remove_file to track what gets removed
+        mock_remove_file = mocker.patch(
+            "archiver.FileManager.remove_file", side_effect=lambda *args, **kwargs: None
+        )
+
+        # Call size_based_cleanup
+        processor.size_based_cleanup(set())
+
+        # Since graceful exit was requested, no files should be removed
+        mock_remove_file.assert_not_called()
+
+    def test_size_based_cleanup_with_archived_files(
+        self, config, logger, graceful_exit, temp_dir, mocker: MockerFixture
+    ):
+        """Test that size_based_cleanup handles archived files properly."""
+        processor = FileProcessor(config, logger, graceful_exit)
+
+        # Set up the config to use temp_dir as the input directory
+        config.directory = temp_dir
+
+        # Set up output directory
+        config.output = temp_dir / "archived"
+        config.output.mkdir()
+
+        # Set a small max size to trigger cleanup
+        config.max_size = "1KB"
+
+        # Create an archived file
+        archived_timestamp = datetime(2023, 1, 1, 12, 0, 0)
+        archived_file = (
+            config.output
+            / str(archived_timestamp.year)
+            / f"{archived_timestamp.month:02d}"
+            / f"{archived_timestamp.day:02d}"
+            / f"archived-{archived_timestamp.strftime('%Y%m%d%H%M%S')}.mp4"
+        )
+        archived_file.parent.mkdir(parents=True)
+        archived_file.write_bytes(b"x" * 800)  # 800 bytes
+
+        # Create another file to exceed the limit
+        other_file = (
+            config.output
+            / str(archived_timestamp.year)
+            / f"{archived_timestamp.month:02d}"
+            / f"{archived_timestamp.day:02d}"
+            / f"archived-{archived_timestamp.strftime('%Y%m%d%H%M%S')}extra.mp4"
+        )
+        other_file.write_bytes(b"x" * 500)  # 500 bytes, total now 1300 bytes > 1KB
+
+        # Mock the FileManager.remove_file to track what gets removed
+        mock_remove_file = mocker.patch(
+            "archiver.FileManager.remove_file", side_effect=lambda *args, **kwargs: None
+        )
+
+        # Call size_based_cleanup
+        processor.size_based_cleanup(set())
+
+        # At least one file should be removed to stay under the limit
+        assert mock_remove_file.called
+        removed_files = [call[0][0] for call in mock_remove_file.call_args_list]
+        # Either the archived file or the other file should be in removed files
+        assert any(f in removed_files for f in [archived_file, other_file])
 
 
 class TestSignalHandling:
@@ -2388,7 +2769,7 @@ class TestMainFunction:
     def test_file_discovery_with_large_number_of_files(self, temp_dir, mocker):
         """Test FileDiscovery with many files to test performance and memory usage."""
         import os
-        from datetime import datetime
+        from datetime import datetime, timedelta
 
         from archiver import FileDiscovery
 

@@ -38,6 +38,52 @@ LOG_ROTATION_SIZE = 4_194_304  # 4MB (4096KB) in bytes
 # Global lock for coordinating logging and progress updates
 OUTPUT_LOCK = threading.Lock()
 
+
+def parse_size(size_str: str) -> int:
+    """Parse size string like '500GB', '1TB', etc. into bytes.
+
+    Args:
+        size_str: Size string with unit (e.g., '500GB', '1TB', '100MB')
+
+    Returns:
+        Size in bytes
+    """
+    size_str = size_str.strip().upper()
+
+    # Define multipliers
+    multipliers = {
+        "B": 1,
+        "KB": 1024,
+        "MB": 1024**2,
+        "GB": 1024**3,
+        "TB": 1024**4,
+        "K": 1024,
+        "M": 1024**2,
+        "G": 1024**3,
+        "T": 1024**4,
+    }
+
+    # Find the numeric part and unit
+    import re
+
+    match = re.match(r"^(\d+(?:\.\d+)?)\s*([A-Z]+)$", size_str)
+
+    if not match:
+        raise ValueError(
+            f"Invalid size format: {size_str}. Expected format like '500GB', '1TB', etc."
+        )
+
+    number = float(match.group(1))
+    unit = match.group(2)
+
+    if unit not in multipliers:
+        raise ValueError(
+            f"Unknown size unit: {unit}. Supported units: B, KB, MB, GB, TB"
+        )
+
+    return int(number * multipliers[unit])
+
+
 # Global reference to the active progress reporter to allow clearing
 ACTIVE_PROGRESS_REPORTER = None
 
@@ -106,6 +152,7 @@ class Config:
         self.cleanup: bool = args.cleanup
         self.clean_output: bool = args.clean_output
         self.age: int = args.age
+        self.max_size: Optional[str] = getattr(args, "max_size", None)
         self.log_file: Optional[FilePath] = (
             Path(args.log_file) if args.log_file else self.directory / "archiver.log"
         )
@@ -1177,6 +1224,182 @@ class FileProcessor:
             self.config.directory, self.logger, dry_run=self.config.dry_run
         )
 
+    def size_based_cleanup(self, trash_files: Set[FilePath]) -> None:
+        """Perform size-based cleanup by removing oldest files first.
+
+        Files are removed in this priority order:
+        1. ./.deleted/... (trash files first)
+        2. ./archived/... (archived files second)
+        3. ./<YYYY>/<MM>/<DD>/... (source files last)
+
+        Args:
+            trash_files: Set of trash files discovered during file discovery
+        """
+        if not self.config.max_size:
+            return
+
+        try:
+            max_bytes = parse_size(self.config.max_size)
+        except ValueError as e:
+            self.logger.error(f"Invalid max-size value: {e}")
+            return
+
+        # Calculate total size of all control directories
+        def get_directory_size(directory: FilePath) -> int:
+            if not directory.exists():
+                return 0
+            total = 0
+            for path in directory.rglob("*"):
+                if path.is_file():
+                    try:
+                        total += path.stat().st_size
+                    except OSError:
+                        continue  # Skip files that can't be accessed
+            return total
+
+        # Get sizes of all directories under our control
+        trash_size = (
+            get_directory_size(self.config.directory / ".deleted")
+            if self.config.trash_root
+            else 0
+        )
+        archived_size = (
+            get_directory_size(self.config.output) if self.config.output else 0
+        )
+        source_size = get_directory_size(self.config.directory)
+
+        # Calculate total size
+        total_size = trash_size + archived_size + source_size
+
+        # If we're already under the limit, no cleanup needed
+        if total_size <= max_bytes:
+            self.logger.info(
+                f"Current size ({total_size} bytes) is within limit ({max_bytes} bytes), no size-based cleanup needed"
+            )
+            return
+
+        self.logger.info(
+            f"Current size ({total_size} bytes) exceeds limit ({max_bytes} bytes), starting size-based cleanup..."
+        )
+
+        # Create a list of all files with their timestamps and priority
+        all_files_with_info = []
+
+        # Add trash files (priority 1 - highest priority for removal)
+        if self.config.trash_root and self.config.trash_root.exists():
+            for trash_type in ["input", "output"]:
+                trash_dir = self.config.trash_root / trash_type
+                if trash_dir.exists():
+                    for p in trash_dir.rglob("*.*"):
+                        if p.is_file():
+                            try:
+                                ts = FileDiscovery._parse_timestamp(p.name)
+                                if not ts:
+                                    # Try parsing from archived files
+                                    ts = FileDiscovery._parse_timestamp_from_archived_filename(
+                                        p.name
+                                    )
+                                    if not ts:
+                                        continue  # Skip files we can't parse timestamps for
+                                all_files_with_info.append((ts, 1, p))  # priority 1
+                            except Exception:
+                                continue  # Skip files we can't process
+
+        # Add archived files (priority 2 - second priority for removal)
+        if self.config.output and self.config.output.exists():
+            for p in self.config.output.rglob("*.*"):
+                if p.is_file():
+                    try:
+                        ts = FileDiscovery._parse_timestamp(p.name)
+                        if not ts:
+                            # Try parsing from archived files
+                            ts = FileDiscovery._parse_timestamp_from_archived_filename(
+                                p.name
+                            )
+                            if not ts:
+                                continue  # Skip files we can't parse timestamps for
+                        all_files_with_info.append((ts, 2, p))  # priority 2
+                    except Exception:
+                        continue  # Skip files we can't process
+
+        # Add source files from the input directory (priority 3 - lowest priority for removal)
+        # Only add files that meet the age requirement
+        age_cutoff = None
+        if self.config.age > 0:
+            age_cutoff = datetime.now() - timedelta(days=self.config.age)
+
+        for p in self.config.directory.rglob("*.*"):
+            if p.is_file():
+                try:
+                    # Skip trash directory files
+                    if self.config.trash_root and self.config.trash_root in p.parents:
+                        continue
+                    # Skip output directory files unless we're cleaning output
+                    if (
+                        self.config.output
+                        and self.config.output in p.parents
+                        and not self.config.clean_output
+                    ):
+                        continue
+
+                    ts = FileDiscovery._parse_timestamp(p.name)
+                    if not ts:
+                        continue  # Skip files we can't parse timestamps for
+
+                    # Skip files that are too new (respect age requirement)
+                    if age_cutoff and ts >= age_cutoff:
+                        continue
+
+                    all_files_with_info.append((ts, 3, p))  # priority 3
+                except Exception:
+                    continue  # Skip files we can't process
+
+        # Sort files by priority (ascending) and then by timestamp (ascending, oldest first)
+        all_files_with_info.sort(key=lambda x: (x[1], x[0]))
+
+        # Remove files until we're under the size limit
+        removed_size = 0
+
+        for ts, priority, file_path in all_files_with_info:
+            if total_size - removed_size <= max_bytes:
+                break  # We're now under the limit
+
+            if self.graceful_exit.should_exit():
+                break
+
+            try:
+                # Get file size before removal
+                file_size = file_path.stat().st_size
+
+                # Determine source root and output flag
+                source_root, is_output_file = self._determine_source_root(file_path)
+
+                # Remove the file
+                FileManager.remove_file(
+                    file_path,
+                    self.logger,
+                    dry_run=self.config.dry_run,
+                    delete=self.config.delete,
+                    trash_root=self.config.trash_root,
+                    is_output=is_output_file,
+                    source_root=source_root,
+                )
+
+                removed_size += file_size
+                self.logger.info(
+                    f"Removed {file_path} ({file_size} bytes) due to size-based cleanup"
+                )
+
+            except Exception as e:
+                self.logger.error(
+                    f"Failed to remove {file_path} during size cleanup: {e}"
+                )
+                continue
+
+        self.logger.info(
+            f"Size-based cleanup completed. Removed {removed_size} bytes. Current size: {total_size - removed_size} bytes"
+        )
+
     def _output_path(self, input_file: FilePath, timestamp: Timestamp) -> FilePath:
         """Generate output path for archived file"""
         return (
@@ -1214,6 +1437,19 @@ def display_plan(plan: ActionPlanType, logger: logging.Logger, config: Config) -
             logger.info(
                 "Cleanup scope: Source files and trash files (archive files excluded)"
             )
+
+        # Show max-size configuration if specified
+        if config.max_size and isinstance(config.max_size, str):
+            try:
+                max_bytes = parse_size(config.max_size)
+                logger.info(
+                    f"Size limit: {config.max_size} ({max_bytes} bytes) - will remove oldest files if exceeded"
+                )
+                logger.info(
+                    "Size-based cleanup priority: 1) trash files, 2) archived files, 3) source files"
+                )
+            except ValueError:
+                logger.warning(f"Invalid max-size value: {config.max_size}")
 
     logger.info("=== END PLAN ===")
 
@@ -1315,6 +1551,11 @@ def parse_args(args: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--age", type=int, default=30, help="Age in days for cleanup (default: 30)"
     )
+    parser.add_argument(
+        "--max-size",
+        type=str,
+        help="Maximum size for cleanup (e.g., 500GB, 1TB) - deletes oldest files first when exceeded",
+    )
     parser.add_argument("--log-file", help="Log file path")
     return parser.parse_args(args)
 
@@ -1388,6 +1629,12 @@ def run_archiver(config: Config) -> int:
                 )
                 processor.cleanup_orphaned_files(mapping)
 
+                # Perform size-based cleanup if max-size is specified
+                if config.max_size and isinstance(config.max_size, str):
+                    processor.size_based_cleanup(
+                        set()
+                    )  # empty set for trash_files in dry run
+
             logger.info("Dry run completed - no transcoding or removals performed")
             return 0
 
@@ -1412,6 +1659,10 @@ def run_archiver(config: Config) -> int:
         if config.cleanup:
             logger.info("Cleaning up files")
             processor.cleanup_orphaned_files(mapping)
+
+            # Perform size-based cleanup if max-size is specified
+            if config.max_size and isinstance(config.max_size, str):
+                processor.size_based_cleanup(trash_files)
 
         logger.info("Archiving completed successfully")
         return 0

@@ -49,11 +49,25 @@ The application uses several key constants and type definitions:
   - `MIN_ARCHIVE_SIZE_BYTES`: Minimum file size (1MB) to skip transcoding if archive already exists
   - `LOG_ROTATION_SIZE`: Log file rotation threshold (4MB)
   - `OUTPUT_LOCK`: Global threading lock for coordinating logging and progress updates
+  - `DEFAULT_PROGRESS_WIDTH`: Default width for progress bars (30 characters)
+  - `PROGRESS_UPDATE_INTERVAL`: Update interval for non-TTY output (5 seconds)
 
 - **Type Definitions**:
   - `TranscodeAction`: TypedDict for transcoding operations with input, output, and paired JPG file
   - `RemovalAction`: TypedDict for file removal operations with file path and reason
   - `ActionPlan`: TypedDict for action plans containing transcoding and removal lists
+  - `FilePath`: Type alias for Path objects
+  - `Timestamp`: Type alias for datetime objects
+  - `FileSize`: Type alias for file sizes as integers
+  - `ProgressCallback`: Type alias for progress callback functions
+  - `DiscoveredFiles`: Tuple type for return value of FileDiscovery.discover_files
+  - `TimestampFileMapping`: Type alias for timestamp-to-file mapping dictionaries
+  - `ActionItem`: Union type for action items to allow both TypedDict and generic dict
+  - `ActionPlanType`: Union type for action plans that's compatible with both TypedDict and dict
+  - `GenericAction`: Generic dictionary type for action items
+
+- **Utility Functions**:
+  - `parse_size()`: Function to parse size strings like '500GB', '1TB' into bytes
 
 ## System Components
 
@@ -65,6 +79,9 @@ Configuration holder that processes command-line arguments and provides a centra
 - Manages output directory path resolution
 - Processes multiple configuration sources (defaults, command-line args, etc.)
 - Includes helper methods `_resolve_trash_root()` and `_resolve_output_path()` for path resolution
+- Contains fields for all command-line arguments: directory, output, dry_run, no_confirm, no_skip, delete, trash_root, cleanup, clean_output, age, max_size, and log_file
+- Defaults max_size to None when not specified
+- Defaults log_file to /camera/archiver.log when not specified
 
 ### FileDiscovery
 
@@ -75,6 +92,9 @@ Discovers camera files with valid timestamps in the expected directory structure
 - Scans multiple directory locations: input, trash, and output directories when clean_output is enabled
 - Handles complex directory path validation to ensure proper YYYY/MM/DD structure
 - Implements `_parse_timestamp_from_archived_filename()` method specifically for parsing timestamps from archived files like `archived-YYYYMMDDHHMMSS.mp4`
+- Uses `_parse_timestamp()` method to extract timestamps from regular camera filenames
+- Includes robust error handling for cases where directory structure validation fails
+- Returns tuple containing: (list of MP4 files with timestamps, timestamp-to-file mapping, set of trash files)
 
 ### Transcoder
 
@@ -89,6 +109,14 @@ Handles video transcoding using ffmpeg with QSV hardware acceleration. It provid
   - `_build_ffmpeg_command()`: Builds the ffmpeg command with appropriate parameters
   - `_parse_ffmpeg_time()`: Parses time string from ffmpeg output and converts to seconds
   - `_calculate_progress()`: Calculates current progress percentage based on ffmpeg output
+  - `_process_ffmpeg_output()`: Processes ffmpeg output stream and reports progress
+- Supports dry-run mode that simulates transcoding without actual file modifications
+- Creates output directory when needed before transcoding
+- Includes timeout handling for subprocess operations
+- Provides debugging support with detailed ffmpeg output logging when in debug mode
+- Uses subprocess.Popen for non-blocking execution of ffmpeg
+- Implements proper subprocess termination handling for cancellation scenarios
+- Includes support for hardware acceleration via QSV with scale_qsv filter
 
 ### FileManager
 
@@ -102,6 +130,15 @@ Manages file operations including moving to trash, permanent deletion, and clean
 - Extracted helper methods for improved testability and code organization:
   - `_calculate_trash_subdirectory()`: Calculates trash subdirectory based on file type (input/output)
   - `_calculate_trash_destination()`: Calculates destination path in trash with logic to prevent double nesting when files are already in trash directories, including conflict resolution with timestamp-counter suffixes
+- Supports dry-run mode that simulates file operations without actual modifications
+- Includes proper error handling for FileNotFoundError, OSError, and other file system errors
+- Handles both file and directory removal operations
+- Implements recursive directory creation using mkdir(parents=True, exist_ok=True)
+- Provides detailed logging of file operations for debugging purposes
+- Supports permanent deletion when delete flag is True instead of moving to trash
+- Includes logic to determine appropriate trash subdirectory based on file source (input vs output)
+- Properly handles files that are already in trash directories to avoid double nesting
+- Uses relative path calculations to maintain trash directory structure
 
 ### FileProcessor
 
@@ -118,6 +155,21 @@ Orchestrates the file processing workflow, generating action plans and executing
 - Implements `_handle_action_type()` method that uses pattern matching (match statement) to handle different action types
 - Includes logic to prevent removal of source files and paired JPGs when transcoding fails
 - Uses ExceptionGroup for handling multiple removal failures in batch operations
+- Initializes with configuration, logger, and graceful exit instances
+- Supports dry-run mode that simulates operations without actual file modifications
+- Implements size-based cleanup functionality through the `size_based_cleanup()` method
+- Calculates age cutoff for file processing based on configuration settings
+- Includes logic to skip transcoding when archives already exist and meet size requirements (MIN_ARCHIVE_SIZE_BYTES)
+- Handles cleanup mode where existing files are removed without transcoding
+- Processes paired JPG files alongside MP4 files for complete cleanup
+- Implements progress reporting integration during transcoding operations
+- Manages failed transcoding operations and prevents removal of associated files
+- Includes detailed logging for all processing operations
+- Supports both source and output file categorization for proper trash management
+- Contains logic to process files with timestamp-based filtering
+- Implements proper exception handling during batch removal operations
+- Includes orphaned JPG file detection and removal functionality
+- Supports size-based cleanup with configurable priority ordering
 
 ### ProgressReporter
 
@@ -128,6 +180,19 @@ Provides thread-safe progress reporting with time estimates and visual progress 
 - Provides elapsed time formatting (with hour display when needed)
 - Includes proper context manager support for cleanup
 - Handles graceful exit coordination during progress updates
+- Tracks current file processing time separately from total elapsed time
+- Provides file-by-file progress tracking with start_file() and finish_file() methods
+- Uses 20-character progress bar with filled and unfilled sections
+- Maintains thread-safe state using internal locking mechanism
+- Updates progress based on percentage calculated from transcoding operations
+- Includes total file count for progress calculation
+- Provides formatted time display in MM:SS format for times under an hour, HH:MM:SS for longer times
+- Displays both current file elapsed time and total operation elapsed time
+- Clears progress line when logging messages are written to maintain visual clarity
+- Integrates with global ACTIVE_PROGRESS_REPORTER variable for coordinating with logging
+- Properly handles progress completion and newline formatting
+- Stores start time for both individual files and the overall process
+- Implements context manager protocol (__enter__ and __exit__ methods) for automatic cleanup
 
 ### Logger
 
@@ -138,6 +203,20 @@ Sets up logging with rotation support and thread-safe console output.
 - Handles log directory creation with error recovery
 - Supports multiple backup file management during rotation
 - Provides file and console handlers with UTF-8 encoding
+- Uses ThreadSafeStreamHandler that coordinates with OUTPUT_LOCK to prevent interference with progress bars
+- Implements automatic log file rotation when size exceeds LOG_ROTATION_SIZE threshold
+- Manages log file backups by renaming existing backups in sequence (.1, .2, etc.)
+- Creates new empty log file after rotation
+- Clears existing handlers before setting up new ones to prevent duplicate log messages
+- Handles directory creation when log file's parent directory doesn't exist
+- Includes error handling for OSError and AttributeError during log rotation
+- Uses "camera_archiver" logger name for consistent identification
+- Sets base logging level to INFO
+- Integrates with ACTIVE_PROGRESS_REPORTER to clear progress lines when logging
+- Supports console output through stderr with thread-safe handling
+- Provides proper log formatting with timestamp, level, and message
+- Handles creation of new log files when they don't exist
+- Includes proper exception handling during file operations
 
 ### GracefulExit
 
@@ -147,6 +226,15 @@ Handles graceful shutdown when signals are received.
 - Supports signal handlers for SIGINT, SIGTERM, and SIGHUP
 - Integrates with all major components for cancellation support
 - Coordinates shutdown messages with OUTPUT_LOCK
+- Uses internal threading.Lock for thread-safe flag access
+- Provides request_exit() method to set the exit flag
+- Provides should_exit() method to check the current exit status
+- Integrates with signal handling through setup_signal_handlers function
+- Used by Transcoder for cancellation of ffmpeg processes
+- Used by ProgressReporter to stop progress updates when shutdown is requested
+- Used by FileProcessor to stop processing when shutdown is requested
+- Implemented as a simple flag-based system that other components check periodically
+- Provides atomic flag operations through internal locking mechanism
 
 ## Workflow
 
@@ -163,13 +251,15 @@ flowchart TD
     GeneratePlan --> DisplayPlan[Display Plan]
     DisplayPlan --> DryRun{Dry Run Mode?}
     DryRun -->|Yes| ExecuteDryRun[Execute Plan in Dry Run]
+    ExecuteDryRun --> SizeBasedCleanup{Size-based cleanup?}
     ExecuteDryRun --> End
     DryRun -->|No| ConfirmPlan{User Confirms?}
     ConfirmPlan -->|No| End
     ConfirmPlan -->|Yes| ExecutePlan[Execute Plan]
-    ExecutePlan --> Cleanup{Cleanup Enabled?}
-    Cleanup -->|Yes| CleanupFiles[Cleanup Files]
-    Cleanup -->|No| End
+    ExecutePlan --> SizeBasedCleanup{Size-based cleanup?}
+    SizeBasedCleanup -->|Yes| SizeCleanup[Size-based Cleanup]
+    SizeCleanup --> CleanupFiles[Cleanup Orphaned Files]
+    SizeBasedCleanup -->|No| CleanupFiles
     CleanupFiles --> End
 ```
 
@@ -184,7 +274,8 @@ flowchart TD
     StartTranscode --> UpdateProgress[Update Progress]
     UpdateProgress --> TranscodeSuccess{Transcode Success?}
     TranscodeSuccess -->|No| LogError[Log Error]
-    LogError --> NextFile[Next File]
+    LogError --> TrackFailed[Track Failed Transcode]
+    TrackFailed --> NextFile[Next File]
     TranscodeSuccess -->|Yes| RemoveJPG[Remove Paired JPG]
     RemoveJPG --> RemoveSource[Remove Source File]
     RemoveSource --> NextFile
@@ -192,7 +283,9 @@ flowchart TD
     RemoveFile --> NextFile
     NextFile --> MoreFiles{More Files?}
     MoreFiles -->|Yes| ForEachFile
-    MoreFiles -->|No| CleanupOrphans[Cleanup Orphaned Files]
+    MoreFiles -->|No| ExecuteRemainingRemovals[Execute Remaining Removals]
+    ExecuteRemainingRemovals --> SizeBasedCleanup[Size-based Cleanup]
+    SizeBasedCleanup --> CleanupOrphans[Cleanup Orphaned Files]
     CleanupOrphans --> CleanEmptyDirs[Clean Empty Directories]
     CleanEmptyDirs --> End([End Processing])
 ```
@@ -492,6 +585,13 @@ The system implements comprehensive error handling at multiple levels:
 7. **Path Operations**: Handles relative path resolution failures, directory nesting issues, and file system access problems
 8. **Batch Operations**: Uses ExceptionGroup to handle multiple removal failures in batch operations, allowing the system to continue processing while logging individual failures
 9. **Transcoding Failures**: Implements logic to prevent removal of source files and paired JPGs when transcoding fails, ensuring data integrity
+10. **Size Parsing**: Handles invalid size format errors in parse_size() function with proper validation of format and units
+11. **Size-based Cleanup**: Handles exceptions during size-based cleanup operations while continuing to process remaining files
+12. **Process Management**: Implements proper cleanup for subprocess operations with timeout handling and forced termination when needed
+13. **File System Access**: Handles OSError, FileNotFoundError, and other system-level errors during file operations
+14. **Logging Directory Creation**: Handles cases where log file parent directories don't exist and cannot be created
+15. **Mock Object Compatibility**: Handles cases where mock objects lack expected attributes during testing
+16. **Exception Recovery**: Provides detailed logging during exception scenarios to aid in debugging and recovery
 
 ## Configuration
 
@@ -507,6 +607,7 @@ The system accepts the following command-line arguments:
 - `--cleanup`: Clean up old files based on age and size
 - `--clean-output`: Also clean output directory during cleanup
 - `--age`: Age in days for cleanup (default: 30)
+- `--max-size`: Maximum size for cleanup (e.g., 500GB, 1TB) - deletes oldest files first when exceeded
 - `--log-file`: Log file path
 
 ## Dependencies
@@ -529,3 +630,19 @@ The application includes several standalone utility functions that orchestrate t
 - `parse_args()`: Parses command-line arguments using argparse
 - `run_archiver()`: Main pipeline function that orchestrates the entire archiving process through discovery, planning, processing, and cleanup stages
 - `main()`: Entry point function that parses arguments and runs the archiver
+- `parse_size()`: Parses size strings like '500GB', '1TB' into bytes with support for B, KB, MB, GB, TB units (case-insensitive) and validates format
+
+## Size-Based Cleanup Functionality
+
+The system includes advanced size-based cleanup capabilities that help manage storage space:
+
+- **FileProcessor.size_based_cleanup() method**: Implements size-based cleanup functionality that removes oldest files first when storage exceeds specified limits, with configurable priority ordering (trash files first, then archived files, then source files)
+- **Priority-based removal**: Files are removed in priority order: trash files first, then archived files, then source files
+- **Configurable size limits**: Uses the `--max-size` argument to specify maximum storage limits (e.g., '500GB', '1TB')
+- **Timestamp-based selection**: Within each priority category, oldest files are removed first
+- **Age threshold respect**: Respects the `--age` setting by not removing source files that are newer than the specified age
+- **Dry-run support**: Supports simulation mode that shows what would be removed without actually deleting files
+- **Detailed logging**: Provides comprehensive logging of files removed during size-based cleanup
+- **Exception handling**: Continues processing even if some files fail to be removed
+- **Size calculation**: Accurately calculates directory sizes by summing file sizes recursively
+- **Cross-platform compatibility**: Properly handles file system differences across platforms
