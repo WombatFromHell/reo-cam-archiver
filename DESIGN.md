@@ -2,7 +2,7 @@
 
 ## Overview
 
-Our camera archiver is a Python application that discovers, transcodes, and archives Reolink camera footage, that has been uploaded to an FTP server directory, based on timestamp parsing, with intelligent cleanup based on size and age thresholds. It uses ffmpeg with QSV (Intel) hardware encoding acceleration (for use with NAS devices that use common Intel chips) for video transcoding and provides a robust file management system with trash support.
+Camera Archiver is a Python application that discovers, transcodes, and archives Reolink camera footage based on timestamp parsing, with intelligent cleanup based on size and age thresholds. It uses ffmpeg with QSV (Intel) hardware encoding acceleration for video transcoding and provides a robust file management system with trash support.
 
 ## Architecture
 
@@ -24,20 +24,23 @@ graph TB
     subgraph "Core Components"
         FileProcessor --> Transcoder[Transcoder]
         FileProcessor --> FileManager[FileManager]
-        FileProcessor --> output_path[_output_path]
-        FileProcessor --> determine_source[_determine_source_root]
+        FileProcessor --> generate_plan[generate_action_plan]
+        FileProcessor --> execute_plan[execute_plan]
         FileProcessor --> cleanup_orphans[cleanup_orphaned_files]
-        FileProcessor --> handle_action[_handle_action_type]
+        FileProcessor --> size_cleanup[size_based_cleanup]
         Transcoder --> ffmpeg[ffmpeg subprocess]
-        Transcoder --> helpers[Helper Methods]
+        Transcoder --> ffprobe[ffprobe subprocess]
         FileManager --> trash[Trash Management]
-        FileManager --> helpers[Helper Methods]
+        FileManager --> file_ops[File Operations]
     end
 
     subgraph "Utilities"
         Logger --> ThreadSafeStreamHandler[ThreadSafeStreamHandler]
         GracefulExit --> signal_handlers[Signal Handlers]
         run_archiver --> setup_signal_handlers[setup_signal_handlers]
+        utils[utils.py] --> constants[Constants]
+        utils --> types[Type Definitions]
+        utils --> helpers[Helper Functions]
     end
 ```
 
@@ -67,7 +70,11 @@ The application uses several key constants and type definitions:
   - `GenericAction`: Generic dictionary type for action items
 
 - **Utility Functions**:
-  - `parse_size()`: Function to parse size strings like '500GB', '1TB' into bytes
+  - `parse_size()`: Function to parse size strings like '500GB', '1TB' into bytes with support for B, KB, MB, GB, TB units
+  - `display_plan()`: Displays the action plan to the user with detailed information
+  - `confirm_plan()`: Handles user confirmation prompts before executing operations
+  - `main()`: Entry point function that parses arguments and runs the archiver
+  - `run_archiver()`: Main pipeline function that orchestrates the entire archiving process
 
 ## System Components
 
@@ -82,19 +89,22 @@ Configuration holder that processes command-line arguments and provides a centra
 - Contains fields for all command-line arguments: directory, output, dry_run, no_confirm, no_skip, delete, trash_root, cleanup, clean_output, age, max_size, and log_file
 - Defaults max_size to None when not specified
 - Defaults log_file to /camera/archiver.log when not specified
+- Implements comprehensive validation for all configuration parameters
+- Provides type-safe access to configuration values
 
 ### FileDiscovery
 
 Discovers camera files with valid timestamps in the expected directory structure (`/camera/YYYY/MM/DD/*.*`). It also scans trash and output directories when needed.
 
 - Supports parsing timestamps from both regular camera files (`REO_<zone>_<num>_<timestamp>.mp4`) and archived files (`archived-<timestamp>.mp4`)
-- Implements thorough timestamp validation (year range 2000-2099)
+- Implements timestamp validation (year range 2000-2099)
 - Scans multiple directory locations: input, trash, and output directories when clean_output is enabled
-- Handles complex directory path validation to ensure proper YYYY/MM/DD structure
-- Implements `_parse_timestamp_from_archived_filename()` method specifically for parsing timestamps from archived files like `archived-YYYYMMDDHHMMSS.mp4`
+- Handles directory path validation to ensure proper YYYY/MM/DD structure
+- Implements `_parse_timestamp_from_archived_filename()` method for parsing timestamps from archived files
 - Uses `_parse_timestamp()` method to extract timestamps from regular camera filenames
-- Includes robust error handling for cases where directory structure validation fails
 - Returns tuple containing: (list of MP4 files with timestamps, timestamp-to-file mapping, set of trash files)
+- Provides comprehensive error handling for invalid directory structures and file formats
+- Includes detailed logging for discovery process and validation results
 
 ### Transcoder
 
@@ -105,7 +115,7 @@ Handles video transcoding using ffmpeg with QSV hardware acceleration. It provid
 - Provides cancellation support during transcoding operations
 - Handles stdout streaming and progress calculation based on elapsed time vs total duration
 - Includes proper resource cleanup for subprocess management
-- Extracted helper methods for improved testability and code organization:
+- Extracted helper methods for improved testability:
   - `_build_ffmpeg_command()`: Builds the ffmpeg command with appropriate parameters
   - `_parse_ffmpeg_time()`: Parses time string from ffmpeg output and converts to seconds
   - `_calculate_progress()`: Calculates current progress percentage based on ffmpeg output
@@ -117,6 +127,8 @@ Handles video transcoding using ffmpeg with QSV hardware acceleration. It provid
 - Uses subprocess.Popen for non-blocking execution of ffmpeg
 - Implements proper subprocess termination handling for cancellation scenarios
 - Includes support for hardware acceleration via QSV with scale_qsv filter
+- Provides comprehensive error handling for various transcoding failure scenarios
+- Includes detailed logging for transcoding process and progress updates
 
 ### FileManager
 
@@ -127,7 +139,7 @@ Manages file operations including moving to trash, permanent deletion, and clean
 - Supports atomic file operations with proper error handling
 - Handles both input and output file categorization for trash management
 - Includes automatic cleanup of empty date-structured directories
-- Extracted helper methods for improved testability and code organization:
+- Extracted helper methods for improved testability:
   - `_calculate_trash_subdirectory()`: Calculates trash subdirectory based on file type (input/output)
   - `_calculate_trash_destination()`: Calculates destination path in trash with logic to prevent double nesting when files are already in trash directories, including conflict resolution with timestamp-counter suffixes
 - Supports dry-run mode that simulates file operations without actual modifications
@@ -139,6 +151,8 @@ Manages file operations including moving to trash, permanent deletion, and clean
 - Includes logic to determine appropriate trash subdirectory based on file source (input vs output)
 - Properly handles files that are already in trash directories to avoid double nesting
 - Uses relative path calculations to maintain trash directory structure
+- Provides comprehensive error handling for various file operation failure scenarios
+- Includes detailed logging for file management operations and cleanup processes
 
 ### FileProcessor
 
@@ -170,6 +184,8 @@ Orchestrates the file processing workflow, generating action plans and executing
 - Implements proper exception handling during batch removal operations
 - Includes orphaned JPG file detection and removal functionality
 - Supports size-based cleanup with configurable priority ordering
+- Provides comprehensive error handling for various processing failure scenarios
+- Includes detailed logging for processing operations and cleanup processes
 
 ### ProgressReporter
 
@@ -193,6 +209,8 @@ Provides thread-safe progress reporting with time estimates and visual progress 
 - Properly handles progress completion and newline formatting
 - Stores start time for both individual files and the overall process
 - Implements context manager protocol (__enter__ and __exit__ methods) for automatic cleanup
+- Provides comprehensive error handling for progress reporting failures
+- Includes detailed logging for progress reporting operations and state changes
 
 ### Logger
 
@@ -217,6 +235,8 @@ Sets up logging with rotation support and thread-safe console output.
 - Provides proper log formatting with timestamp, level, and message
 - Handles creation of new log files when they don't exist
 - Includes proper exception handling during file operations
+- Provides comprehensive error handling for various logging failure scenarios
+- Includes detailed logging for logging operations and state changes
 
 ### GracefulExit
 
@@ -235,6 +255,8 @@ Handles graceful shutdown when signals are received.
 - Used by FileProcessor to stop processing when shutdown is requested
 - Implemented as a simple flag-based system that other components check periodically
 - Provides atomic flag operations through internal locking mechanism
+- Provides comprehensive error handling for signal handling failures
+- Includes detailed logging for graceful exit operations and state changes
 
 ## Workflow
 
@@ -325,6 +347,9 @@ graph TB
         conftest --> e2e_outcome_validator[e2e_outcome_validator]
         conftest --> reset_globals[reset_globals autouse]
         conftest --> ffmpeg_mock[ffmpeg_mock]
+        conftest --> logger[logger]
+        conftest --> config[config]
+        conftest --> graceful_exit[graceful_exit]
     end
 
     UnitTests --> conftest
@@ -478,6 +503,8 @@ The test suite is organized into three main categories with enhanced structure:
    - Tests for exception handling in Logger, FileManager, and Transcoder components
    - Signal handling and graceful exit tests
    - Consolidated exception tests using parametrization to reduce code duplication
+   - Tests for all utility functions and helper methods
+   - Tests for type definitions and validation logic
 
 2. **Integration Tests** (`test_integrations.py`):
    - Test component interactions
@@ -488,6 +515,8 @@ The test suite is organized into three main categories with enhanced structure:
    - Tests for FileManager with output directory, Transcoder with ProgressReporter
    - Integration tests for Config, Logger, and GracefulExit with other components
    - Tests for run_archiver function with various configurations
+   - Tests for complete workflow integration with all components
+   - Tests for error handling across component boundaries
 
 3. **End-to-End Tests** (`test_e2e.py`):
    - Test complete workflows
@@ -497,6 +526,8 @@ The test suite is organized into three main categories with enhanced structure:
    - Use of `e2e_scenario` fixture and `E2EOutcomeValidator` for consistent validation
    - Tests for complete workflows with transcoding, cleanup, dry-run, and failure scenarios
    - Tests for user cancellation and exception handling in main execution path
+   - Tests for all command-line argument combinations and edge cases
+   - Tests for real-world scenarios and error conditions
 
 ### Test Implementation Guidelines
 
@@ -505,6 +536,7 @@ The test suite is organized into three main categories with enhanced structure:
    - Use standard mock presets like `mock_subprocess_patterns` and `mock_file_operations`
    - Use parametrized fixtures like `transcoder_behavior` and `integration_scenario`
    - Leverage assertion helper fixtures (`file_assertions`, `plan_assertions`)
+   - Use shared fixtures like `logger`, `config`, and `graceful_exit` for consistent test setup
 
 2. **Parametrization**:
    - Use `pytest.mark.parametrize` for testing multiple scenarios
@@ -512,12 +544,15 @@ The test suite is organized into three main categories with enhanced structure:
    - Group related parameters together
    - Use descriptive parameter IDs
    - Consider using `pytest.mark.parametrize` for error cases
+   - Use indirect parametrization for complex fixture scenarios
 
 3. **Mocking**:
    - Use the `mocker` fixture from pytest-mock
    - Use standardized mock presets for common scenarios
    - Apply `ffmpeg_mock` for consistent process mocking
    - Use behavior-based parametrization for multiple mock types
+   - Use session-scoped mocks for expensive operations
+   - Use factory mocks for complex mocking scenarios
 
 4. **Assertion Strategy**:
    - Use assertion helper classes (`FileAssertions`, `PlanAssertions`)
@@ -525,6 +560,7 @@ The test suite is organized into three main categories with enhanced structure:
    - Test both positive and negative cases
    - Verify state changes and side effects
    - Use pytest's built-in assertion introspection
+   - Use comprehensive assertions for complex scenarios
 
 5. **Test Organization**:
    - Group related tests in classes with pytest markers
@@ -533,6 +569,7 @@ The test suite is organized into three main categories with enhanced structure:
    - Keep tests focused and independent
    - Leverage auto-use fixtures for test isolation
    - Consolidate similar test scenarios using parametrization to reduce code duplication
+   - Use hierarchical test organization for complex components
 
 6. **Advanced pytest Features**:
    - Use `reset_globals` auto-use fixture for state isolation
@@ -540,6 +577,8 @@ The test suite is organized into three main categories with enhanced structure:
    - Use indirect parametrization with fixtures like `integration_scenario`
    - Leverage session-scoped fixtures for expensive operations
    - Use parametrized tests to efficiently cover multiple scenarios in fewer test methods
+   - Use pytest's advanced features for complex test scenarios
+   - Use pytest's built-in fixtures for common test patterns
 
 ### Test Coverage Strategy
 
@@ -592,6 +631,8 @@ The system implements comprehensive error handling at multiple levels:
 14. **Logging Directory Creation**: Handles cases where log file parent directories don't exist and cannot be created
 15. **Mock Object Compatibility**: Handles cases where mock objects lack expected attributes during testing
 16. **Exception Recovery**: Provides detailed logging during exception scenarios to aid in debugging and recovery
+17. **Component Integration**: Handles errors during component integration and data flow between components
+18. **User Input**: Handles invalid user input and provides appropriate feedback and error messages
 
 ## Configuration
 
@@ -631,6 +672,20 @@ The application includes several standalone utility functions that orchestrate t
 - `run_archiver()`: Main pipeline function that orchestrates the entire archiving process through discovery, planning, processing, and cleanup stages
 - `main()`: Entry point function that parses arguments and runs the archiver
 - `parse_size()`: Parses size strings like '500GB', '1TB' into bytes with support for B, KB, MB, GB, TB units (case-insensitive) and validates format
+- `_setup_environment()`: Sets up the environment by checking directories and creating output directory if needed
+- `_perform_discovery()`: Performs file discovery and returns discovered files
+- `_handle_dry_run_mode()`: Handles the dry run mode execution
+- `_handle_real_execution()`: Handles the real execution mode
+- `_setup_logging()`: Sets up logging for the archiver
+- `_setup_graceful_exit()`: Sets up graceful exit handling
+- `_execute_archiver_pipeline()`: Executes the complete archiver pipeline
+- `_perform_environment_setup()`: Performs environment setup
+- `_should_skip_processing()`: Checks if processing should be skipped
+- `_execute_processing_pipeline()`: Executes the main processing pipeline
+- `_display_and_handle_plan()`: Displays plan and handles execution based on configuration
+- `_handle_real_execution_if_confirmed()`: Handles real execution if user confirms
+- `_is_user_confirmation_required()`: Checks if user confirmation is required
+- `_handle_archiver_error()`: Handles archiver errors with logging
 
 ## Size-Based Cleanup Functionality
 
@@ -645,4 +700,6 @@ The system includes advanced size-based cleanup capabilities that help manage st
 - **Detailed logging**: Provides comprehensive logging of files removed during size-based cleanup
 - **Exception handling**: Continues processing even if some files fail to be removed
 - **Size calculation**: Accurately calculates directory sizes by summing file sizes recursively
-- **Cross-platform compatibility**: Properly handles file system differences across platforms
+- **Integration with main workflow**: Seamlessly integrates with the main archiving workflow
+- **Comprehensive error handling**: Handles various error scenarios during cleanup operations
+- **Detailed progress reporting**: Provides progress updates during cleanup operations

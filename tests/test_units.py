@@ -14,7 +14,7 @@ from pytest_mock import MockerFixture
 parent_dir = Path(__file__).parent.parent
 sys.path.insert(0, str(parent_dir))
 
-from archiver import (  # noqa: E402
+from src.archiver import (  # noqa: E402
     Config,
     FileDiscovery,
     FileManager,
@@ -102,7 +102,7 @@ class TestConfig:
 
     def test_config_path_resolution_methods(self, mock_args):
         """Test static path resolution methods separately."""
-        from archiver import Config
+        from src.archiver import Config
 
         # Test _resolve_output_path
         mock_args.output = "/custom/output"
@@ -218,7 +218,7 @@ class TestProgressReporter:
         with ProgressReporter(10, graceful_exit) as reporter:
             assert reporter is not None
         # After exiting context, ACTIVE_PROGRESS_REPORTER should be None
-        from archiver import ACTIVE_PROGRESS_REPORTER
+        from src.archiver import ACTIVE_PROGRESS_REPORTER
 
         assert ACTIVE_PROGRESS_REPORTER is None
 
@@ -228,7 +228,7 @@ class TestProgressReporter:
         """Test concurrent progress updates from multiple threads."""
         import threading
 
-        from archiver import OUTPUT_LOCK
+        from src.archiver import OUTPUT_LOCK
 
         reporter = ProgressReporter(10, graceful_exit, silent=True)
 
@@ -272,7 +272,7 @@ class TestProgressReporter:
 
     def test_update_progress_with_graceful_exit(self, mocker: MockerFixture):
         """Test that progress updates are skipped when graceful exit is requested."""
-        from archiver import GracefulExit
+        from src.archiver import GracefulExit
 
         graceful_exit = GracefulExit()
         graceful_exit.request_exit()
@@ -377,7 +377,7 @@ class TestLogger:
         logger = Logger.setup(config)
 
         # Check that the console handler is a ThreadSafeStreamHandler
-        from archiver import ThreadSafeStreamHandler
+        from src.archiver import ThreadSafeStreamHandler
 
         handlers = [
             h for h in logger.handlers if isinstance(h, ThreadSafeStreamHandler)
@@ -391,7 +391,7 @@ class TestLogger:
         import logging
         import sys
 
-        from archiver import ThreadSafeStreamHandler
+        from src.archiver import ThreadSafeStreamHandler
 
         # Create a ThreadSafeStreamHandler instance
         handler = ThreadSafeStreamHandler(sys.stderr)
@@ -433,7 +433,7 @@ class TestLogger:
         import logging
         import sys
 
-        from archiver import ThreadSafeStreamHandler
+        from src.archiver import ThreadSafeStreamHandler
 
         # Create a ThreadSafeStreamHandler instance
         handler = ThreadSafeStreamHandler(sys.stderr)
@@ -495,7 +495,7 @@ class TestLogger:
 
     def test_log_rotation_large_file(self, temp_dir, mocker: MockerFixture):
         """Test that log rotation works when file exceeds maximum size."""
-        from archiver import LOG_ROTATION_SIZE
+        from src.archiver import LOG_ROTATION_SIZE
 
         log_file = temp_dir / "test.log"
 
@@ -592,7 +592,7 @@ class TestLogger:
 
     def test_log_rotation_multiple_backups(self, temp_dir, mocker: MockerFixture):
         """Test that log rotation handles multiple backup files."""
-        from archiver import LOG_ROTATION_SIZE
+        from src.archiver import LOG_ROTATION_SIZE
 
         log_file = temp_dir / "test.log"
 
@@ -645,7 +645,7 @@ class TestLogger:
         self, temp_dir, mocker: MockerFixture, exception_type, exception_msg, operation
     ):
         """Test Logger rotation when different exceptions occur during file operations."""
-        from archiver import LOG_ROTATION_SIZE, Logger
+        from src.archiver import LOG_ROTATION_SIZE, Logger
 
         log_file = temp_dir / "test.log"
 
@@ -1032,7 +1032,7 @@ class TestFileManager:
         self, temp_dir, trash_dir, scenario, mocker
     ):
         """Test calculating trash destination for various scenarios."""
-        from archiver import FileManager
+        from src.archiver import FileManager
 
         source_root = temp_dir / "source"
         source_root.mkdir()
@@ -1248,7 +1248,7 @@ class TestFileManager:
         self, sample_files, logger, temp_dir, mocker
     ):
         """Test removing a file when trash directory becomes read-only mid-operation."""
-        from archiver import FileManager
+        from src.archiver import FileManager
 
         # Create a trash directory
         trash_dir = temp_dir / ".trash"
@@ -1379,7 +1379,7 @@ class TestTranscoder:
         )
         mock_process.wait.return_value = 0
         mock_popen = mocker.patch(
-            "archiver.subprocess.Popen", return_value=mock_process
+            "subprocess.Popen", return_value=mock_process
         )
 
         # Mock get_video_duration
@@ -1410,7 +1410,7 @@ class TestTranscoder:
             ]
         )
         mock_process.wait.return_value = 1  # Non-zero exit code
-        mocker.patch("archiver.subprocess.Popen", return_value=mock_process)
+        mocker.patch("subprocess.Popen", return_value=mock_process)
 
         # Mock get_video_duration
         mocker.patch.object(Transcoder, "get_video_duration", return_value=2.0)
@@ -1437,7 +1437,7 @@ class TestTranscoder:
             ]
         )
         mock_process.wait.return_value = 0
-        mocker.patch("archiver.subprocess.Popen", return_value=mock_process)
+        mocker.patch("subprocess.Popen", return_value=mock_process)
 
         # Mock progress callback
         progress_callback = mocker.Mock()
@@ -1455,13 +1455,13 @@ class TestTranscoder:
         self, sample_files, mocker: MockerFixture
     ):
         """Test get_video_duration when ffprobe returns 'N/A'."""
-        from archiver import Transcoder
+        from src.archiver import Transcoder
 
         # Mock subprocess.run to return 'N/A'
         mock_result = mocker.Mock()
         mock_result.stdout = "N/A\n"
-        mocker.patch("archiver.subprocess.run", return_value=mock_result)
-        mocker.patch("archiver.shutil.which", return_value="/usr/bin/ffprobe")
+        mocker.patch("subprocess.run", return_value=mock_result)
+        mocker.patch("shutil.which", return_value="/usr/bin/ffprobe")
 
         duration = Transcoder.get_video_duration(sample_files["mp4"])
         assert duration is None
@@ -1470,13 +1470,13 @@ class TestTranscoder:
         self, sample_files, mocker: MockerFixture
     ):
         """Test get_video_duration when ffprobe returns empty string."""
-        from archiver import Transcoder
+        from src.archiver import Transcoder
 
         # Mock subprocess.run to return empty string
         mock_result = mocker.Mock()
         mock_result.stdout = "\n"
-        mocker.patch("archiver.subprocess.run", return_value=mock_result)
-        mocker.patch("archiver.shutil.which", return_value="/usr/bin/ffprobe")
+        mocker.patch("subprocess.run", return_value=mock_result)
+        mocker.patch("shutil.which", return_value="/usr/bin/ffprobe")
 
         duration = Transcoder.get_video_duration(sample_files["mp4"])
         assert duration is None
@@ -1485,7 +1485,7 @@ class TestTranscoder:
         self, sample_files, logger, mocker: MockerFixture
     ):
         """Test transcode_file when proc.stdout is None."""
-        from archiver import Transcoder
+        from src.archiver import Transcoder
 
         input_path = sample_files["mp4"]
         output_path = input_path.parent / "output.mp4"
@@ -1495,7 +1495,7 @@ class TestTranscoder:
         mock_process.stdout = None
         mock_process.wait = mocker.Mock(return_value=0)
         mock_process.terminate = mocker.Mock()
-        mocker.patch("archiver.subprocess.Popen", return_value=mock_process)
+        mocker.patch("subprocess.Popen", return_value=mock_process)
 
         # Mock get_video_duration
         mocker.patch.object(Transcoder, "get_video_duration", return_value=2.0)
@@ -1508,7 +1508,7 @@ class TestTranscoder:
         self, sample_files, logger, mocker: MockerFixture
     ):
         """Test transcode_file when closing stdout raises an exception."""
-        from archiver import Transcoder
+        from src.archiver import Transcoder
 
         input_path = sample_files["mp4"]
         output_path = input_path.parent / "output.mp4"
@@ -1524,7 +1524,7 @@ class TestTranscoder:
         )
         mock_process.wait = mocker.Mock(return_value=0)
         mock_process.stdout.close = mocker.Mock(side_effect=Exception("Close error"))
-        mocker.patch("archiver.subprocess.Popen", return_value=mock_process)
+        mocker.patch("subprocess.Popen", return_value=mock_process)
 
         # Mock get_video_duration
         mocker.patch.object(Transcoder, "get_video_duration", return_value=2.0)
@@ -1537,7 +1537,7 @@ class TestTranscoder:
         self, logger, mocker: MockerFixture
     ):
         """Test _process_ffmpeg_output when ffmpeg crashes mid-transcode."""
-        from archiver import GracefulExit, Transcoder
+        from src.archiver import GracefulExit, Transcoder
 
         # Mock the subprocess process
         mock_proc = mocker.Mock()
@@ -1565,7 +1565,7 @@ class TestTranscoder:
         self, logger, mocker: MockerFixture
     ):
         """Test _process_ffmpeg_output when graceful exit is requested."""
-        from archiver import GracefulExit, Transcoder
+        from src.archiver import GracefulExit, Transcoder
 
         # Mock the subprocess process
         mock_proc = mocker.Mock()
@@ -1668,7 +1668,7 @@ class TestFileProcessor:
         )
         archive_path.parent.mkdir(parents=True)
         # Create file with content larger than MIN_ARCHIVE_SIZE_BYTES to trigger skip
-        from archiver import MIN_ARCHIVE_SIZE_BYTES
+        from src.archiver import MIN_ARCHIVE_SIZE_BYTES
 
         with open(archive_path, "w") as f:
             f.write(
@@ -2167,7 +2167,7 @@ class TestFileProcessor:
 
         # Mock the FileManager.remove_file to track what gets removed
         mock_remove_file = mocker.patch(
-            "archiver.FileManager.remove_file", side_effect=lambda *args, **kwargs: None
+            "src.archiver.FileManager.remove_file", side_effect=lambda *args, **kwargs: None
         )
 
         # Call size_based_cleanup
@@ -2219,7 +2219,7 @@ class TestFileProcessor:
 
         # Mock the FileManager.remove_file to track what gets removed
         mock_remove_file = mocker.patch(
-            "archiver.FileManager.remove_file", side_effect=lambda *args, **kwargs: None
+            "src.archiver.FileManager.remove_file", side_effect=lambda *args, **kwargs: None
         )
 
         # Call size_based_cleanup
@@ -2262,7 +2262,7 @@ class TestFileProcessor:
 
         # Mock the FileManager.remove_file to track what gets removed
         mock_remove_file = mocker.patch(
-            "archiver.FileManager.remove_file", side_effect=lambda *args, **kwargs: None
+            "src.archiver.FileManager.remove_file", side_effect=lambda *args, **kwargs: None
         )
 
         # Call size_based_cleanup
@@ -2305,7 +2305,7 @@ class TestFileProcessor:
 
         # Mock the FileManager.remove_file to track what gets removed
         mock_remove_file = mocker.patch(
-            "archiver.FileManager.remove_file", side_effect=lambda *args, **kwargs: None
+            "src.archiver.FileManager.remove_file", side_effect=lambda *args, **kwargs: None
         )
 
         # Call size_based_cleanup
@@ -2345,7 +2345,7 @@ class TestFileProcessor:
 
         # Mock the FileManager.remove_file to track what gets removed
         mock_remove_file = mocker.patch(
-            "archiver.FileManager.remove_file", side_effect=lambda *args, **kwargs: None
+            "src.archiver.FileManager.remove_file", side_effect=lambda *args, **kwargs: None
         )
 
         # Call size_based_cleanup
@@ -2394,7 +2394,7 @@ class TestFileProcessor:
 
         # Mock the FileManager.remove_file to track what gets removed
         mock_remove_file = mocker.patch(
-            "archiver.FileManager.remove_file", side_effect=lambda *args, **kwargs: None
+            "src.archiver.FileManager.remove_file", side_effect=lambda *args, **kwargs: None
         )
 
         # Call size_based_cleanup
@@ -2412,7 +2412,7 @@ class TestSignalHandling:
 
     def test_setup_signal_handlers(self, graceful_exit):
         """Test that setup_signal_handlers correctly sets up signal handlers."""
-        from archiver import setup_signal_handlers
+        from src.archiver import setup_signal_handlers
 
         # This test is tricky because it involves actual signal handling
         # We can at least verify that the function runs without error
@@ -2423,7 +2423,7 @@ class TestSignalHandling:
 
     def test_signal_handler_processes_signals(self, graceful_exit):
         """Test that the signal handler correctly processes signals."""
-        from archiver import setup_signal_handlers
+        from src.archiver import setup_signal_handlers
 
         # Set up signal handlers
         setup_signal_handlers(graceful_exit)
@@ -2433,7 +2433,7 @@ class TestSignalHandling:
 
     def test_setup_signal_handlers_with_exception(self, graceful_exit, mocker):
         """Test setup_signal_handlers when signal.signal raises ValueError/OSError."""
-        from archiver import setup_signal_handlers
+        from src.archiver import setup_signal_handlers
 
         # Mock signal.signal to raise an exception
         mocker.patch("signal.signal", side_effect=ValueError("Invalid signal"))
@@ -2446,7 +2446,7 @@ class TestSignalHandling:
 
     def test_setup_signal_handlers_with_oserror(self, graceful_exit, mocker):
         """Test setup_signal_handlers when signal.signal raises OSError."""
-        from archiver import setup_signal_handlers
+        from src.archiver import setup_signal_handlers
 
         # Mock signal.signal to raise an OSError
         mocker.patch("signal.signal", side_effect=OSError("Invalid signal"))
@@ -2463,7 +2463,7 @@ class TestDisplayAndConfirmFunctions:
 
     def test_display_plan_basic(self, logger, config):
         """Test display_plan function with basic plan."""
-        from archiver import display_plan
+        from src.archiver import display_plan
 
         plan = {
             "transcoding": [
@@ -2486,7 +2486,7 @@ class TestDisplayAndConfirmFunctions:
 
     def test_display_plan_with_cleanup(self, logger, config):
         """Test display_plan function when cleanup is enabled."""
-        from archiver import display_plan
+        from src.archiver import display_plan
 
         # Enable cleanup
         config.cleanup = True
@@ -2499,7 +2499,7 @@ class TestDisplayAndConfirmFunctions:
 
     def test_display_plan_with_clean_output(self, logger, config):
         """Test display_plan function when cleanup and clean_output are enabled."""
-        from archiver import display_plan
+        from src.archiver import display_plan
 
         # Enable cleanup and clean_output
         config.cleanup = True
@@ -2513,7 +2513,7 @@ class TestDisplayAndConfirmFunctions:
 
     def test_confirm_plan_no_confirm(self, config, logger):
         """Test confirm_plan function when no_confirm is True."""
-        from archiver import confirm_plan
+        from src.archiver import confirm_plan
 
         plan = {"transcoding": [], "removals": []}
 
@@ -2526,7 +2526,7 @@ class TestDisplayAndConfirmFunctions:
 
     def test_confirm_plan_with_input_y(self, config, logger, mocker):
         """Test confirm_plan function with 'y' input."""
-        from archiver import confirm_plan
+        from src.archiver import confirm_plan
 
         plan = {"transcoding": [], "removals": []}
 
@@ -2538,7 +2538,7 @@ class TestDisplayAndConfirmFunctions:
 
     def test_confirm_plan_with_input_yes(self, config, logger, mocker):
         """Test confirm_plan function with 'yes' input."""
-        from archiver import confirm_plan
+        from src.archiver import confirm_plan
 
         plan = {"transcoding": [], "removals": []}
 
@@ -2550,7 +2550,7 @@ class TestDisplayAndConfirmFunctions:
 
     def test_confirm_plan_with_input_n(self, config, logger, mocker):
         """Test confirm_plan function with 'n' input."""
-        from archiver import confirm_plan
+        from src.archiver import confirm_plan
 
         plan = {"transcoding": [], "removals": []}
 
@@ -2562,7 +2562,7 @@ class TestDisplayAndConfirmFunctions:
 
     def test_confirm_plan_with_empty_input(self, config, logger, mocker):
         """Test confirm_plan function with empty input."""
-        from archiver import confirm_plan
+        from src.archiver import confirm_plan
 
         plan = {"transcoding": [], "removals": []}
 
@@ -2574,7 +2574,7 @@ class TestDisplayAndConfirmFunctions:
 
     def test_confirm_plan_with_keyboard_interrupt(self, config, logger, mocker):
         """Test confirm_plan function when KeyboardInterrupt occurs."""
-        from archiver import confirm_plan
+        from src.archiver import confirm_plan
 
         plan = {"transcoding": [], "removals": []}
 
@@ -2592,7 +2592,7 @@ class TestParseArgs:
         """Test parse_args when args parameter is None."""
         import sys
 
-        from archiver import parse_args
+        from src.archiver import parse_args
 
         # Patch sys.argv to have only the script name to avoid test runner args
         mocker.patch.object(sys, "argv", ["archiver.py"])
@@ -2606,7 +2606,7 @@ class TestParseArgs:
 
     def test_parse_args_with_empty_list(self):
         """Test parse_args when args parameter is empty list."""
-        from archiver import parse_args
+        from src.archiver import parse_args
 
         # This should work with an empty list
         args = parse_args([])
@@ -2617,7 +2617,7 @@ class TestParseArgs:
 
     def test_parse_args_with_custom_args(self):
         """Test parse_args with custom arguments."""
-        from archiver import parse_args
+        from src.archiver import parse_args
 
         # Test with custom arguments
         args = parse_args(["/custom/dir", "--age", "60", "--output", "/output"])
@@ -2632,7 +2632,7 @@ class TestRunArchiver:
 
     def test_run_archiver_with_nonexistent_directory(self, mock_args):
         """Test run_archiver when input directory doesn't exist."""
-        from archiver import Config, run_archiver
+        from src.archiver import Config, run_archiver
 
         # Set directory to a non-existent path
         mock_args.directory = "/nonexistent/directory"
@@ -2643,7 +2643,7 @@ class TestRunArchiver:
 
     def test_run_archiver_with_no_files(self, mock_args, temp_dir, mocker):
         """Test run_archiver when no files are discovered."""
-        from archiver import Config, FileDiscovery, run_archiver
+        from src.archiver import Config, FileDiscovery, run_archiver
 
         # Set up directory that exists but has no files
         mock_args.directory = str(temp_dir)
@@ -2659,7 +2659,7 @@ class TestRunArchiver:
 
     def test_run_archiver_with_exception(self, mock_args, temp_dir, mocker):
         """Test run_archiver when an exception occurs."""
-        from archiver import Config, FileDiscovery, run_archiver
+        from src.archiver import Config, FileDiscovery, run_archiver
 
         # Set up directory that exists
         mock_args.directory = str(temp_dir)
@@ -2677,7 +2677,7 @@ class TestRunArchiver:
         self, mock_args, temp_dir, sample_files, mocker
     ):
         """Test run_archiver when user cancels the operation."""
-        from archiver import Config, FileDiscovery, run_archiver
+        from src.archiver import Config, FileDiscovery, run_archiver
 
         # Set up directory that exists
         mock_args.directory = str(temp_dir)
@@ -2697,7 +2697,7 @@ class TestRunArchiver:
         )
 
         # Mock the confirm_plan function to return False (user cancels)
-        mocker.patch("archiver.confirm_plan", return_value=False)
+        mocker.patch("src.archiver.utils.confirm_plan", return_value=False)
 
         result = run_archiver(config)
         assert result == 0  # Should return success code 0 when user cancels
@@ -2708,13 +2708,13 @@ class TestMainFunction:
 
     def test_main_function_success(self, mocker):
         """Test main function with successful execution."""
-        from archiver import main
+        from src.archiver import main
 
         # Mock sys.argv to simulate command line arguments
         mocker.patch("sys.argv", ["archiver.py", "/test/directory"])
 
         # Mock run_archiver to return success
-        mocker.patch("archiver.run_archiver", return_value=0)
+        mocker.patch("src.archiver.utils.run_archiver", return_value=0)
 
         # Mock parse_args to return a config
         mock_args = mocker.Mock()
@@ -2730,15 +2730,15 @@ class TestMainFunction:
         mock_args.age = 30
         mock_args.log_file = None
 
-        mocker.patch("archiver.parse_args", return_value=mock_args)
-        mocker.patch("archiver.Config")
+        mocker.patch("src.archiver.config.parse_args", return_value=mock_args)
+        mocker.patch("src.archiver.config.Config")
 
         result = main()
         assert result == 0  # Should return the same as run_archiver
 
     def test_main_function_error(self, mocker):
         """Test main function with error execution."""
-        from archiver import main
+        from src.archiver import main
 
         # Mock sys.argv to simulate command line arguments
         mocker.patch("sys.argv", ["archiver.py", "/test/directory"])
@@ -2771,7 +2771,7 @@ class TestMainFunction:
         import os
         from datetime import datetime, timedelta
 
-        from archiver import FileDiscovery
+        from src.archiver import FileDiscovery
 
         # Create directory structure
         year_dir = temp_dir / "2023"
@@ -2803,7 +2803,7 @@ class TestMainFunction:
         """Test Transcoder with 0-byte input file."""
         import os
 
-        from archiver import Transcoder
+        from src.archiver import Transcoder
 
         # Create a 0-byte input file
         input_path = temp_dir / "zero_byte.mp4"
@@ -2816,7 +2816,7 @@ class TestMainFunction:
         mock_process.stdout = mocker.Mock()
         mock_process.stdout.readline = mocker.Mock(side_effect=[""])
         mock_process.wait.return_value = 0
-        mocker.patch("archiver.subprocess.Popen", return_value=mock_process)
+        mocker.patch("subprocess.Popen", return_value=mock_process)
 
         # Also mock get_video_duration to return None for zero-byte file
         mocker.patch.object(Transcoder, "get_video_duration", return_value=None)
@@ -2830,7 +2830,7 @@ class TestMainFunction:
         """Test Logger rotation when log file is over LOG_ROTATION_SIZE."""
         from argparse import Namespace
 
-        from archiver import LOG_ROTATION_SIZE, Logger
+        from src.archiver import LOG_ROTATION_SIZE, Logger
 
         # Create args with log file
         args = Namespace()

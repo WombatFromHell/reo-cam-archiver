@@ -14,7 +14,8 @@ import pytest
 
 parent_dir = Path(__file__).parent.parent
 sys.path.insert(0, str(parent_dir))
-from archiver import (  # noqa: E402
+sys.path.insert(0, str(parent_dir / "src"))
+from src.archiver import (  # noqa: E402
     Config,
     FileDiscovery,
     FileManager,
@@ -249,11 +250,11 @@ def mock_subprocess_patterns(mocker):
     """Provides common subprocess mocking patterns."""
     return {
         "success": lambda: mocker.patch(
-            "archiver.subprocess.run",
+            "src.archiver.subprocess.run",
             return_value=mocker.Mock(stdout="120.5\n", returncode=0),
         ),
         "failure": lambda: mocker.patch(
-            "archiver.subprocess.run",
+            "src.archiver.subprocess.run",
             side_effect=subprocess.CalledProcessError(1, "cmd"),
         ),
         "not_found": lambda: mocker.patch("shutil.which", return_value=None),
@@ -485,7 +486,7 @@ def ffmpeg_mock(mocker):
                 output_path.touch()
             return mock_process
 
-        return mocker.patch("archiver.subprocess.Popen", side_effect=popen_side_effect)
+        return mocker.patch("src.archiver.subprocess.Popen", side_effect=popen_side_effect)
 
     return _configure
 
@@ -622,7 +623,7 @@ def e2e_outcome_validator(camera_dir, archived_dir, trash_dir):
 @pytest.fixture(autouse=True)
 def reset_globals():
     """Reset global state before each test."""
-    import archiver
+    import src.archiver
 
-    archiver.ACTIVE_PROGRESS_REPORTER = None
+    src.archiver.ACTIVE_PROGRESS_REPORTER = None
     yield

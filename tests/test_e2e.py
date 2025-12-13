@@ -9,7 +9,7 @@ from pathlib import Path
 parent_dir = Path(__file__).parent.parent
 sys.path.insert(0, str(parent_dir))
 
-from archiver import (  # noqa: E402
+from src.archiver import (  # noqa: E402
     Config,
     Transcoder,
     main,
@@ -428,7 +428,7 @@ class TestEndToEndWithUncoveredPaths:
         )
 
         # Mock confirm_plan to return False (user cancels)
-        mocker.patch("archiver.confirm_plan", return_value=False)
+        mocker.patch("archiver.utils.confirm_plan", return_value=False)
 
         result = run_archiver(config)
         assert result == 0  # Should return 0 when user cancels

@@ -11,7 +11,7 @@ from pathlib import Path
 parent_dir = Path(__file__).parent.parent
 sys.path.insert(0, str(parent_dir))
 
-from archiver import (  # noqa: E402
+from src.archiver import (  # noqa: E402
     Config,
     FileDiscovery,
     FileManager,
@@ -151,7 +151,7 @@ class TestFileManagerIntegration:
 
             return mock_process
 
-        mocker.patch("archiver.subprocess.Popen", side_effect=mock_popen)
+        mocker.patch("subprocess.Popen", side_effect=mock_popen)
 
         # Mock FileDiscovery.discover_files to return the expected files
         mp4s = [(sample_files["mp4"], sample_files["timestamp"])]
@@ -288,7 +288,7 @@ class TestTranscoderIntegration:
 
             return mock_process
 
-        mocker.patch("archiver.subprocess.Popen", side_effect=mock_popen)
+        mocker.patch("subprocess.Popen", side_effect=mock_popen)
 
         # Mock FileDiscovery.discover_files to return the expected files
         mp4s = [(sample_files["mp4"], sample_files["timestamp"])]
@@ -424,7 +424,7 @@ class TestLoggerIntegration:
         logger = Logger.setup(config)
 
         # Check that console handler is a ThreadSafeStreamHandler
-        from archiver import ThreadSafeStreamHandler
+        from src.archiver import ThreadSafeStreamHandler
 
         handlers = [
             h for h in logger.handlers if isinstance(h, ThreadSafeStreamHandler)
@@ -818,7 +818,7 @@ class TestIntegrationWithUncoveredPaths:
 
         # Mock subprocess.Popen to raise an OSError to test error handling
         mocker.patch(
-            "archiver.subprocess.Popen", side_effect=OSError("Command not found")
+            "subprocess.Popen", side_effect=OSError("Command not found")
         )
 
         # Should handle the error gracefully

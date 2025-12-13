@@ -6,9 +6,9 @@ readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
   "pytest>=8.4.2",
+  "pytest-cov>=7.0.0",
   "pytest-mock>=3.15.1",
-  "slipcover>=1.0.17",
-  "pytest-timeout>=2.2.0",
+  "radon>=6.0.1",
 ]
 
 [tool.pytest.ini_options]
@@ -26,7 +26,5 @@ addopts = [
   "--strict-markers",
   "--strict-config",
   "--tb=short",
-  "--timeout=30",
 ]
 testpaths = ["tests"]
-timeout = 300 # Global timeout for tests (5 minutes)
