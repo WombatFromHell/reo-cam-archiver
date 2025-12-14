@@ -85,13 +85,25 @@ class ProgressReporter:
                 sys.stderr.flush()
 
     def __enter__(self):
-        import src.archiver.utils as utils
+        # Use relative import to handle both development and zipapp environments
+        try:
+            # Try importing from archiver package (zipapp bundle)
+            from . import utils
+        except ImportError:
+            # Fallback to importing from src.archiver (development environment)
+            import src.archiver.utils as utils
 
         utils.ACTIVE_PROGRESS_REPORTER = self
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        import src.archiver.utils as utils
+        # Use relative import to handle both development and zipapp environments
+        try:
+            # Try importing from archiver package (zipapp bundle)
+            from . import utils
+        except ImportError:
+            # Fallback to importing from src.archiver (development environment)
+            import src.archiver.utils as utils
 
         utils.ACTIVE_PROGRESS_REPORTER = None
         self.finish()
