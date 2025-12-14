@@ -85,11 +85,13 @@ class ProgressReporter:
                 sys.stderr.flush()
 
     def __enter__(self):
-        global ACTIVE_PROGRESS_REPORTER
-        ACTIVE_PROGRESS_REPORTER = self
+        import src.archiver.utils as utils
+
+        utils.ACTIVE_PROGRESS_REPORTER = self
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        global ACTIVE_PROGRESS_REPORTER
-        ACTIVE_PROGRESS_REPORTER = None
+        import src.archiver.utils as utils
+
+        utils.ACTIVE_PROGRESS_REPORTER = None
         self.finish()

@@ -8,6 +8,7 @@ import threading
 from datetime import datetime
 from pathlib import Path
 from typing import (
+    TYPE_CHECKING,
     Any,
     Callable,
     Dict,
@@ -19,6 +20,10 @@ from typing import (
     TypedDict,
     Union,
 )
+
+if TYPE_CHECKING:
+    from .graceful_exit import GracefulExit
+    from .processor import FileProcessor
 
 # Constants
 MIN_ARCHIVE_SIZE_BYTES = 1_048_576  # 1MB
@@ -44,7 +49,9 @@ ProgressCallback = Callable[[float], None]
 # Return type for FileDiscovery.discover_files method
 DiscoveredFiles = Tuple[
     List[Tuple[FilePath, Timestamp]],  # List of (file_path, timestamp) tuples
-    Dict[str, Dict[str, FilePath]],  # Mapping of timestamp keys to file extensions and paths
+    Dict[
+        str, Dict[str, FilePath]
+    ],  # Mapping of timestamp keys to file extensions and paths
     Set[FilePath],  # Set of trash file paths
 ]
 
@@ -146,9 +153,11 @@ def _display_transcoding_actions(plan: ActionPlanType, logger) -> None:
         _display_paired_jpg_removal(action, logger)
 
 
-def _display_paired_jpg_removal(action: dict, logger) -> None:
+def _display_paired_jpg_removal(
+    action: Union[TranscodeAction, Dict[str, Any]], logger
+) -> None:
     """Display information about paired JPG removal."""
-    if action["jpg_to_remove"]:
+    if action.get("jpg_to_remove"):
         logger.info(f"      + Removing paired JPG: {action['jpg_to_remove']}")
 
 
@@ -171,6 +180,7 @@ def _display_cleanup_information(config, logger) -> None:
 def _calculate_age_cutoff(config) -> datetime:
     """Calculate age cutoff for cleanup."""
     from datetime import timedelta
+
     return datetime.now() - timedelta(days=config.age)
 
 
@@ -254,9 +264,9 @@ def _setup_environment(config, logger) -> int:
 def _perform_discovery(config, logger) -> Tuple[List, Dict, Set]:
     """Perform file discovery and return discovered files."""
     from .discovery import FileDiscovery
-    
+
     logger.info("Discovering files")
-    
+
     mp4s, mapping, trash_files = FileDiscovery.discover_files(
         config.directory, config.trash_root, config.output, config.clean_output
     )
@@ -265,10 +275,12 @@ def _perform_discovery(config, logger) -> Tuple[List, Dict, Set]:
     return mp4s, mapping, trash_files
 
 
-def _handle_dry_run_mode(config, logger, graceful_exit, processor, plan, mapping) -> int:
+def _handle_dry_run_mode(
+    config, logger, graceful_exit, processor, plan, mapping
+) -> int:
     """Handle the dry run mode execution."""
     from .progress import ProgressReporter
-    
+
     logger.info("Processing files (dry run - no actual filesystem changes)")
 
     progress_reporter = ProgressReporter(
@@ -293,10 +305,12 @@ def _handle_dry_run_mode(config, logger, graceful_exit, processor, plan, mapping
     return 0
 
 
-def _handle_real_execution(config, logger, graceful_exit, processor, plan, mapping, trash_files) -> int:
+def _handle_real_execution(
+    config, logger, graceful_exit, processor, plan, mapping, trash_files
+) -> int:
     """Handle the real execution mode."""
     from .progress import ProgressReporter
-    
+
     logger.info("Processing files")
 
     progress_reporter = ProgressReporter(
@@ -330,11 +344,6 @@ def run_archiver(config) -> int:
     Returns:
         int: Exit code (0 for success, non-zero for errors)
     """
-    from .graceful_exit import GracefulExit, setup_signal_handlers
-    from .logger import Logger
-    from .processor import FileProcessor
-    from .progress import ProgressReporter
-
     logger = _setup_logging(config)
     graceful_exit = _setup_graceful_exit()
 
@@ -347,28 +356,34 @@ def run_archiver(config) -> int:
 def _setup_logging(config) -> "logging.Logger":
     """Setup logging for the archiver."""
     from .logger import Logger
+
     return Logger.setup(config)
 
 
 def _setup_graceful_exit() -> "GracefulExit":
     """Setup graceful exit handling."""
     from .graceful_exit import GracefulExit, setup_signal_handlers
+
     graceful_exit = GracefulExit()
     setup_signal_handlers(graceful_exit)
     return graceful_exit
 
 
-def _execute_archiver_pipeline(config, logger: "logging.Logger", graceful_exit: "GracefulExit") -> int:
+def _execute_archiver_pipeline(
+    config, logger: "logging.Logger", graceful_exit: "GracefulExit"
+) -> int:
     """Execute the complete archiver pipeline."""
     if _perform_environment_setup(config, logger) != 0:
         return 1
 
     mp4s, mapping, trash_files = _perform_discovery(config, logger)
-    
+
     if _should_skip_processing(mp4s, logger):
         return 0
 
-    return _execute_processing_pipeline(config, logger, graceful_exit, mp4s, mapping, trash_files)
+    return _execute_processing_pipeline(
+        config, logger, graceful_exit, mp4s, mapping, trash_files
+    )
 
 
 def _perform_environment_setup(config, logger: "logging.Logger") -> int:
@@ -384,36 +399,68 @@ def _should_skip_processing(mp4s: List, logger: "logging.Logger") -> bool:
     return False
 
 
-def _execute_processing_pipeline(config, logger: "logging.Logger", graceful_exit: "GracefulExit", mp4s: List, mapping: Dict, trash_files: Set) -> int:
+def _execute_processing_pipeline(
+    config,
+    logger: "logging.Logger",
+    graceful_exit: "GracefulExit",
+    mp4s: List,
+    mapping: Dict,
+    trash_files: Set,
+) -> int:
     """Execute the main processing pipeline."""
     from .processor import FileProcessor
+
     logger.info("Planning operations")
-    
+
     processor = FileProcessor(config, logger, graceful_exit)
     plan = processor.generate_action_plan(mp4s, mapping)
 
-    _display_and_handle_plan(plan, logger, config, graceful_exit, processor, mapping, trash_files)
-    
+    _display_and_handle_plan(
+        plan, logger, config, graceful_exit, processor, mapping, trash_files
+    )
+
     return 0
 
 
-def _display_and_handle_plan(plan: ActionPlanType, logger: "logging.Logger", config, graceful_exit: "GracefulExit", processor: "FileProcessor", mapping: Dict, trash_files: Set) -> None:
+def _display_and_handle_plan(
+    plan: ActionPlanType,
+    logger: "logging.Logger",
+    config,
+    graceful_exit: "GracefulExit",
+    processor: "FileProcessor",
+    mapping: Dict,
+    trash_files: Set,
+) -> None:
     """Display plan and handle execution based on configuration."""
     display_plan(plan, logger, config)
-    
+
     if config.dry_run:
         _handle_dry_run_mode(config, logger, graceful_exit, processor, plan, mapping)
     else:
-        _handle_real_execution_if_confirmed(plan, config, logger, graceful_exit, processor, mapping, trash_files)
+        _handle_real_execution_if_confirmed(
+            plan, config, logger, graceful_exit, processor, mapping, trash_files
+        )
 
 
-def _handle_real_execution_if_confirmed(plan: ActionPlanType, config, logger: "logging.Logger", graceful_exit: "GracefulExit", processor: "FileProcessor", mapping: Dict, trash_files: Set) -> None:
+def _handle_real_execution_if_confirmed(
+    plan: ActionPlanType,
+    config,
+    logger: "logging.Logger",
+    graceful_exit: "GracefulExit",
+    processor: "FileProcessor",
+    mapping: Dict,
+    trash_files: Set,
+) -> None:
     """Handle real execution if user confirms."""
     if _is_user_confirmation_required(config, plan, logger):
-        _handle_real_execution(config, logger, graceful_exit, processor, plan, mapping, trash_files)
+        _handle_real_execution(
+            config, logger, graceful_exit, processor, plan, mapping, trash_files
+        )
 
 
-def _is_user_confirmation_required(config, plan: ActionPlanType, logger: "logging.Logger") -> bool:
+def _is_user_confirmation_required(
+    config, plan: ActionPlanType, logger: "logging.Logger"
+) -> bool:
     """Check if user confirmation is required."""
     if not confirm_plan(plan, config, logger):
         logger.info("Operation cancelled by user")
@@ -436,7 +483,7 @@ def main() -> int:
         int: Exit code (0 for success, non-zero for errors)
     """
     from .config import Config, parse_args
-    
+
     args = parse_args()
     config = Config(args)
     return run_archiver(config)
@@ -444,4 +491,5 @@ def main() -> int:
 
 if __name__ == "__main__":
     import sys
+
     sys.exit(main())

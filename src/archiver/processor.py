@@ -5,7 +5,7 @@ File processing operations for the Camera Archiver application.
 import logging
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 from .config import Config
 from .discovery import FileDiscovery
@@ -39,8 +39,8 @@ class FileProcessor:
 
     def _calculate_age_cutoff(self) -> Optional[datetime]:
         """Calculate age cutoff for file processing."""
-        if self.config.age > 0:
-            return datetime.now() - timedelta(days=self.config.age)
+        if self.config.older_than > 0:
+            return datetime.now() - timedelta(days=self.config.older_than)
         return None
 
     def _should_skip_file_due_to_age(
@@ -85,11 +85,13 @@ class FileProcessor:
             else "Skipping transcoding: cleanup mode enabled"
         )
 
-        removal_actions.append({
-            "type": "source_removal_after_skip",
-            "file": fp,
-            "reason": reason,
-        })
+        removal_actions.append(
+            {
+                "type": "source_removal_after_skip",
+                "file": fp,
+                "reason": reason,
+            }
+        )
 
         if jpg:
             jpg_reason = (
@@ -97,11 +99,13 @@ class FileProcessor:
                 if not cleanup_mode
                 else "Skipping transcoding: cleanup mode enabled"
             )
-            removal_actions.append({
-                "type": "jpg_removal_after_skip",
-                "file": jpg,
-                "reason": jpg_reason,
-            })
+            removal_actions.append(
+                {
+                    "type": "jpg_removal_after_skip",
+                    "file": jpg,
+                    "reason": jpg_reason,
+                }
+            )
 
     def _create_transcoding_actions(
         self,
@@ -112,25 +116,31 @@ class FileProcessor:
         removal_actions: List[Dict[str, Any]],
     ) -> None:
         """Create transcoding and related removal actions."""
-        transcoding_actions.append({
-            "type": "transcode",
-            "input": fp,
-            "output": outp,
-            "jpg_to_remove": jpg,
-        })
+        transcoding_actions.append(
+            {
+                "type": "transcode",
+                "input": fp,
+                "output": outp,
+                "jpg_to_remove": jpg,
+            }
+        )
 
-        removal_actions.append({
-            "type": "source_removal_after_transcode",
-            "file": fp,
-            "reason": f"Source file for transcoded archive at {outp}",
-        })
+        removal_actions.append(
+            {
+                "type": "source_removal_after_transcode",
+                "file": fp,
+                "reason": f"Source file for transcoded archive at {outp}",
+            }
+        )
 
         if jpg:
-            removal_actions.append({
-                "type": "jpg_removal_after_transcode",
-                "file": jpg,
-                "reason": "Paired with transcoded MP4",
-            })
+            removal_actions.append(
+                {
+                    "type": "jpg_removal_after_transcode",
+                    "file": jpg,
+                    "reason": "Paired with transcoded MP4",
+                }
+            )
 
     def generate_action_plan(
         self,
@@ -201,7 +211,9 @@ class FileProcessor:
         source_root = self.config.output if is_output_file else self.config.directory
         return source_root, is_output_file
 
-    def _execute_transcoding_action(self, action: dict, progress_reporter) -> bool:
+    def _execute_transcoding_action(
+        self, action: Dict[str, Any], progress_reporter
+    ) -> bool:
         """Execute a single transcoding action."""
         input_path = action["input"]
         output_path = action["output"]
@@ -226,19 +238,19 @@ class FileProcessor:
 
         if success:
             progress_reporter.finish_file()
-            self.logger.info(
-                f"Successfully transcoded {input_path} -> {output_path}"
-            )
+            self.logger.info(f"Successfully transcoded {input_path} -> {output_path}")
         else:
             self.logger.error(f"Failed to transcode {input_path}")
 
         return success
 
-    def _remove_paired_jpg(self, jpg_path: str) -> None:
+    def _remove_paired_jpg(self, jpg_path: Union[str, FilePath, None]) -> None:
         """Remove paired JPG file if it exists."""
         if jpg_path:
+            # Convert string to Path if needed (for test compatibility)
+            file_path = Path(jpg_path) if isinstance(jpg_path, str) else jpg_path
             FileManager.remove_file(
-                jpg_path,
+                file_path,
                 self.logger,
                 dry_run=self.config.dry_run,
                 delete=self.config.delete,
@@ -247,14 +259,20 @@ class FileProcessor:
                 source_root=self.config.directory,
             )
 
-    def _remove_source_file(self, file_path: str, removal_actions: list) -> None:
+    def _remove_source_file(
+        self, file_path: Union[str, FilePath], removal_actions: list
+    ) -> None:
         """Remove source file and update removal actions list."""
+        # Convert string to Path if needed (for test compatibility)
+        file_path_obj = Path(file_path) if isinstance(file_path, str) else file_path
+
         # Find and remove the source removal action
         source_removal_action = None
         for removal_action in removal_actions:
-            if (
-                removal_action.get("type") == "source_removal_after_transcode"
-                and removal_action["file"] == file_path
+            if removal_action.get(
+                "type"
+            ) == "source_removal_after_transcode" and removal_action["file"] == str(
+                file_path_obj
             ):
                 source_removal_action = removal_action
                 break
@@ -277,7 +295,9 @@ class FileProcessor:
         """Filter removal actions to skip files related to failed transcodes."""
         remaining_removal_actions = []
         for action in removal_actions:
-            if self._should_skip_removal_action(action, failed_transcodes, failed_jpgs_to_remove):
+            if self._should_skip_removal_action(
+                action, failed_transcodes, failed_jpgs_to_remove
+            ):
                 continue
             remaining_removal_actions.append(action)
         return remaining_removal_actions
@@ -289,21 +309,25 @@ class FileProcessor:
         if self._is_source_removal_for_failed_transcode(action, failed_transcodes):
             self._log_skipped_removal(action, "transcoding failure")
             return True
-        
+
         if self._is_jpg_removal_for_failed_transcode(action, failed_jpgs_to_remove):
             self._log_skipped_removal(action, "transcoding failure")
             return True
-            
+
         return False
 
-    def _is_source_removal_for_failed_transcode(self, action: dict, failed_transcodes: set) -> bool:
+    def _is_source_removal_for_failed_transcode(
+        self, action: dict, failed_transcodes: set
+    ) -> bool:
         """Check if action is for removing source file of failed transcode."""
         return (
             action.get("type") == "source_removal_after_transcode"
             and action["file"] in failed_transcodes
         )
 
-    def _is_jpg_removal_for_failed_transcode(self, action: dict, failed_jpgs_to_remove: set) -> bool:
+    def _is_jpg_removal_for_failed_transcode(
+        self, action: dict, failed_jpgs_to_remove: set
+    ) -> bool:
         """Check if action is for removing JPG of failed transcode."""
         return (
             action.get("type") == "jpg_removal_after_transcode"
@@ -312,9 +336,7 @@ class FileProcessor:
 
     def _log_skipped_removal(self, action: dict, reason: str) -> None:
         """Log information about skipped removal."""
-        self.logger.info(
-            f"Skipping removal of {action['file']} due to {reason}"
-        )
+        self.logger.info(f"Skipping removal of {action['file']} due to {reason}")
 
     def _execute_removal_action(self, action: dict, exceptions: list) -> None:
         """Execute a single removal action with exception handling."""
@@ -347,9 +369,7 @@ class FileProcessor:
                 for exc in exceptions:
                     self.logger.error(f"  - {str(exc)}")
 
-    def execute_plan(
-        self, plan: ActionPlanType, progress_reporter
-    ) -> bool:
+    def execute_plan(self, plan: ActionPlanType, progress_reporter) -> bool:
         """Execute the action plan generated by generate_action_plan.
 
         Args:
@@ -360,8 +380,8 @@ class FileProcessor:
             bool: True if execution completed successfully, False otherwise
         """
         # Cast to specific types to maintain internal type safety
-        transcoding_actions = plan["transcoding"]  # type: ignore
-        removal_actions = plan["removals"]  # type: ignore
+        transcoding_actions: List[Dict[str, Any]] = plan["transcoding"]  # type: ignore
+        removal_actions: List[Dict[str, Any]] = plan["removals"]  # type: ignore
 
         # Track failed transcodes to avoid removing their source files and paired JPGs
         failed_transcodes = set()
@@ -456,15 +476,20 @@ class FileProcessor:
 
         return count
 
-    def _is_orphaned_jpg(self, jpg: Optional[FilePath], mp4: Optional[FilePath]) -> bool:
+    def _is_orphaned_jpg(
+        self, jpg: Optional[FilePath], mp4: Optional[FilePath]
+    ) -> bool:
         """Check if a JPG file is orphaned (has no corresponding MP4)."""
         return jpg is not None and mp4 is None
 
-    def _remove_orphaned_jpg_file(self, jpg: FilePath) -> None:
+    def _remove_orphaned_jpg_file(self, jpg: Optional[FilePath]) -> None:
         """Remove a single orphaned JPG file."""
+        if jpg is None:
+            return
+
         self.logger.info(f"Found orphaned JPG (no MP4 pair): {jpg}")
         is_output_file, source_root = self._determine_jpg_source_info(jpg)
-        
+
         FileManager.remove_file(
             jpg,
             self.logger,
@@ -485,7 +510,7 @@ class FileProcessor:
         """Check if JPG file is from the output directory."""
         if not self.config.output:
             return False
-        
+
         try:
             jpg.relative_to(self.config.output)
             return True
@@ -520,40 +545,43 @@ class FileProcessor:
                     continue  # Skip files that can't be accessed
         return total
 
-    def _collect_files_for_cleanup(self, directory: FilePath, priority: int, is_output: bool = False) -> List[Tuple[Timestamp, int, FilePath]]:
+    def _collect_files_for_cleanup(
+        self, directory: FilePath, priority: int, is_output: bool = False
+    ) -> List[Tuple[Timestamp, int, FilePath]]:
         """Collect files from a directory with their timestamps and priority"""
         files_with_info = []
-        
+
         if not directory.exists():
             return files_with_info
-            
+
         for file_path in directory.rglob("*.*"):
             if not file_path.is_file():
                 continue
-                
+
             try:
                 # Parse timestamp
                 ts = FileDiscovery._parse_timestamp(file_path.name)
                 if not ts and is_output:
                     # Try parsing from archived files for output directory
-                    ts = FileDiscovery._parse_timestamp_from_archived_filename(file_path.name)
+                    ts = FileDiscovery._parse_timestamp_from_archived_filename(
+                        file_path.name
+                    )
                     if not ts:
                         continue
                 elif not ts:
                     continue
-                    
+
                 files_with_info.append((ts, priority, file_path))
             except Exception:
                 continue  # Skip files we can't process
-                
+
         return files_with_info
 
     def _should_skip_file_for_cleanup(self, file_path: FilePath) -> bool:
         """Determine if a file should be skipped during cleanup collection."""
-        return (
-            self._is_file_in_trash_directory(file_path)
-            or self._is_file_in_output_directory_when_not_cleaning_output(file_path)
-        )
+        return self._is_file_in_trash_directory(
+            file_path
+        ) or self._is_file_in_output_directory_when_not_cleaning_output(file_path)
 
     def _is_file_in_trash_directory(self, file_path: FilePath) -> bool:
         """Check if file is in trash directory."""
@@ -562,7 +590,9 @@ class FileProcessor:
             and self.config.trash_root in file_path.parents
         )
 
-    def _is_file_in_output_directory_when_not_cleaning_output(self, file_path: FilePath) -> bool:
+    def _is_file_in_output_directory_when_not_cleaning_output(
+        self, file_path: FilePath
+    ) -> bool:
         """Check if file is in output directory but we're not cleaning output."""
         return (
             self.config.output is not None
@@ -570,25 +600,29 @@ class FileProcessor:
             and not self.config.clean_output
         )
 
-    def _should_skip_file_due_to_age_for_cleanup(self, ts: Timestamp, age_cutoff: Optional[datetime]) -> bool:
+    def _should_skip_file_due_to_age_for_cleanup(
+        self, ts: Timestamp, age_cutoff: Optional[datetime]
+    ) -> bool:
         """Determine if a file should be skipped due to age during cleanup."""
         if age_cutoff and ts >= age_cutoff:
             return True
         return False
 
-    def _collect_source_files_for_cleanup(self) -> List[Tuple[Timestamp, int, FilePath]]:
+    def _collect_source_files_for_cleanup(
+        self,
+    ) -> List[Tuple[Timestamp, int, FilePath]]:
         """Collect source files that meet age requirements for cleanup"""
         files_with_info = []
-        
+
         # Calculate age cutoff if specified
         age_cutoff = None
-        if self.config.age > 0:
-            age_cutoff = datetime.now() - timedelta(days=self.config.age)
+        if self.config.older_than > 0:
+            age_cutoff = datetime.now() - timedelta(days=self.config.older_than)
 
         for file_path in self.config.directory.rglob("*.*"):
             if not file_path.is_file():
                 continue
-                
+
             try:
                 # Skip files that should be excluded from cleanup
                 if self._should_skip_file_for_cleanup(file_path):
@@ -602,13 +636,17 @@ class FileProcessor:
                 if self._should_skip_file_due_to_age_for_cleanup(ts, age_cutoff):
                     continue
 
-                files_with_info.append((ts, 3, file_path))  # priority 3 for source files
+                files_with_info.append(
+                    (ts, 3, file_path)
+                )  # priority 3 for source files
             except Exception:
                 continue  # Skip files we can't process
 
         return files_with_info
 
-    def _remove_file_for_cleanup(self, file_path: FilePath, total_size: int, max_bytes: int, removed_size: int) -> int:
+    def _remove_file_for_cleanup(
+        self, file_path: FilePath, total_size: int, max_bytes: int, removed_size: int
+    ) -> int:
         """Remove a single file during cleanup and return updated removed size"""
         try:
             # Get file size before removal
@@ -634,9 +672,7 @@ class FileProcessor:
             )
 
         except Exception as e:
-            self.logger.error(
-                f"Failed to remove {file_path} during size cleanup: {e}"
-            )
+            self.logger.error(f"Failed to remove {file_path} during size cleanup: {e}")
 
         return removed_size
 
@@ -659,7 +695,7 @@ class FileProcessor:
             return
 
         total_size = self._calculate_total_directory_sizes()
-        
+
         if self._is_cleanup_needed(total_size, max_bytes):
             self._perform_cleanup_operations(total_size, max_bytes)
 
@@ -667,7 +703,10 @@ class FileProcessor:
         """Parse max_size configuration with error handling."""
         try:
             from .utils import parse_size
-            return parse_size(self.config.max_size)
+
+            if self.config.max_size:
+                return parse_size(self.config.max_size)
+            return None
         except ValueError as e:
             self.logger.error(f"Invalid max-size value: {e}")
             return None
@@ -682,7 +721,8 @@ class FileProcessor:
     def _get_trash_directory_size(self) -> int:
         """Get size of trash directory if configured."""
         if self.config.trash_root:
-            return self._get_directory_size(self.config.directory / ".deleted")
+            trash_dir = self.config.directory / ".deleted"
+            return self._get_directory_size(trash_dir)
         return 0
 
     def _get_archived_directory_size(self) -> int:
@@ -698,7 +738,7 @@ class FileProcessor:
                 f"Current size ({total_size} bytes) is within limit ({max_bytes} bytes), no size-based cleanup needed"
             )
             return False
-        
+
         self.logger.info(
             f"Current size ({total_size} bytes) exceeds limit ({max_bytes} bytes), starting size-based cleanup..."
         )
@@ -708,13 +748,15 @@ class FileProcessor:
         """Perform the actual cleanup operations."""
         all_files_with_info = self._collect_all_files_for_cleanup()
         sorted_files = self._sort_files_by_priority_and_age(all_files_with_info)
-        removed_size = self._remove_files_until_under_limit(sorted_files, total_size, max_bytes)
+        removed_size = self._remove_files_until_under_limit(
+            sorted_files, total_size, max_bytes
+        )
         self._log_cleanup_results(total_size, max_bytes, removed_size)
 
     def _collect_all_files_for_cleanup(self) -> List[Tuple[Timestamp, int, FilePath]]:
         """Collect all files that are candidates for cleanup."""
         all_files_with_info = []
-        
+
         # Add trash files (priority 1 - highest priority for removal)
         if self.config.trash_root:
             all_files_with_info.extend(self._collect_trash_files_for_cleanup())
@@ -725,27 +767,35 @@ class FileProcessor:
 
         # Add source files from the input directory (priority 3 - lowest priority for removal)
         all_files_with_info.extend(self._collect_source_files_for_cleanup())
-        
+
         return all_files_with_info
 
     def _collect_trash_files_for_cleanup(self) -> List[Tuple[Timestamp, int, FilePath]]:
         """Collect trash files for cleanup."""
         trash_files = []
-        for trash_type in ["input", "output"]:
-            trash_dir = self.config.trash_root / trash_type
-            trash_files.extend(self._collect_files_for_cleanup(trash_dir, 1))
+        if self.config.trash_root:
+            for trash_type in ["input", "output"]:
+                trash_dir = self.config.trash_root / trash_type
+                trash_files.extend(self._collect_files_for_cleanup(trash_dir, 1))
         return trash_files
 
-    def _collect_archived_files_for_cleanup(self) -> List[Tuple[Timestamp, int, FilePath]]:
+    def _collect_archived_files_for_cleanup(
+        self,
+    ) -> List[Tuple[Timestamp, int, FilePath]]:
         """Collect archived files for cleanup."""
         return self._collect_files_for_cleanup(self.config.output, 2, is_output=True)
 
-    def _sort_files_by_priority_and_age(self, files_with_info: List[Tuple[Timestamp, int, FilePath]]) -> List[Tuple[Timestamp, int, FilePath]]:
+    def _sort_files_by_priority_and_age(
+        self, files_with_info: List[Tuple[Timestamp, int, FilePath]]
+    ) -> List[Tuple[Timestamp, int, FilePath]]:
         """Sort files by priority (ascending) and then by timestamp (ascending, oldest first)."""
         return sorted(files_with_info, key=lambda x: (x[1], x[0]))
 
     def _remove_files_until_under_limit(
-        self, sorted_files: List[Tuple[Timestamp, int, FilePath]], total_size: int, max_bytes: int
+        self,
+        sorted_files: List[Tuple[Timestamp, int, FilePath]],
+        total_size: int,
+        max_bytes: int,
     ) -> int:
         """Remove files until we're under the size limit."""
         removed_size = 0
@@ -757,11 +807,15 @@ class FileProcessor:
             if self.graceful_exit.should_exit():
                 break
 
-            removed_size = self._remove_file_for_cleanup(file_path, total_size, max_bytes, removed_size)
+            removed_size = self._remove_file_for_cleanup(
+                file_path, total_size, max_bytes, removed_size
+            )
 
         return removed_size
 
-    def _log_cleanup_results(self, total_size: int, max_bytes: int, removed_size: int) -> None:
+    def _log_cleanup_results(
+        self, total_size: int, max_bytes: int, removed_size: int
+    ) -> None:
         """Log the results of the cleanup operation."""
         self.logger.info(
             f"Size-based cleanup completed. Removed {removed_size} bytes. Current size: {total_size - removed_size} bytes"

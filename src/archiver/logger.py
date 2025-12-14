@@ -122,7 +122,7 @@ class Logger:
     def _rotate_log_file(log_file_path) -> None:
         """Rotate log file if it exceeds maximum size"""
         from .utils import LOG_ROTATION_SIZE
-        
+
         if log_file_path.exists() and log_file_path.stat().st_size > LOG_ROTATION_SIZE:
             # Find existing backup files
             max_backup_num = Logger._find_max_backup_number(log_file_path)

@@ -1,5 +1,16 @@
 """
 Fixtures and utility functions for the Camera Archiver test suite.
+
+This module provides a comprehensive set of fixtures for testing the Camera Archiver
+application. The fixtures are organized into several categories:
+
+1. Core Fixtures: Basic test infrastructure (temp_dir, camera_dir, etc.)
+2. Mock Fixtures: Standardized mock objects (mock_config, mock_logger, etc.)
+3. Action Plan Fixtures: Pre-configured action plans for testing
+4. Environment Fixtures: Composite fixtures for complex test scenarios
+5. Performance Fixtures: Optimized fixtures for performance-critical tests
+
+For detailed usage examples, see the individual fixture docstrings.
 """
 
 import shutil
@@ -8,21 +19,21 @@ import sys
 import tempfile
 from datetime import datetime
 from pathlib import Path
-from unittest.mock import MagicMock
 
 import pytest
 
 parent_dir = Path(__file__).parent.parent
 sys.path.insert(0, str(parent_dir))
 sys.path.insert(0, str(parent_dir / "src"))
-from src.archiver import (  # noqa: E402
-    Config,
-    FileDiscovery,
-    FileManager,
-    GracefulExit,
-    Logger,
-    Transcoder,
-)
+
+from src.archiver.config import Config  # noqa: E402
+from src.archiver.discovery import FileDiscovery  # noqa: E402
+from src.archiver.file_manager import FileManager  # noqa: E402
+from src.archiver.graceful_exit import GracefulExit  # noqa: E402
+from src.archiver.logger import Logger  # noqa: E402
+from src.archiver.processor import FileProcessor  # noqa: E402
+from src.archiver.progress import ProgressReporter  # noqa: E402
+from src.archiver.transcoder import Transcoder  # noqa: E402
 
 
 @pytest.fixture(scope="module")
@@ -66,10 +77,10 @@ def trash_dir(temp_dir):
 
 
 @pytest.fixture
-def logger(temp_dir):
+def logger(temp_dir, mocker):
     """Create a test logger."""
     # Create a mock config with a temp log file to avoid directory issues
-    mock_args = MagicMock()
+    mock_args = mocker.MagicMock()
     mock_args.directory = str(temp_dir)
     mock_args.log_file = str(temp_dir / "test.log")
     config = Config(mock_args)
@@ -146,7 +157,6 @@ class FileSetBuilder:
     def build(self):
         """Build the file set according to specifications."""
         from datetime import datetime
-        from pathlib import Path
 
         result = {"files": [], "archived_files": [], "orphaned_jpgs": []}
 
@@ -210,9 +220,9 @@ def sample_files(camera_dir):
 
 
 @pytest.fixture
-def mock_args():
+def mock_args(mocker):
     """Create mock command-line arguments."""
-    args = MagicMock()
+    args = mocker.MagicMock()
     args.directory = "/camera"
     args.output = None
     args.dry_run = False
@@ -223,8 +233,369 @@ def mock_args():
     args.cleanup = False
     args.clean_output = False
     args.age = 30
+    args.older_than = 30
     args.log_file = None
     return args
+
+
+@pytest.fixture
+def mock_config(mocker):
+    """
+    Create a mock Config instance with configurable parameters.
+
+    This fixture provides a standardized way to create mock configurations
+    for testing, reducing boilerplate code in test functions.
+
+    Usage:
+        def test_something(mock_config):
+            # Use default configuration
+            config = mock_config
+
+        def test_something_custom(mock_config):
+            # Customize configuration
+            mock_config.directory = "/custom/path"
+            mock_config.dry_run = True
+    """
+    config = mocker.MagicMock(spec=Config)
+    config.directory = Path("/camera")
+    config.output = Path("/camera/archived")
+    config.dry_run = False
+    config.no_confirm = False
+    config.no_skip = False
+    config.delete = False
+    config.trash_root = Path("/camera/.deleted")
+    config.cleanup = False
+    config.clean_output = False
+    config.age = 30
+    config.max_size = None
+    config.log_file = None
+    return config
+
+
+@pytest.fixture
+def mock_logger(mocker):
+    """
+    Create a mock Logger instance with standard logging methods.
+
+    This fixture provides a standardized mock logger that can be used
+    to verify logging calls in tests without requiring actual file I/O.
+
+    Usage:
+        def test_something(mock_logger):
+            # Use mock logger
+            mock_logger.info.assert_called_with("Expected message")
+    """
+    logger = mocker.MagicMock(spec=Logger)
+    logger.info = mocker.MagicMock()
+    logger.error = mocker.MagicMock()
+    logger.debug = mocker.MagicMock()
+    logger.warning = mocker.MagicMock()
+    return logger
+
+
+@pytest.fixture
+def mock_processor(mocker):
+    """
+    Create a mock FileProcessor instance with standard methods.
+
+    This fixture provides a standardized mock processor that can be used
+    to test component interactions without requiring actual file processing.
+
+    Usage:
+        def test_something(mock_processor):
+            # Use mock processor
+            mock_processor.execute_plan.return_value = None
+            mock_processor.cleanup_orphaned_files.return_value = None
+            mock_processor.size_based_cleanup.return_value = None
+    """
+    processor = mocker.MagicMock(spec=FileProcessor)
+    processor.execute_plan = mocker.MagicMock()
+    processor.cleanup_orphaned_files = mocker.MagicMock()
+    processor.size_based_cleanup = mocker.MagicMock()
+    processor.config = None
+    processor.logger = None
+    processor.graceful_exit = None
+    return processor
+
+
+@pytest.fixture
+def mock_progress_reporter(mocker):
+    """
+    Create a mock ProgressReporter instance with context manager support.
+
+    This fixture provides a standardized mock progress reporter that handles
+    the context manager protocol and can be used to verify progress reporting
+    behavior in tests.
+
+    Usage:
+        def test_something(mock_progress_reporter):
+            # Use mock progress reporter
+            with mock_progress_reporter as reporter:
+                reporter.start_file.assert_called_once()
+    """
+    reporter = mocker.MagicMock(spec=ProgressReporter)
+    reporter.__enter__ = mocker.MagicMock(return_value=reporter)
+    reporter.__exit__ = mocker.MagicMock(return_value=None)
+    reporter.start_file = mocker.MagicMock()
+    reporter.finish_file = mocker.MagicMock()
+    reporter.update = mocker.MagicMock()
+    reporter.clear = mocker.MagicMock()
+    return reporter
+
+
+@pytest.fixture
+def empty_action_plan():
+    """
+    Create an empty action plan with standard structure.
+
+    This fixture provides a standardized empty action plan that can be used
+    as a base for tests that need to verify action plan processing.
+
+    Usage:
+        def test_something(empty_action_plan):
+            # Use empty plan
+            plan = empty_action_plan
+            assert len(plan['transcoding']) == 0
+            assert len(plan['removals']) == 0
+    """
+    return {"transcoding": [], "removals": []}
+
+
+@pytest.fixture
+def action_plan_with_transcoding():
+    """
+    Create an action plan with transcoding operations.
+
+    This fixture provides a standardized action plan with transcoding operations
+    that can be used to test transcoding functionality.
+
+    Usage:
+        def test_something(action_plan_with_transcoding):
+            # Use plan with transcoding
+            plan = action_plan_with_transcoding
+            assert len(plan['transcoding']) == 1
+            assert len(plan['removals']) == 0
+    """
+    return {
+        "transcoding": [
+            {
+                "type": "transcode",
+                "input": "/path/to/input.mp4",
+                "output": "/path/to/output.mp4",
+                "jpg_to_remove": "/path/to/input.jpg",
+            }
+        ],
+        "removals": [],
+    }
+
+
+@pytest.fixture
+def action_plan_with_removals():
+    """
+    Create an action plan with removal operations.
+
+    This fixture provides a standardized action plan with removal operations
+    that can be used to test file removal functionality.
+
+    Usage:
+        def test_something(action_plan_with_removals):
+            # Use plan with removals
+            plan = action_plan_with_removals
+            assert len(plan['transcoding']) == 0
+            assert len(plan['removals']) == 1
+    """
+    return {
+        "transcoding": [],
+        "removals": [
+            {
+                "type": "source_removal_after_transcode",
+                "file": "/path/to/source.mp4",
+                "reason": "Source file for transcoded archive",
+            }
+        ],
+    }
+
+
+@pytest.fixture
+def action_plan_with_mixed_actions():
+    """
+    Create an action plan with both transcoding and removal operations.
+
+    This fixture provides a standardized action plan with mixed operations
+    that can be used to test comprehensive processing functionality.
+
+    Usage:
+        def test_something(action_plan_with_mixed_actions):
+            # Use plan with mixed actions
+            plan = action_plan_with_mixed_actions
+            assert len(plan['transcoding']) == 1
+            assert len(plan['removals']) == 1
+    """
+    return {
+        "transcoding": [
+            {
+                "type": "transcode",
+                "input": "/path/to/input.mp4",
+                "output": "/path/to/output.mp4",
+                "jpg_to_remove": "/path/to/input.jpg",
+            }
+        ],
+        "removals": [
+            {
+                "type": "source_removal_after_transcode",
+                "file": "/path/to/source.mp4",
+                "reason": "Source file for transcoded archive",
+            }
+        ],
+    }
+
+
+@pytest.fixture
+def utils_test_environment(mock_config, mock_logger, mock_processor, empty_action_plan):
+    """
+    Create a complete test environment for utils module testing.
+
+    This fixture composes multiple fixtures to provide a comprehensive
+    test environment that reduces boilerplate in utils module tests.
+
+    Usage:
+        def test_something(utils_test_environment):
+            # Access all components
+            config = utils_test_environment['config']
+            logger = utils_test_environment['logger']
+            processor = utils_test_environment['processor']
+            plan = utils_test_environment['plan']
+    """
+    return {
+        "config": mock_config,
+        "logger": mock_logger,
+        "processor": mock_processor,
+        "plan": empty_action_plan,
+    }
+
+
+@pytest.fixture
+def mock_file_discovery(mocker):
+    """
+    Create a mock FileDiscovery instance with configurable results.
+
+    This fixture provides a standardized mock file discovery that can be
+    configured to return specific file sets for testing discovery functionality.
+
+    Usage:
+        def test_something(mock_file_discovery, mocker):
+            # Configure mock to return specific results
+            mock_file_discovery.discover_files.return_value = ([], {}, set())
+
+            # Or use with patching
+            mocker.patch.object(FileDiscovery, 'discover_files',
+                               return_value=([], {}, set()))
+    """
+    discovery = mocker.MagicMock(spec=FileDiscovery)
+    discovery.discover_files = mocker.MagicMock(return_value=([], {}, set()))
+    return discovery
+
+
+@pytest.fixture
+def performance_camera_dir():
+    """
+    Create a pre-configured camera directory structure for performance-critical tests.
+
+    This fixture provides a pre-created directory structure with common test data
+    to reduce setup time for performance-sensitive tests. The structure includes
+    a standard 2023/01/15 directory path that's commonly used in tests.
+
+    Usage:
+        def test_performance_critical_operation(performance_camera_dir):
+            # Use pre-configured directory
+            camera_path = performance_camera_dir
+            # Directory structure already exists: 2023/01/15
+    """
+    # Create temp directory
+    temp_path = Path(tempfile.mkdtemp())
+
+    # Create common camera directory structure
+    camera_path = temp_path / "camera"
+    camera_path.mkdir()
+
+    # Create common date structure (2023/01/15) that's used in many tests
+    date_path = camera_path / "2023" / "01" / "15"
+    date_path.mkdir(parents=True)
+
+    yield camera_path
+
+    # Cleanup
+    shutil.rmtree(temp_path)
+
+
+@pytest.fixture(scope="module")
+def shared_test_resources(mocker):
+    """
+    Create shared test resources with module scope for performance optimization.
+
+    This fixture provides commonly used test resources that can be shared
+    across multiple tests in a module to reduce setup time and memory usage.
+    Resources include pre-created directory structures and mock objects.
+
+    Usage:
+        def test_something(shared_test_resources):
+            # Access shared resources
+            camera_dir = shared_test_resources['camera_dir']
+            mock_config = shared_test_resources['mock_config']
+            mock_logger = shared_test_resources['mock_logger']
+    """
+    # Create temp directory
+    temp_path = Path(tempfile.mkdtemp())
+
+    # Create shared directory structures
+    camera_dir = temp_path / "camera"
+    archived_dir = temp_path / "archived"
+    trash_dir = temp_path / ".deleted"
+
+    camera_dir.mkdir()
+    archived_dir.mkdir()
+    trash_dir.mkdir()
+
+    # Create common date structure
+    date_path = camera_dir / "2023" / "01" / "15"
+    date_path.mkdir(parents=True)
+
+    # Create shared mock objects
+    mock_config = mocker.MagicMock(spec=Config)
+    mock_config.directory = camera_dir
+    mock_config.output = archived_dir
+    mock_config.dry_run = False
+    mock_config.no_confirm = False
+    mock_config.no_skip = False
+    mock_config.delete = False
+    mock_config.trash_root = trash_dir
+    mock_config.cleanup = False
+    mock_config.clean_output = False
+    mock_config.age = 30
+    mock_config.max_size = None
+    mock_config.log_file = None
+
+    mock_logger = mocker.MagicMock(spec=Logger)
+    mock_logger.info = mocker.MagicMock()
+    mock_logger.error = mocker.MagicMock()
+    mock_logger.debug = mocker.MagicMock()
+    mock_logger.warning = mocker.MagicMock()
+
+    # Create shared resources dictionary
+    resources = {
+        "temp_dir": temp_path,
+        "camera_dir": camera_dir,
+        "archived_dir": archived_dir,
+        "trash_dir": trash_dir,
+        "date_path": date_path,
+        "mock_config": mock_config,
+        "mock_logger": mock_logger,
+    }
+
+    yield resources
+
+    # Cleanup
+    shutil.rmtree(temp_path)
 
 
 @pytest.fixture
@@ -250,11 +621,11 @@ def mock_subprocess_patterns(mocker):
     """Provides common subprocess mocking patterns."""
     return {
         "success": lambda: mocker.patch(
-            "src.archiver.subprocess.run",
+            "src.archiver.transcoder.subprocess.run",
             return_value=mocker.Mock(stdout="120.5\n", returncode=0),
         ),
         "failure": lambda: mocker.patch(
-            "src.archiver.subprocess.run",
+            "src.archiver.transcoder.subprocess.run",
             side_effect=subprocess.CalledProcessError(1, "cmd"),
         ),
         "not_found": lambda: mocker.patch("shutil.which", return_value=None),
@@ -486,7 +857,9 @@ def ffmpeg_mock(mocker):
                 output_path.touch()
             return mock_process
 
-        return mocker.patch("src.archiver.subprocess.Popen", side_effect=popen_side_effect)
+        return mocker.patch(
+            "src.archiver.transcoder.subprocess.Popen", side_effect=popen_side_effect
+        )
 
     return _configure
 
@@ -623,7 +996,8 @@ def e2e_outcome_validator(camera_dir, archived_dir, trash_dir):
 @pytest.fixture(autouse=True)
 def reset_globals():
     """Reset global state before each test."""
-    import src.archiver
+    # Reset the global variable to None
+    import src.archiver.utils as utils
 
-    src.archiver.ACTIVE_PROGRESS_REPORTER = None
+    utils.ACTIVE_PROGRESS_REPORTER = None
     yield

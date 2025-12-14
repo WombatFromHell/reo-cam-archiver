@@ -6,7 +6,6 @@ import logging
 import re
 import shutil
 import subprocess
-from pathlib import Path
 from typing import List, Optional
 
 from .graceful_exit import GracefulExit
@@ -136,14 +135,18 @@ class Transcoder:
         return False
 
     @staticmethod
-    def _log_ffmpeg_output(line: str, log_lines: List[str], debug_ffmpeg: bool, logger) -> None:
+    def _log_ffmpeg_output(
+        line: str, log_lines: List[str], debug_ffmpeg: bool, logger
+    ) -> None:
         """Log ffmpeg output if debug mode is enabled."""
         if debug_ffmpeg:
             logger.debug(f"FFmpeg output: {line.strip()}")
         log_lines.append(line)
 
     @staticmethod
-    def _handle_ffmpeg_completion(rc: int, log_lines: List[str], graceful_exit: GracefulExit, logger) -> bool:
+    def _handle_ffmpeg_completion(
+        rc: int, log_lines: List[str], graceful_exit: GracefulExit, logger
+    ) -> bool:
         """Handle ffmpeg process completion and return success status."""
         if rc != 0 and not graceful_exit.should_exit():
             msg = f"FFmpeg failed (code {rc})\n" + "".join(log_lines)
@@ -191,10 +194,14 @@ class Transcoder:
 
             Transcoder._log_ffmpeg_output(line, log_lines, debug_ffmpeg, logger)
             cur_pct = Transcoder._calculate_progress(line, total_duration, cur_pct)
-            prev_pct = Transcoder._update_progress_callback(progress_cb, cur_pct, prev_pct)
+            prev_pct = Transcoder._update_progress_callback(
+                progress_cb, cur_pct, prev_pct
+            )
 
         rc = proc.wait()
-        return Transcoder._handle_ffmpeg_completion(rc, log_lines, graceful_exit, logger)
+        return Transcoder._handle_ffmpeg_completion(
+            rc, log_lines, graceful_exit, logger
+        )
 
     @staticmethod
     def _should_exit_gracefully(graceful_exit: GracefulExit) -> bool:
@@ -238,10 +245,11 @@ class Transcoder:
             return None
 
     @staticmethod
-    def _cleanup_ffmpeg_process(proc: subprocess.Popen) -> None:
+    def _cleanup_ffmpeg_process(proc: Optional[subprocess.Popen]) -> None:
         """Clean up ffmpeg process resources."""
-        Transcoder._close_process_stdout(proc)
-        Transcoder._wait_for_process_completion(proc)
+        if proc:
+            Transcoder._close_process_stdout(proc)
+            Transcoder._wait_for_process_completion(proc)
 
     @staticmethod
     def _close_process_stdout(proc: subprocess.Popen) -> None:
@@ -288,6 +296,11 @@ class Transcoder:
         if graceful_exit is None:
             graceful_exit = GracefulExit()
         if graceful_exit.should_exit():
+            return False
+
+        # Validate input path
+        if not input_path or str(input_path).strip() == "" or str(input_path) == ".":
+            logger.error("Empty input path provided for transcoding")
             return False
 
         if dry_run:

@@ -20,7 +20,8 @@ class Config:
         self.trash_root: Optional[Path] = self._resolve_trash_root(args)
         self.cleanup: bool = args.cleanup
         self.clean_output: bool = args.clean_output
-        self.age: int = args.age
+        # Use --older-than argument (default is 30, set by argparse)
+        self.older_than: int = args.older_than
         self.max_size: Optional[str] = getattr(args, "max_size", None)
         self.log_file: Optional[Path] = (
             Path(args.log_file) if args.log_file else self.directory / "archiver.log"
@@ -91,7 +92,10 @@ def parse_args(args: Optional[list] = None) -> argparse.Namespace:
         help="Also clean output directory during cleanup",
     )
     parser.add_argument(
-        "--age", type=int, default=30, help="Age in days for cleanup (default: 30)"
+        "--older-than",
+        type=int,
+        default=30,
+        help="Only remove files older than specified days (default: 30)",
     )
     parser.add_argument(
         "--max-size",

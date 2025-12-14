@@ -66,7 +66,9 @@ class FileManager:
             source_root = file_path.parent
 
         if not delete and trash_root:
-            FileManager._move_to_trash(file_path, source_root, trash_root, is_output, logger)
+            FileManager._move_to_trash(
+                file_path, source_root, trash_root, is_output, logger
+            )
         else:
             FileManager._delete_file(file_path, logger)
 
@@ -106,7 +108,9 @@ class FileManager:
     ) -> FilePath:
         """Calculate the destination path in trash for a given file"""
         dest_sub = FileManager._calculate_trash_subdirectory(is_output)
-        rel_path = FileManager._get_relative_path_without_double_nesting(file_path, source_root)
+        rel_path = FileManager._get_relative_path_without_double_nesting(
+            file_path, source_root
+        )
         base_dest = trash_root / dest_sub / rel_path
         return FileManager._resolve_unique_destination(base_dest)
 
@@ -120,7 +124,7 @@ class FileManager:
         except ValueError:
             # If file_path is not relative to source_root, use just the filename
             return Path(file_path.name)
-        
+
         return FileManager._remove_trash_prefix_if_present(rel_path)
 
     @staticmethod

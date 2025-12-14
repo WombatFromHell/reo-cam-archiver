@@ -4,8 +4,7 @@ File discovery operations for the Camera Archiver application.
 
 import re
 from datetime import datetime
-from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple
+from typing import List, Optional, Set, Tuple
 
 from .utils import DiscoveredFiles, FilePath, Timestamp, TimestampFileMapping
 
@@ -23,9 +22,7 @@ class FileDiscovery:
             y, m, d = rel_parts[-4], rel_parts[-3], rel_parts[-2]
             y_int, m_int, d_int = int(y), int(m), int(d)
 
-            return (
-                1000 <= y_int <= 9999 and 1 <= m_int <= 12 and 1 <= d_int <= 31
-            )
+            return 1000 <= y_int <= 9999 and 1 <= m_int <= 12 and 1 <= d_int <= 31
         except (ValueError, AttributeError):
             return False
 
@@ -35,7 +32,7 @@ class FileDiscovery:
         # Skip if not a file
         if not file_path.is_file():
             return False
-        
+
         # File is valid for processing
         return True
 
@@ -77,7 +74,7 @@ class FileDiscovery:
         mapping.setdefault(key, {})[ext] = file_path
         if ext == ".mp4":
             mp4s.append((file_path, ts))
-        
+
         # Add to trash files if applicable
         if is_trash and trash_files is not None:
             trash_files.add(file_path)
@@ -98,7 +95,9 @@ class FileDiscovery:
             return
 
         # Validate directory structure
-        if not FileDiscovery._validate_file_structure(file_path, base_directory, is_trash):
+        if not FileDiscovery._validate_file_structure(
+            file_path, base_directory, is_trash
+        ):
             return
 
         # Parse timestamp
@@ -127,7 +126,14 @@ class FileDiscovery:
 
         for file_path in directory.rglob("*.*"):
             FileDiscovery._process_file_if_valid(
-                file_path, directory, mp4s, mapping, trash_files, is_trash, is_output, trash_root
+                file_path,
+                directory,
+                mp4s,
+                mapping,
+                trash_files,
+                is_trash,
+                is_output,
+                trash_root,
             )
 
     @staticmethod
@@ -163,13 +169,19 @@ class FileDiscovery:
         trash_files: Set[FilePath] = set()
 
         # Scan base directory
-        FileDiscovery._scan_directory(directory, mp4s, mapping, trash_files=None, trash_root=trash_root)
+        FileDiscovery._scan_directory(
+            directory, mp4s, mapping, trash_files=None, trash_root=trash_root
+        )
 
         # Scan output directory if clean_output is specified
         if clean_output and output_directory:
             FileDiscovery._scan_directory(
-                output_directory, mp4s, mapping, 
-                trash_files=None, is_output=True, trash_root=trash_root
+                output_directory,
+                mp4s,
+                mapping,
+                trash_files=None,
+                is_output=True,
+                trash_root=trash_root,
             )
 
         # Scan trash directory if enabled
@@ -177,8 +189,12 @@ class FileDiscovery:
             for trash_type in ["input", "output"]:
                 trash_dir = trash_root / trash_type
                 FileDiscovery._scan_directory(
-                    trash_dir, mp4s, mapping, 
-                    trash_files=trash_files, is_trash=True, trash_root=None
+                    trash_dir,
+                    mp4s,
+                    mapping,
+                    trash_files=trash_files,
+                    is_trash=True,
+                    trash_root=None,
                 )
 
         return mp4s, mapping, trash_files
