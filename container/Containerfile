@@ -1,4 +1,4 @@
-FROM linuxserver/ffmpeg:version-8.0-cli
+FROM linuxserver/ffmpeg:version-8.0.1-cli
 
 ENV TZ=America/Denver
 ENV DEBIAN_FRONTEND=noninteractive
