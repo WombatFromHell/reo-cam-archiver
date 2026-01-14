@@ -6,6 +6,7 @@ services:
       args:
         TZ: ${TZ}
     image: ${IMAGENAME}:${VERSION}
+    pull_policy: never
     restart: unless-stopped
     devices:
       - "/dev/dri:/dev/dri"
