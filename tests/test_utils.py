@@ -181,7 +181,7 @@ class TestDisplayFunctions:
         """Test display_plan with empty plan."""
         mock_logger = mocker.Mock()
         mock_config = mocker.Mock()
-        mock_config.age = 30  # Set age to avoid TypeError
+        mock_config.older_than = 30  # Set older_than to avoid TypeError
         mock_config.cleanup = False
 
         plan = {"transcoding": [], "removals": []}
@@ -196,7 +196,7 @@ class TestDisplayFunctions:
         """Test display_plan with transcoding actions."""
         mock_logger = mocker.Mock()
         mock_config = mocker.Mock()
-        mock_config.age = 30  # Set age to avoid TypeError
+        mock_config.older_than = 30  # Set older_than to avoid TypeError
         mock_config.cleanup = False
 
         plan = {
@@ -224,7 +224,7 @@ class TestDisplayFunctions:
         """Test display_plan with removal actions."""
         mock_logger = mocker.Mock()
         mock_config = mocker.Mock()
-        mock_config.age = 30  # Set age to avoid TypeError
+        mock_config.older_than = 30  # Set older_than to avoid TypeError
         mock_config.cleanup = False
 
         plan = {
@@ -252,7 +252,7 @@ class TestDisplayFunctions:
         """Test display_plan with mixed action types."""
         mock_logger = mocker.Mock()
         mock_config = mocker.Mock()
-        mock_config.age = 30  # Set age to avoid TypeError
+        mock_config.older_than = 30  # Set older_than to avoid TypeError
         mock_config.cleanup = False
 
         plan = {
@@ -289,7 +289,7 @@ class TestDisplayFunctions:
         """Test display_plan in cleanup mode."""
         mock_logger = mocker.Mock()
         mock_config = mocker.Mock()
-        mock_config.age = 30  # Set age to avoid TypeError
+        mock_config.older_than = 30  # Set older_than to avoid TypeError
         mock_config.cleanup = True
         mock_config.clean_output = False
         mock_config.max_size = None

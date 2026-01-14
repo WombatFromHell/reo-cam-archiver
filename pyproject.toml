@@ -1,6 +1,6 @@
 [project]
 name = "camera-archiver"
-version = "1.0.1"
+version = "1.0.3"
 description = "Camera video archiver for Reolink"
 readme = "README.md"
 requires-python = ">=3.13"

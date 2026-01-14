@@ -478,7 +478,6 @@ class TestConfigTypeSafety:
         args.trash_root = None
         args.cleanup = False
         args.clean_output = False
-        args.age = 30
         args.older_than = 30
         args.log_file = None
 
@@ -515,7 +514,6 @@ class TestConfigTypeSafety:
         args.trash_root = None
         args.cleanup = False
         args.clean_output = False
-        args.age = invalid_age
         args.older_than = invalid_age
         args.log_file = None
 

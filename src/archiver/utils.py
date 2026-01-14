@@ -181,14 +181,14 @@ def _calculate_age_cutoff(config) -> datetime:
     """Calculate age cutoff for cleanup."""
     from datetime import timedelta
 
-    return datetime.now() - timedelta(days=config.age)
+    return datetime.now() - timedelta(days=config.older_than)
 
 
 def _display_age_cutoff_info(config, age_cutoff: datetime, logger) -> None:
     """Display age cutoff information."""
     logger.info(
         f"Cleanup enabled: Files older than {age_cutoff.strftime('%Y-%m-%d %H:%M:%S')} "
-        f"will be removed based on age threshold of {config.age} days"
+        f"will be removed based on age threshold of {config.older_than} days"
     )
 
 

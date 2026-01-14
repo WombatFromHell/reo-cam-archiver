@@ -27,7 +27,7 @@ class TestFileProcessorInitialization:
         """Test FileProcessor with minimal configuration."""
         mock_args.directory = "/camera"
         mock_args.output = None
-        mock_args.age = 0
+        mock_args.older_than = 0
 
         config = Config(mock_args)
         processor = FileProcessor(config, logger, graceful_exit)

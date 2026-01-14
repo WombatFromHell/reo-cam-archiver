@@ -232,7 +232,6 @@ def mock_args(mocker):
     args.trash_root = None
     args.cleanup = False
     args.clean_output = False
-    args.age = 30
     args.older_than = 30
     args.log_file = None
     return args
@@ -266,7 +265,7 @@ def mock_config(mocker):
     config.trash_root = Path("/camera/.deleted")
     config.cleanup = False
     config.clean_output = False
-    config.age = 30
+    config.older_than = 30
     config.max_size = None
     config.log_file = None
     return config
@@ -571,7 +570,7 @@ def shared_test_resources(mocker):
     mock_config.trash_root = trash_dir
     mock_config.cleanup = False
     mock_config.clean_output = False
-    mock_config.age = 30
+    mock_config.older_than = 30
     mock_config.max_size = None
     mock_config.log_file = None
 
