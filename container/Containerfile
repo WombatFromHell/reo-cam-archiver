@@ -1,7 +1,9 @@
 FROM linuxserver/ffmpeg:version-8.0.1-cli
 
-ENV TZ=America/Denver
+ARG TZ=$TZ
+#
 ENV DEBIAN_FRONTEND=noninteractive
+
 # Latest releases available at https://github.com/aptible/supercronic/releases
 ENV SUPERCRONIC_URL=https://github.com/aptible/supercronic/releases/download/v0.2.34/supercronic-linux-amd64 \
   SUPERCRONIC_SHA1SUM=e8631edc1775000d119b70fd40339a7238eece14 \
@@ -10,7 +12,8 @@ ENV SUPERCRONIC_URL=https://github.com/aptible/supercronic/releases/download/v0.
 RUN apt-get update -y && \
   apt-get install -y curl python3 tmux nano ca-certificates && \
   # ensure we have a timezone set
-  ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
+  ln -snf /usr/share/zoneinfo/${TZ} /etc/localtime && \
+  echo "${TZ}" > /etc/timezone
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 RUN curl -fsSLO "$SUPERCRONIC_URL" \
@@ -19,12 +22,18 @@ RUN curl -fsSLO "$SUPERCRONIC_URL" \
   && mv "$SUPERCRONIC" "/usr/local/bin/${SUPERCRONIC}" \
   && ln -s "/usr/local/bin/${SUPERCRONIC}" /usr/local/bin/supercronic
 
-COPY entrypoint.sh /root/
-COPY 99archival /root/99archival
+COPY container/entrypoint.sh /root/
+COPY container/99archival /root/99archival
 
 RUN chmod 0644 /root/99archival && \
   chown root:root /root/99archival && \
   touch /var/log/cron.log
-WORKDIR /camera/
+
+WORKDIR /app/
+
+COPY container/archiver.pyz \
+  container/archive-task.sh \
+  container/cleanup-task.sh /app/
+RUN chmod +x /app/*.sh /app/*.pyz
 
 ENTRYPOINT ["/root/entrypoint.sh"]

@@ -1,19 +1,35 @@
 #!/usr/bin/env bash
 
-IMAGE_NAME="cam_archiver"
+ENV_FILE="${ENV_FILE:-./compose.env}"
+# read vars from .env
+if [ -r "${ENV_FILE}" ]; then # shellcheck disable=SC1090
+  source "${ENV_FILE}"
+fi
 
 build() {
-  docker build -t "$IMAGE_NAME" -f ./Containerfile .
+  docker build -t "${IMAGENAME}:${VERSION}" -f container/Containerfile "${COMPOSEROOT}"
 }
+
 run() {
   docker run --rm -it \
-    -v "/share/FTPRoot/camera:/camera" \
+    --build-arg TZ="${TZ}" \
+    -v "${SHAREROOT}:/camera" \
     --device "/dev/dri:/dev/dri" \
-    --name "$IMAGE_NAME" "$IMAGE_NAME"
+    --name "${IMAGENAME}" "${IMAGENAME}:${VERSION}"
 }
+
 shell() {
-  docker exec -it "$IMAGE_NAME" /bin/bash
+  docker exec -it "${IMAGENAME}" /bin/bash
 }
+
+up() {
+  docker compose -p "${IMAGENAME}" --env-file "${ENV_FILE}" up -d
+}
+
+down() {
+  docker compose -p "${IMAGENAME}" down
+}
+
 help() {
   echo
   echo "Usage: $0 [--build | -b] [--run | -r] [--shell | -s] [--test] [--help | -h]"
@@ -23,6 +39,9 @@ help() {
   echo "  --shell, -s      open a shell inside the image"
   echo "  --test           rerun the tests"
   echo "  --help, -h       this message"
+  echo
+  echo "  up               start the container via docker compose"
+  echo "  down             stop the container via docker compose"
   echo
   exit 1
 }
@@ -40,6 +59,12 @@ case "$CMD" in
   ;;
 "--shell" | "-s")
   shell
+  ;;
+"up")
+  up
+  ;;
+"down")
+  down
   ;;
 *)
   build

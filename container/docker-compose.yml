@@ -1,15 +1,13 @@
-version: "3"
-
 services:
   cam_archiver:
     build:
-      context: /share/homes/nxxel/Projects/camera-archiver
-      dockerfile: Containerfile
-    image: cam_archiver:latest
+      context: ${COMPOSEROOT}
+      dockerfile: container/Containerfile
+      args:
+        TZ: ${TZ}
+    image: ${IMAGENAME}:${VERSION}
     restart: unless-stopped
-    tty: true
-    stdin_open: true
     devices:
       - "/dev/dri:/dev/dri"
     volumes:
-      - "/share/FTPRoot/camera:/camera"
+      - "${SHAREROOT}:/camera"
