@@ -9,7 +9,14 @@ import pytest
 
 from src.archiver.config import Config
 from src.archiver.discovery import FileDiscovery
-from src.archiver.processor import FileProcessor
+from src.archiver.processor import (
+    AgeBasedCleanupStrategy,
+    CleanupFile,
+    CleanupRules,
+    CleanupStrategy,
+    FileProcessor,
+    SizeBasedCleanupStrategy,
+)
 from src.archiver.transcoder import Transcoder
 
 
@@ -1372,7 +1379,9 @@ class TestCleanupOperations:
         # Should remove exactly one orphaned JPG
         mock_remove.assert_called_once()
 
-    def test_size_based_cleanup_basic_functionality(self, config, graceful_exit, logger, temp_dir, mocker):
+    def test_size_based_cleanup_basic_functionality(
+        self, config, graceful_exit, logger, temp_dir, mocker
+    ):
         """Test basic size-based cleanup functionality with real file operations."""
         # Setup
         config.max_size = "1KB"  # 1024 bytes
@@ -1399,7 +1408,9 @@ class TestCleanupOperations:
         def mock_parse_timestamp(filename):
             return datetime(2023, 1, 1, 12, 0, 0)
 
-        mocker.patch.object(FileDiscovery, '_parse_timestamp', side_effect=mock_parse_timestamp)
+        mocker.patch.object(
+            FileDiscovery, "_parse_timestamp", side_effect=mock_parse_timestamp
+        )
 
         # Track actual removals
         removed_files = []
@@ -1413,18 +1424,19 @@ class TestCleanupOperations:
             except Exception:
                 return 0
 
-        mocker.patch("src.archiver.file_manager.FileManager.remove_file", side_effect=mock_remove_file)
+        mocker.patch(
+            "src.archiver.file_manager.FileManager.remove_file",
+            side_effect=mock_remove_file,
+        )
 
         # Debug: Check what files are collected
-        print(f"\n=== Debug: Collecting trash files ===")
+        print("\n=== Debug: Collecting trash files ===")
         trash_files = processor._collect_trash_files_for_cleanup()
         print(f"Trash files collected: {len(trash_files)}")
         for ts, priority, file_path in trash_files:
             print(f"  Priority {priority}: {file_path} (timestamp: {ts})")
 
-        archived_files = processor._collect_archived_files_for_cleanup()
-
-        print(f"\n=== Debug: Collecting source files ===")
+        print("\n=== Debug: Collecting source files ===")
         source_files = processor._collect_source_files_for_cleanup()
         print(f"Source files collected: {len(source_files)}")
         for ts, priority, file_path in source_files:
@@ -1480,7 +1492,14 @@ class TestSizeBasedCleanup:
         new_source = temp_dir / "REO_front_01_20230102120000.mp4"
 
         # Create all files with 300 bytes each (total 1800 > 1024 limit)
-        for file in [old_trash, new_trash, old_archived, new_archived, old_source, new_source]:
+        for file in [
+            old_trash,
+            new_trash,
+            old_archived,
+            new_archived,
+            old_source,
+            new_source,
+        ]:
             with file.open("w") as f:
                 f.write("x" * 300)
 
@@ -1501,8 +1520,14 @@ class TestSizeBasedCleanup:
                 return new_timestamp
             return datetime(2023, 1, 1, 12, 0, 0)
 
-        mocker.patch.object(FileDiscovery, '_parse_timestamp', side_effect=mock_parse_timestamp)
-        mocker.patch.object(FileDiscovery, '_parse_timestamp_from_archived_filename', side_effect=mock_parse_archived)
+        mocker.patch.object(
+            FileDiscovery, "_parse_timestamp", side_effect=mock_parse_timestamp
+        )
+        mocker.patch.object(
+            FileDiscovery,
+            "_parse_timestamp_from_archived_filename",
+            side_effect=mock_parse_archived,
+        )
 
         # Track removal order
         removal_order = []
@@ -1513,9 +1538,10 @@ class TestSizeBasedCleanup:
             removal_order.append(str(file_path))
             return size
 
-        mocker.patch("src.archiver.file_manager.FileManager.remove_file", side_effect=mock_remove_file)
-
-
+        mocker.patch(
+            "src.archiver.file_manager.FileManager.remove_file",
+            side_effect=mock_remove_file,
+        )
 
         # Run cleanup
         processor.size_based_cleanup(set())
@@ -1884,9 +1910,13 @@ class TestSizeBasedCleanup:
         # Check priorities for the files we have
         for ts, priority, file_path in all_files:
             if "output" in str(file_path):
-                assert priority == 3  # archived files now have highest protection (priority 3)
+                assert (
+                    priority == 3
+                )  # archived files now have highest protection (priority 3)
             elif "2023" in str(file_path):
-                assert priority == 2  # source files in YYYY/MM/DD structure have medium protection (priority 2)
+                assert (
+                    priority == 2
+                )  # source files in YYYY/MM/DD structure have medium protection (priority 2)
 
         # Test _sort_files_by_priority_and_age
         sorted_files = processor._sort_files_by_priority_and_age(all_files)
@@ -1903,7 +1933,9 @@ class TestSizeBasedCleanup:
                 # Different priority, should be sorted by priority (ascending)
                 assert prio1 <= prio2
 
-    def test_size_based_cleanup_custom_trash_root(self, config, graceful_exit, logger, temp_dir, mocker):
+    def test_size_based_cleanup_custom_trash_root(
+        self, config, graceful_exit, logger, temp_dir, mocker
+    ):
         """Test size-based cleanup with custom trash-root configuration."""
         config.max_size = "1KB"
         config.directory = temp_dir
@@ -1939,7 +1971,9 @@ class TestSizeBasedCleanup:
         def mock_parse_timestamp(filename):
             return datetime(2023, 1, 1, 12, 0, 0)
 
-        mocker.patch.object(FileDiscovery, '_parse_timestamp', side_effect=mock_parse_timestamp)
+        mocker.patch.object(
+            FileDiscovery, "_parse_timestamp", side_effect=mock_parse_timestamp
+        )
 
         # Track what gets removed
         removed_files = []
@@ -1950,7 +1984,10 @@ class TestSizeBasedCleanup:
             removed_files.append(str(file_path))
             return size
 
-        mocker.patch("src.archiver.file_manager.FileManager.remove_file", side_effect=mock_remove_file)
+        mocker.patch(
+            "src.archiver.file_manager.FileManager.remove_file",
+            side_effect=mock_remove_file,
+        )
 
         # Run cleanup
         processor.size_based_cleanup(set())
@@ -1964,11 +2001,11 @@ class TestSizeBasedCleanup:
 
         # Verify size calculation is correct (doesn't include .deleted)
         final_size = processor._calculate_total_directory_sizes()
-        # Should only count custom trash + source, not .deleted
-        expected_max = 400 + 400 + 400  # Two trash + one source max
         assert final_size <= 1024
 
-    def test_size_enforcement_final_size_verification(self, config, graceful_exit, logger, temp_dir, mocker):
+    def test_size_enforcement_final_size_verification(
+        self, config, graceful_exit, logger, temp_dir, mocker
+    ):
         """Test that cleanup actually achieves the target size threshold."""
         config.max_size = "1KB"  # 1024 bytes
         config.directory = temp_dir
@@ -2006,8 +2043,14 @@ class TestSizeBasedCleanup:
         def mock_parse_timestamp(filename):
             return datetime(2023, 1, 1, 12, 0, 0)
 
-        mocker.patch.object(FileDiscovery, '_parse_timestamp', side_effect=mock_parse_timestamp)
-        mocker.patch.object(FileDiscovery, '_parse_timestamp_from_archived_filename', side_effect=mock_parse_timestamp)
+        mocker.patch.object(
+            FileDiscovery, "_parse_timestamp", side_effect=mock_parse_timestamp
+        )
+        mocker.patch.object(
+            FileDiscovery,
+            "_parse_timestamp_from_archived_filename",
+            side_effect=mock_parse_timestamp,
+        )
 
         # Real file removal
         def mock_remove_file(file_path, *args, **kwargs):
@@ -2018,7 +2061,10 @@ class TestSizeBasedCleanup:
             except Exception:
                 return 0
 
-        mocker.patch("src.archiver.file_manager.FileManager.remove_file", side_effect=mock_remove_file)
+        mocker.patch(
+            "src.archiver.file_manager.FileManager.remove_file",
+            side_effect=mock_remove_file,
+        )
 
         # Run cleanup
         processor.size_based_cleanup(set())
@@ -2029,9 +2075,13 @@ class TestSizeBasedCleanup:
 
         # Should have removed enough files to get under limit
         removed_count = len([f for f in files_data if not f[0].exists()])
-        assert removed_count >= 2  # Should remove at least 2 files to get from 2100 to <=1024
+        assert (
+            removed_count >= 2
+        )  # Should remove at least 2 files to get from 2100 to <=1024
 
-    def test_size_based_cleanup_ignores_age_thresholds(self, config, graceful_exit, logger, temp_dir, mocker):
+    def test_size_based_cleanup_ignores_age_thresholds(
+        self, config, graceful_exit, logger, temp_dir, mocker
+    ):
         """Test that size-based cleanup ignores age thresholds and removes oldest files first."""
         config.max_size = "1KB"
         config.older_than = 30  # 30 days
@@ -2049,7 +2099,7 @@ class TestSizeBasedCleanup:
 
         # Create files with different ages
         recent_time = datetime.now() - timedelta(days=15)  # Recent file
-        old_time = datetime.now() - timedelta(days=45)    # Old file
+        old_time = datetime.now() - timedelta(days=45)  # Old file
 
         # Create files (both recent and old files will be considered during size-based cleanup)
         recent_trash = input_trash / "recent_trash.mp4"
@@ -2062,7 +2112,14 @@ class TestSizeBasedCleanup:
         old_source = temp_dir / "old_source.mp4"
 
         # Create all files with 300 bytes each
-        for file in [recent_trash, recent_archived, recent_source, old_trash, old_archived, old_source]:
+        for file in [
+            recent_trash,
+            recent_archived,
+            recent_source,
+            old_trash,
+            old_archived,
+            old_source,
+        ]:
             with file.open("w") as f:
                 f.write("x" * 300)
 
@@ -2083,8 +2140,14 @@ class TestSizeBasedCleanup:
                 return old_time
             return datetime(2023, 1, 1, 12, 0, 0)
 
-        mocker.patch.object(FileDiscovery, '_parse_timestamp', side_effect=mock_parse_timestamp)
-        mocker.patch.object(FileDiscovery, '_parse_timestamp_from_archived_filename', side_effect=mock_parse_archived)
+        mocker.patch.object(
+            FileDiscovery, "_parse_timestamp", side_effect=mock_parse_timestamp
+        )
+        mocker.patch.object(
+            FileDiscovery,
+            "_parse_timestamp_from_archived_filename",
+            side_effect=mock_parse_archived,
+        )
 
         # Track what gets removed
         removed_files = []
@@ -2093,7 +2156,10 @@ class TestSizeBasedCleanup:
             removed_files.append(str(file_path))
             return 300
 
-        mocker.patch("src.archiver.file_manager.FileManager.remove_file", side_effect=mock_remove_file)
+        mocker.patch(
+            "src.archiver.file_manager.FileManager.remove_file",
+            side_effect=mock_remove_file,
+        )
 
         # Run cleanup
         processor.size_based_cleanup(set())
@@ -2109,14 +2175,19 @@ class TestSizeBasedCleanup:
         # Since size-based cleanup ignores age thresholds, it should remove files
         # based on priority (trash first, then archived, then source) and oldest first
         # to stay under the size limit
-        assert len(removed_paths) > 0  # At least some files should be removed to meet size limit
+        assert (
+            len(removed_paths) > 0
+        )  # At least some files should be removed to meet size limit
 
         # Trash files should be removed first (regardless of age) during size-based cleanup
         trash_removed = [p for p in removed_paths if "trash" in p]
-        assert len(trash_removed) > 0  # At least some trash files should be removed first
+        assert (
+            len(trash_removed) > 0
+        )  # At least some trash files should be removed first
 
-
-    def test_comprehensive_size_based_cleanup_behavior(self, config, graceful_exit, logger, temp_dir, mocker):
+    def test_comprehensive_size_based_cleanup_behavior(
+        self, config, graceful_exit, logger, temp_dir, mocker
+    ):
         """Comprehensive test to validate size-based cleanup behavior.
 
         This test verifies that:
@@ -2148,10 +2219,18 @@ class TestSizeBasedCleanup:
 
         # Create files in different categories with different ages
         # Trash files (highest priority for removal)
-        old_trash_input = config.trash_root / "input" / f"REO_old_{old_timestamp_str}.mp4"
-        recent_trash_input = config.trash_root / "input" / f"REO_recent_{recent_timestamp_str}.mp4"
-        old_trash_output = config.trash_root / "output" / f"archived-{old_timestamp_str}_copy.mp4"
-        recent_trash_output = config.trash_root / "output" / f"archived-{recent_timestamp_str}_copy.mp4"
+        old_trash_input = (
+            config.trash_root / "input" / f"REO_old_{old_timestamp_str}.mp4"
+        )
+        recent_trash_input = (
+            config.trash_root / "input" / f"REO_recent_{recent_timestamp_str}.mp4"
+        )
+        old_trash_output = (
+            config.trash_root / "output" / f"archived-{old_timestamp_str}_copy.mp4"
+        )
+        recent_trash_output = (
+            config.trash_root / "output" / f"archived-{recent_timestamp_str}_copy.mp4"
+        )
 
         # Archived files (medium priority for removal)
         old_archived = config.output / f"archived-{old_timestamp_str}.mp4"
@@ -2163,12 +2242,18 @@ class TestSizeBasedCleanup:
 
         # Create all files with 500 bytes each
         all_files = [
-            old_trash_input, recent_trash_input, old_trash_output, recent_trash_output,
-            old_archived, recent_archived, old_source, recent_source
+            old_trash_input,
+            recent_trash_input,
+            old_trash_output,
+            recent_trash_output,
+            old_archived,
+            recent_archived,
+            old_source,
+            recent_source,
         ]
 
         for file_path in all_files:
-            with open(file_path, 'w') as f:
+            with open(file_path, "w") as f:
                 f.write("x" * 500)  # 500 bytes each
 
         processor = FileProcessor(config, logger, graceful_exit)
@@ -2188,8 +2273,14 @@ class TestSizeBasedCleanup:
                 return recent_time
             return datetime(2023, 1, 1, 12, 0, 0)
 
-        mocker.patch.object(FileDiscovery, '_parse_timestamp', side_effect=mock_parse_timestamp)
-        mocker.patch.object(FileDiscovery, '_parse_timestamp_from_archived_filename', side_effect=mock_parse_archived)
+        mocker.patch.object(
+            FileDiscovery, "_parse_timestamp", side_effect=mock_parse_timestamp
+        )
+        mocker.patch.object(
+            FileDiscovery,
+            "_parse_timestamp_from_archived_filename",
+            side_effect=mock_parse_archived,
+        )
 
         # Track what gets removed
         removed_files = []
@@ -2198,7 +2289,10 @@ class TestSizeBasedCleanup:
             removed_files.append(str(file_path))
             return 500  # Return file size
 
-        mocker.patch("src.archiver.file_manager.FileManager.remove_file", side_effect=mock_remove_file)
+        mocker.patch(
+            "src.archiver.file_manager.FileManager.remove_file",
+            side_effect=mock_remove_file,
+        )
 
         # Run size-based cleanup
         processor.size_based_cleanup(set())
@@ -2214,10 +2308,6 @@ class TestSizeBasedCleanup:
         assert len(removed_paths) > 0, "At least some files should have been removed"
 
         # Since trash files have highest priority, some trash files should be removed first
-        trash_removed = [p for p in removed_paths if "trash" in p]
-        archived_removed = [p for p in removed_paths if "archived" in p and "trash" not in p]
-        source_removed = [p for p in removed_paths if "trash" not in p and "archived" not in p]
-
         # Verify that the cleanup prioritized correctly
         # (Note: actual behavior depends on implementation details)
         print(f"Removed {len(removed_paths)} files: {removed_paths}")
@@ -3205,3 +3295,338 @@ class TestFixtureIntegration:
         assert processor.logger == logger
         assert hasattr(logger, "info")
         assert hasattr(logger, "error")
+
+
+class TestRenovatedCleanupFunctionality:
+    """Test the renovated cleanup functionality with unified approaches."""
+
+    def test_cleanup_rules_creation(self, config):
+        """Test creation of CleanupRules object."""
+        rules = CleanupRules(
+            max_size=1024, older_than_days=30, clean_output=True, is_size_based=False
+        )
+
+        assert rules.max_size == 1024
+        assert rules.older_than_days == 30
+        assert rules.clean_output is True
+        assert rules.is_size_based is False
+
+    def test_cleanup_rules_age_based_inclusion(self, config, temp_dir):
+        """Test CleanupRules should_include_file with age-based logic."""
+        # Create a rule with age-based logic
+        rules = CleanupRules(
+            max_size=1024, older_than_days=30, clean_output=True, is_size_based=False
+        )
+
+        # Create timestamps: one old (should be included), one recent (should not be included)
+        old_timestamp = datetime.now() - timedelta(days=45)  # Older than 30 days
+        recent_timestamp = datetime.now() - timedelta(
+            days=15
+        )  # More recent than 30 days
+
+        # Old file should be included
+        assert rules.should_include_file(old_timestamp) is True
+
+        # Recent file should not be included
+        assert rules.should_include_file(recent_timestamp) is False
+
+    def test_cleanup_rules_size_based_inclusion(self, config, temp_dir):
+        """Test CleanupRules should_include_file with size-based logic."""
+        # Create a rule with size-based logic
+        rules = CleanupRules(
+            max_size=1024, older_than_days=30, clean_output=True, is_size_based=True
+        )
+
+        # Create timestamps: both should be included regardless of age
+        old_timestamp = datetime.now() - timedelta(days=45)  # Older than 30 days
+        recent_timestamp = datetime.now() - timedelta(
+            days=15
+        )  # More recent than 30 days
+
+        # Both files should be included since age is ignored in size-based mode
+        assert rules.should_include_file(old_timestamp) is True
+        assert rules.should_include_file(recent_timestamp) is True
+
+    def test_cleanup_file_creation(self, temp_dir):
+        """Test creation of CleanupFile object."""
+        test_file = temp_dir / "test.mp4"
+        test_file.touch()
+
+        cleanup_file = CleanupFile(
+            path=test_file, timestamp=datetime.now(), priority=1, location_type="trash"
+        )
+
+        assert cleanup_file.path == test_file
+        assert cleanup_file.priority == 1
+        assert cleanup_file.location_type == "trash"
+
+    def test_cleanup_file_inclusion_logic_age_based(self, temp_dir):
+        """Test CleanupFile should_include_in_cleanup with age-based logic."""
+        test_file = temp_dir / "test.mp4"
+        test_file.touch()
+
+        # Create a config with age threshold
+        from unittest.mock import MagicMock
+
+        mock_config = MagicMock()
+        mock_config.older_than = 30
+
+        # Create an old file (should be included)
+        old_timestamp = datetime.now() - timedelta(days=45)
+        old_cleanup_file = CleanupFile(
+            path=test_file, timestamp=old_timestamp, priority=1, location_type="trash"
+        )
+
+        # Should be included in age-based cleanup
+        assert (
+            old_cleanup_file.should_include_in_cleanup(mock_config, is_size_based=False)
+            is True
+        )
+
+        # Create a recent file (should not be included in age-based cleanup)
+        recent_timestamp = datetime.now() - timedelta(days=15)
+        recent_cleanup_file = CleanupFile(
+            path=test_file,
+            timestamp=recent_timestamp,
+            priority=1,
+            location_type="trash",
+        )
+
+        # Should not be included in age-based cleanup
+        assert (
+            recent_cleanup_file.should_include_in_cleanup(
+                mock_config, is_size_based=False
+            )
+            is False
+        )
+
+    def test_cleanup_file_inclusion_logic_size_based(self, temp_dir):
+        """Test CleanupFile should_include_in_cleanup with size-based logic."""
+        test_file = temp_dir / "test.mp4"
+        test_file.touch()
+
+        # Create a config with age threshold
+        from unittest.mock import MagicMock
+
+        mock_config = MagicMock()
+        mock_config.older_than = 30
+
+        # Create both old and recent files
+        old_timestamp = datetime.now() - timedelta(days=45)
+        recent_timestamp = datetime.now() - timedelta(days=15)
+
+        old_cleanup_file = CleanupFile(
+            path=test_file, timestamp=old_timestamp, priority=1, location_type="trash"
+        )
+
+        recent_cleanup_file = CleanupFile(
+            path=test_file,
+            timestamp=recent_timestamp,
+            priority=1,
+            location_type="trash",
+        )
+
+        # Both should be included in size-based cleanup (age ignored)
+        assert (
+            old_cleanup_file.should_include_in_cleanup(mock_config, is_size_based=True)
+            is True
+        )
+        assert (
+            recent_cleanup_file.should_include_in_cleanup(
+                mock_config, is_size_based=True
+            )
+            is True
+        )
+
+    def test_strategy_pattern_implementation(self):
+        """Test the strategy pattern for cleanup strategies."""
+        # Test that abstract base class exists and is abstract
+        assert issubclass(CleanupStrategy, object)
+
+        # Test age-based strategy
+        age_strategy = AgeBasedCleanupStrategy()
+        assert isinstance(age_strategy, CleanupStrategy)
+
+        # Test size-based strategy
+        size_strategy = SizeBasedCleanupStrategy()
+        assert isinstance(size_strategy, CleanupStrategy)
+
+    def test_unified_collection_method_exists(self, config, logger, graceful_exit):
+        """Test that the unified collection method exists."""
+        processor = FileProcessor(config, logger, graceful_exit)
+
+        # Check that the new unified method exists
+        assert hasattr(processor, "_collect_files_from_location")
+        assert hasattr(processor, "_collect_files_for_cleanup_unified")
+
+    def test_unified_validation_method_exists(self, config, logger, graceful_exit):
+        """Test that the unified validation method exists."""
+        processor = FileProcessor(config, logger, graceful_exit)
+
+        # Check that the new unified validation methods exist
+        assert hasattr(processor, "_validate_and_filter_files")
+        assert hasattr(processor, "_is_valid_for_cleanup")
+
+    def test_cleanup_configuration_object_integration(
+        self, config, logger, graceful_exit
+    ):
+        """Test integration of the cleanup configuration object."""
+
+        # Test creating a CleanupRules object with processor config
+        rules = CleanupRules(
+            max_size=2048 if config.max_size else None,
+            older_than_days=config.older_than,
+            clean_output=config.clean_output,
+            is_size_based=True,
+        )
+
+        assert rules.older_than_days == config.older_than
+        assert rules.clean_output == config.clean_output
+
+    def test_unified_cleanup_pipeline_method_exists(
+        self, config, logger, graceful_exit
+    ):
+        """Test that the unified cleanup pipeline method exists."""
+        processor = FileProcessor(config, logger, graceful_exit)
+
+        # Check that the new unified cleanup method exists
+        assert hasattr(processor, "_execute_unified_cleanup")
+
+
+class TestUnifiedCollectionMethod:
+    """Test the unified collection method functionality."""
+
+    def test_collect_files_from_location_with_different_types(
+        self, config, logger, graceful_exit, temp_dir, mocker
+    ):
+        """Test _collect_files_from_location with different location types."""
+        processor = FileProcessor(config, logger, graceful_exit)
+
+        # Create a test directory
+        test_dir = temp_dir / "test_loc"
+        test_dir.mkdir()
+
+        # Create test files with proper naming for timestamp parsing
+        old_file = test_dir / "REO_front_01_20230101120000.mp4"
+        old_file.touch()
+
+        # Mock the timestamp parsing to return a known timestamp
+        mock_ts = datetime(2023, 1, 1, 12, 0, 0)
+        mocker.patch(
+            "src.archiver.discovery.FileDiscovery._parse_timestamp",
+            return_value=mock_ts,
+        )
+
+        # Test collecting from source location
+        files = processor._collect_files_from_location(
+            test_dir, 1, "source", include_age_filter=False
+        )
+
+        assert len(files) == 1
+        ts, priority, path = files[0]
+        assert ts == mock_ts
+        assert priority == 1
+        assert path == old_file
+
+    def test_collect_files_from_location_with_archived_type(
+        self, config, logger, graceful_exit, temp_dir, mocker
+    ):
+        """Test _collect_files_from_location with archived location type."""
+        processor = FileProcessor(config, logger, graceful_exit)
+
+        # Create a test directory
+        test_dir = temp_dir / "archived"
+        test_dir.mkdir()
+
+        # Create test file with archived naming
+        archived_file = test_dir / "archived-20230101120000.mp4"
+        archived_file.touch()
+
+        # Mock the archived timestamp parsing to return a known timestamp
+        mock_ts = datetime(2023, 1, 1, 12, 0, 0)
+        mocker.patch(
+            "src.archiver.discovery.FileDiscovery._parse_timestamp_from_archived_filename",
+            return_value=mock_ts,
+        )
+
+        # Test collecting from archived location
+        files = processor._collect_files_from_location(
+            test_dir, 2, "archived", include_age_filter=False
+        )
+
+        assert len(files) == 1
+        ts, priority, path = files[0]
+        assert ts == mock_ts
+        assert priority == 2
+        assert path == archived_file
+
+
+class TestUnifiedValidationMethod:
+    """Test the unified validation method functionality."""
+
+    def test_validate_and_filter_files(
+        self, config, logger, graceful_exit, temp_dir, mocker
+    ):
+        """Test _validate_and_filter_files method."""
+        processor = FileProcessor(config, logger, graceful_exit)
+
+        # Create test files with timestamps
+        mock_ts = datetime(2023, 1, 1, 12, 0, 0)
+        test_file = temp_dir / "test.mp4"
+        test_file.touch()
+
+        # Create a list of files to validate
+        files_to_validate = [(mock_ts, 1, test_file)]
+
+        # Mock the validation method to always return True
+        mocker.patch.object(processor, "_is_valid_for_cleanup", return_value=True)
+
+        validated_files = processor._validate_and_filter_files(
+            files_to_validate, config
+        )
+
+        assert len(validated_files) == 1
+        assert validated_files[0] == (mock_ts, 1, test_file)
+
+    def test_is_valid_for_cleanup(
+        self, config, logger, graceful_exit, temp_dir, mocker
+    ):
+        """Test _is_valid_for_cleanup method."""
+        processor = FileProcessor(config, logger, graceful_exit)
+
+        # Create test file with timestamp
+        mock_ts = datetime(2023, 1, 1, 12, 0, 0)
+        test_file = temp_dir / "test.mp4"
+        test_file.touch()
+
+        # Mock the skip methods to return False (don't skip)
+        mocker.patch.object(
+            processor, "_should_skip_file_for_cleanup", return_value=False
+        )
+        mocker.patch.object(
+            processor, "_should_skip_file_due_to_age_for_cleanup", return_value=False
+        )
+
+        # Test that a valid file passes validation
+        is_valid = processor._is_valid_for_cleanup((mock_ts, 1, test_file), config)
+        assert is_valid is True
+
+    def test_is_valid_for_cleanup_with_skip_conditions(
+        self, config, logger, graceful_exit, temp_dir, mocker
+    ):
+        """Test _is_valid_for_cleanup with skip conditions."""
+        processor = FileProcessor(config, logger, graceful_exit)
+
+        # Create test file with timestamp
+        mock_ts = datetime(2023, 1, 1, 12, 0, 0)
+        test_file = temp_dir / "test.mp4"
+        test_file.touch()
+
+        # Mock the skip methods to return True (skip)
+        mocker.patch.object(
+            processor, "_should_skip_file_for_cleanup", return_value=True
+        )
+
+        # Test that a file that should be skipped fails validation
+        is_valid = processor._is_valid_for_cleanup((mock_ts, 1, test_file), config)
+        assert is_valid is False

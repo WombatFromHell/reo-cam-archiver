@@ -22,7 +22,7 @@ class Config:
         self.clean_output: bool = args.clean_output
         # Use --older-than argument (default is 30, set by argparse)
         self.older_than: int = args.older_than
-        self.max_size: Optional[str] = getattr(args, "max_size", None)
+        self.max_size: Optional[str] = args.max_size
         self.log_file: Optional[Path] = (
             Path(args.log_file) if args.log_file else self.directory / "archiver.log"
         )
@@ -58,7 +58,11 @@ def parse_args(args: Optional[list] = None) -> argparse.Namespace:
         default="/camera",
         help="Input directory containing camera footage (defaults to /camera)",
     )
-    parser.add_argument("-o", "--output", help="Output directory for archived footage")
+    parser.add_argument(
+        "-o",
+        "--output",
+        help="Output directory for archived footage (defaults to /camera/archived)",
+    )
     parser.add_argument(
         "--dry-run",
         action="store_true",
@@ -100,6 +104,7 @@ def parse_args(args: Optional[list] = None) -> argparse.Namespace:
     parser.add_argument(
         "--max-size",
         type=str,
+        default="1TB",
         help="Maximum size for cleanup (e.g., 500GB, 1TB) - deletes oldest files first when exceeded",
     )
     parser.add_argument("--log-file", help="Log file path")

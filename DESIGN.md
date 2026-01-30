@@ -235,7 +235,7 @@ Orchestrates the file processing workflow, generating action plans and executing
 - Contains logic to process files with timestamp-based filtering
 - Implements proper exception handling during batch removal operations
 - Includes orphaned JPG file detection and removal functionality
-- Supports size-based cleanup with configurable priority ordering
+- Supports size-based cleanup with configurable priority ordering and age threshold handling
 - Provides comprehensive error handling for various processing failure scenarios
 - Includes detailed logging for processing operations and cleanup processes
 - Implements `_calculate_age_cutoff()` for age cutoff calculation
@@ -269,8 +269,8 @@ Orchestrates the file processing workflow, generating action plans and executing
 - Implements `_should_skip_file_for_cleanup()` for file skip logic
 - Uses `_is_file_in_trash_directory()` for trash directory detection
 - Implements `_is_file_in_output_directory_when_not_cleaning_output()` for output directory detection
-- Uses `_should_skip_file_due_to_age_for_cleanup()` for age-based skip logic
-- Implements `_collect_source_files_for_cleanup()` for source file collection
+- Uses `_should_skip_file_due_to_age_for_cleanup()` for age-based skip logic with size-based override capability
+- Implements `_collect_source_files_for_cleanup()` for source file collection (excludes output directory files regardless of clean_output setting)
 - Uses `_remove_file_for_cleanup()` for file removal
 - Implements `_parse_max_size_with_error_handling()` for max size parsing
 - Uses `_calculate_total_directory_sizes()` for total size calculation
@@ -278,12 +278,31 @@ Orchestrates the file processing workflow, generating action plans and executing
 - Uses `_get_archived_directory_size()` for archived size calculation
 - Implements `_is_cleanup_needed()` for cleanup need detection
 - Uses `_perform_cleanup_operations()` for cleanup operations
-- Implements `_collect_all_files_for_cleanup()` for file collection
-- Uses `_collect_trash_files_for_cleanup()` for trash file collection
-- Implements `_collect_archived_files_for_cleanup()` for archived file collection
-- Uses `_sort_files_by_priority_and_age()` for file sorting
-- Implements `_remove_files_until_under_limit()` for file removal
+- Implements `_collect_all_files_for_cleanup()` for file collection with size-based cleanup flag
+- Uses `_collect_trash_files_for_cleanup()` for trash file collection (excludes age filtering)
+- Implements `_collect_archived_files_for_cleanup()` for archived file collection (respects clean_output flag)
+- Uses `_sort_files_by_priority_and_age()` for file sorting with priority order: trash (1) → source (2) → archived (3)
+- Implements `_remove_files_until_under_limit()` for file removal that stops when size threshold is satisfied
 - Uses `_log_cleanup_results()` for cleanup results logging
+
+### Renovated Cleanup Functionality
+
+The cleanup functionality has been enhanced with several architectural improvements:
+
+- **Unified File Collection Method**: Created `_collect_files_from_location()` method that consolidates file collection logic across different locations with consistent logic
+- **Strategy Pattern Implementation**: Introduced `CleanupStrategy` abstract base class with concrete implementations:
+  - `AgeBasedCleanupStrategy`: Implements age-based cleanup logic
+  - `SizeBasedCleanupStrategy`: Implements size-based cleanup logic (ignoring age thresholds)
+- **Unified File Metadata Class**: Created `CleanupFile` dataclass that encapsulates priority, age, and location information with unified inclusion logic
+- **Consolidated Validation and Filtering**: Added `_validate_and_filter_files()` and `_is_valid_for_cleanup()` methods to apply all validation and filtering rules in one place
+- **Cleanup Configuration Object**: Created `CleanupRules` dataclass that encapsulates all cleanup rules and configuration parameters (max_size, older_than_days, clean_output, is_size_based)
+- **Refactored Collection Methods**: Improved complexity of `_collect_files_from_location()` by extracting helper methods:
+  - `_get_age_cutoff_for_collection()`: Gets age cutoff for file collection based on configuration
+  - `_process_file_for_collection()`: Processes a single file for collection and returns file info if it should be included
+  - `_parse_timestamp_by_location_type()`: Parses timestamp based on the location type
+- **Alternative Unified Approach**: Created `_collect_files_for_cleanup_unified()` as an alternative implementation that uses the new unified collection approach while preserving the original methods for compatibility
+- **Improved Error Handling**: Enhanced error handling in `_remove_file_for_cleanup()` with proper return value calculation
+- **Maintained Backward Compatibility**: Original collection methods remain in use by the main flow to ensure stability while providing new unified approaches as alternatives
 
 ### ProgressReporter
 
@@ -425,6 +444,43 @@ flowchart TD
     CleanupOrphans --> CleanEmptyDirs[Clean Empty Directories]
     CleanEmptyDirs --> End([End Processing])
 ```
+
+## Cleanup and Thresholding Logic
+
+The cleanup functionality implements sophisticated file management with configurable thresholds and priority-based removal:
+
+### Size-Based vs Age-Based Cleanup
+
+- **Size-based cleanup** (`--max-size`): Prioritizes staying under size limits over age thresholds; removes oldest files first to satisfy size constraints
+- **Age-based cleanup** (`--older-than`): Removes files based solely on age, regardless of size limits
+- **Combined cleanup**: When both flags are specified, size threshold takes precedence during size-based cleanup, but age thresholds still apply to age-based operations
+
+### File Priority System
+
+Files are removed in strict priority order during size-based cleanup:
+
+1. **Trash files** (priority 1): Always eligible for removal, no age filtering applied
+2. **Source files** (priority 2): Eligible for removal based on age thresholds
+3. **Archived files** (priority 3): Most protected, only removed when `--clean-output` is specified and size threshold requires it
+
+### Directory-Specific Behavior
+
+- **Input directory** (`/camera/...`): Files subject to age threshold filtering during cleanup
+- **Output directory** (`/camera/archived/...`): Only processed when `--clean-output` flag is enabled
+- **Trash directory** (`/camera/.deleted/...`): Always eligible for cleanup, no age filtering
+
+### Size Threshold Enforcement
+
+- Continues removing files in priority order until total size falls below the specified limit
+- Removes oldest files first within each priority category
+- Stops removal process as soon as size threshold is satisfied
+- Maintains protection hierarchy even during aggressive size-based cleanup
+
+### Age Threshold Integration
+
+- **During size-based cleanup**: Age thresholds are ignored for trash files, but respected for source and archived files (when applicable)
+- **During age-based cleanup**: All files subject to age threshold filtering regardless of priority
+- **Conflict resolution**: Size threshold takes precedence when both thresholds are configured
 
 ## Test Design
 

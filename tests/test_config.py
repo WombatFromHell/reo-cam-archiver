@@ -209,7 +209,7 @@ class TestParseArgs:
                     "cleanup": False,
                     "clean_output": False,
                     "older_than": 30,
-                    "max_size": None,
+                    "max_size": "1TB",
                     "log_file": None,
                 },
             ),
@@ -261,7 +261,7 @@ class TestParseArgs:
                     "cleanup": False,
                     "clean_output": False,
                     "older_than": 30,  # Should still have default
-                    "max_size": None,
+                    "max_size": "1TB",
                     "log_file": None,
                 },
             ),

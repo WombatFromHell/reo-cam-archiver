@@ -3,6 +3,8 @@ File processing operations for the Camera Archiver application.
 """
 
 import logging
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
@@ -18,6 +20,81 @@ from .utils import (
     Timestamp,
     TimestampFileMapping,
 )
+
+
+class CleanupStrategy(ABC):
+    """Base class for cleanup strategies"""
+
+    @abstractmethod
+    def should_include_file(self, file_info, config) -> bool:
+        pass
+
+
+class AgeBasedCleanupStrategy(CleanupStrategy):
+    """Strategy for age-based cleanup"""
+
+    def should_include_file(self, file_info, config):
+        # Age-based logic here
+        _, _, file_path = file_info
+        # Extract timestamp from file_path using FileDiscovery methods
+        ts = FileDiscovery._parse_timestamp(file_path.name)
+        if not ts:
+            ts = FileDiscovery._parse_timestamp_from_archived_filename(file_path.name)
+
+        if not ts or config.older_than <= 0:
+            return True
+
+        age_cutoff = datetime.now() - timedelta(days=config.older_than)
+        return ts < age_cutoff  # Only include files older than threshold
+
+
+class SizeBasedCleanupStrategy(CleanupStrategy):
+    """Strategy for size-based cleanup (ignoring age)"""
+
+    def should_include_file(self, file_info, config):
+        # Size-based logic (ignore age) - always include for size-based removal consideration
+        return True
+
+
+@dataclass
+class CleanupRules:
+    """Encapsulates all cleanup rules and configuration"""
+
+    max_size: Optional[int]
+    older_than_days: int
+    clean_output: bool
+    is_size_based: bool
+
+    def should_include_file(self, file_timestamp: datetime) -> bool:
+        """Encapsulated inclusion logic"""
+        if self.is_size_based:
+            # For size-based cleanup, ignore age thresholds
+            return True
+        if self.older_than_days <= 0:
+            return True
+        age_cutoff = datetime.now() - timedelta(days=self.older_than_days)
+        return file_timestamp < age_cutoff
+
+
+@dataclass
+class CleanupFile:
+    """Unified file metadata class that encapsulates priority, age, and location"""
+
+    path: Path
+    timestamp: datetime
+    priority: int
+    location_type: str
+
+    def should_include_in_cleanup(self, config, is_size_based: bool = False):
+        """Unified inclusion logic"""
+        if is_size_based:
+            # For size-based cleanup, ignore age thresholds and always include
+            return True
+        # For age-based cleanup, respect age thresholds
+        if config.older_than <= 0:
+            return True
+        age_cutoff = datetime.now() - timedelta(days=config.older_than)
+        return self.timestamp < age_cutoff
 
 
 class FileProcessor:
@@ -577,6 +654,75 @@ class FileProcessor:
 
         return files_with_info
 
+    def _collect_files_from_location(
+        self,
+        directory: Path,
+        priority: int,
+        location_type: str,
+        include_age_filter: bool = True,
+    ):
+        """Unified method to collect files from different locations with consistent logic"""
+        if not directory.exists():
+            return []
+
+        age_cutoff = self._get_age_cutoff_for_collection(include_age_filter)
+        files_with_info = []
+
+        for file_path in directory.rglob("*.*"):
+            if not file_path.is_file():
+                continue
+
+            file_info = self._process_file_for_collection(
+                file_path, location_type, priority, age_cutoff, include_age_filter
+            )
+            if file_info:
+                files_with_info.append(file_info)
+
+        return files_with_info
+
+    def _get_age_cutoff_for_collection(self, include_age_filter: bool):
+        """Get age cutoff for file collection based on configuration"""
+        if include_age_filter and self.config.older_than > 0:
+            return datetime.now() - timedelta(days=self.config.older_than)
+        return None
+
+    def _process_file_for_collection(
+        self,
+        file_path: Path,
+        location_type: str,
+        priority: int,
+        age_cutoff,
+        include_age_filter: bool,
+    ):
+        """Process a single file for collection and return file info if it should be included"""
+        # Skip files that should be excluded from cleanup
+        if self._should_skip_file_for_cleanup(file_path):
+            return None
+
+        # Parse timestamp based on location type
+        ts = self._parse_timestamp_by_location_type(file_path.name, location_type)
+        if not ts:
+            return None
+
+        # Apply age threshold filtering if required
+        if include_age_filter:
+            if self._should_skip_file_due_to_age_for_cleanup(
+                ts, age_cutoff, is_size_based=False
+            ):
+                return None
+
+        return (ts, priority, file_path)
+
+    def _parse_timestamp_by_location_type(self, filename: str, location_type: str):
+        """Parse timestamp based on the location type"""
+        if location_type == "trash":
+            return FileDiscovery._parse_timestamp(filename)
+        elif location_type == "archived":
+            return FileDiscovery._parse_timestamp_from_archived_filename(filename)
+        elif location_type == "source":
+            return FileDiscovery._parse_timestamp(filename)
+        return None
+
     def _should_skip_file_for_cleanup(self, file_path: FilePath) -> bool:
         """Determine if a file should be skipped during cleanup collection."""
         return self._is_file_in_trash_directory(
@@ -616,6 +762,37 @@ class FileProcessor:
             return True
         return False
 
+    def _validate_and_filter_files(
+        self, files: List[Tuple[Timestamp, int, FilePath]], config
+    ) -> List[Tuple[Timestamp, int, FilePath]]:
+        """Apply all validation and filtering rules in one place"""
+        validated_files = []
+        for ts, priority, file_path in files:
+            if self._is_valid_for_cleanup((ts, priority, file_path), config):
+                validated_files.append((ts, priority, file_path))
+        return validated_files
+
+    def _is_valid_for_cleanup(
+        self, file_info: Tuple[Timestamp, int, FilePath], config
+    ) -> bool:
+        """Check if a file is valid for cleanup based on all criteria"""
+        ts, priority, file_path = file_info
+
+        # Check if file should be skipped for cleanup
+        if self._should_skip_file_for_cleanup(file_path):
+            return False
+
+        # For size-based cleanup, ignore age thresholds
+        is_size_based = True  # This would be passed as a parameter in practice
+        age_cutoff = None
+        if config.older_than > 0 and not is_size_based:
+            age_cutoff = datetime.now() - timedelta(days=config.older_than)
+
+        if self._should_skip_file_due_to_age_for_cleanup(ts, age_cutoff, is_size_based):
+            return False
+
+        return True
+
     def _collect_source_files_for_cleanup(
         self, is_size_based: bool = False
     ) -> List[Tuple[Timestamp, int, FilePath]]:
@@ -627,9 +804,9 @@ class FileProcessor:
         if self.config.older_than > 0:
             age_cutoff = datetime.now() - timedelta(days=self.config.older_than)
 
-        # Determine if we should exclude output directory from source file collection
-        exclude_output_dir = self.config.output is not None and not self.config.clean_output
-
+        # Always exclude output directory from source file collection
+        # The clean_output flag determines IF archived files are eligible for removal,
+        # not WHERE they get collected from
         for file_path in self.config.directory.rglob("*.*"):
             if not file_path.is_file():
                 continue
@@ -639,8 +816,8 @@ class FileProcessor:
                 if self._should_skip_file_for_cleanup(file_path):
                     continue
 
-                # Skip files in output directory if we're not cleaning output
-                if exclude_output_dir and self.config.output in file_path.parents:
+                # Always skip files in output directory - they are handled separately
+                if self.config.output and self.config.output in file_path.parents:
                     continue
 
                 ts = FileDiscovery._parse_timestamp(file_path.name)
@@ -648,7 +825,9 @@ class FileProcessor:
                     continue  # Skip files we can't parse timestamps for
 
                 # Skip files that are too new (respect age requirement)
-                if self._should_skip_file_due_to_age_for_cleanup(ts, age_cutoff, is_size_based):
+                if self._should_skip_file_due_to_age_for_cleanup(
+                    ts, age_cutoff, is_size_based
+                ):
                     continue
 
                 files_with_info.append(
@@ -681,10 +860,12 @@ class FileProcessor:
                 source_root=source_root,
             )
 
-            removed_size += file_size
             self.logger.info(
                 f"Removed {file_path} ({file_size} bytes) due to size-based cleanup"
             )
+
+            # Return the updated removed size
+            return removed_size + file_size
 
         except Exception as e:
             self.logger.error(f"Failed to remove {file_path} during size cleanup: {e}")
@@ -773,7 +954,22 @@ class FileProcessor:
         )
         self._log_cleanup_results(total_size, max_bytes, removed_size)
 
-    def _collect_all_files_for_cleanup(self, is_size_based: bool = False) -> List[Tuple[Timestamp, int, FilePath]]:
+    def _execute_unified_cleanup(self, max_bytes: int) -> None:
+        """Execute unified cleanup process."""
+        # Use the new unified collection approach
+        all_files_with_info = self._collect_files_for_cleanup_unified(
+            is_size_based=True
+        )
+        sorted_files = self._sort_files_by_priority_and_age(all_files_with_info)
+        total_size = self._calculate_total_directory_sizes()
+        removed_size = self._remove_files_until_under_limit(
+            sorted_files, total_size, max_bytes
+        )
+        self._log_cleanup_results(total_size, max_bytes, removed_size)
+
+    def _collect_all_files_for_cleanup(
+        self, is_size_based: bool = False
+    ) -> List[Tuple[Timestamp, int, FilePath]]:
         """Collect all files that are candidates for cleanup."""
         all_files_with_info = []
 
@@ -785,7 +981,9 @@ class FileProcessor:
         # Add archived files (priority 2 - second priority for removal)
         if self.config.output:
             archived_files = self._collect_archived_files_for_cleanup(is_size_based)
-            self.logger.debug(f"Collected {len(archived_files)} archived files for cleanup")
+            self.logger.debug(
+                f"Collected {len(archived_files)} archived files for cleanup"
+            )
             all_files_with_info.extend(archived_files)
 
         # Add source files from the input directory (priority 3 - lowest priority for removal)
@@ -795,7 +993,52 @@ class FileProcessor:
 
         return all_files_with_info
 
-    def _collect_trash_files_for_cleanup(self, is_size_based: bool = False) -> List[Tuple[Timestamp, int, FilePath]]:
+    def _collect_files_for_cleanup_unified(
+        self, is_size_based: bool = False
+    ) -> List[Tuple[Timestamp, int, FilePath]]:
+        """Unified method to collect all files for cleanup using the new approach."""
+        all_files_with_info = []
+
+        # Add trash files (priority 1 - highest priority for removal)
+        trash_root = self.config.trash_root or self.config.directory / ".deleted"
+        for trash_type in ["input", "output"]:
+            trash_dir = trash_root / trash_type
+            if trash_dir.exists():
+                # Trash files are always included regardless of age during size-based cleanup
+                include_age_filter = not is_size_based
+                trash_files = self._collect_files_from_location(
+                    trash_dir, 1, "trash", include_age_filter=include_age_filter
+                )
+                all_files_with_info.extend(trash_files)
+
+        # Add archived files (priority 3 - third priority for removal)
+        if self.config.output and self.config.clean_output:
+            # Only collect archived files if clean_output is enabled
+            include_age_filter = not is_size_based
+            archived_files = self._collect_files_from_location(
+                self.config.output, 3, "archived", include_age_filter=include_age_filter
+            )
+            all_files_with_info.extend(archived_files)
+
+        # Add source files from the input directory (priority 2 - second priority for removal)
+        include_age_filter = not is_size_based
+        source_files = self._collect_files_from_location(
+            self.config.directory, 2, "source", include_age_filter=include_age_filter
+        )
+        # Filter out files that are in output directory when not cleaning output
+        filtered_source_files = []
+        for ts, priority, file_path in source_files:
+            if not self._is_file_in_output_directory_when_not_cleaning_output(
+                file_path
+            ):
+                filtered_source_files.append((ts, priority, file_path))
+        all_files_with_info.extend(filtered_source_files)
+
+        return all_files_with_info
+
+    def _collect_trash_files_for_cleanup(
+        self, is_size_based: bool = False
+    ) -> List[Tuple[Timestamp, int, FilePath]]:
         """Collect trash files for cleanup (no age threshold filtering - trash files are always eligible for removal)."""
         trash_files = []
 
@@ -832,7 +1075,8 @@ class FileProcessor:
         """Collect archived files for cleanup with age threshold filtering."""
         files_with_info = []
 
-        if not self.config.output:
+        # Don't collect archived files if clean_output is not enabled
+        if not self.config.output or not self.config.clean_output:
             return files_with_info
 
         # Calculate age cutoff if specified (consistent with source file collection)
@@ -846,12 +1090,16 @@ class FileProcessor:
 
             try:
                 # Parse timestamp from archived files
-                ts = FileDiscovery._parse_timestamp_from_archived_filename(file_path.name)
+                ts = FileDiscovery._parse_timestamp_from_archived_filename(
+                    file_path.name
+                )
                 if not ts:
                     continue
 
                 # Apply age threshold filtering (consistent with source files)
-                if self._should_skip_file_due_to_age_for_cleanup(ts, age_cutoff, is_size_based):
+                if self._should_skip_file_due_to_age_for_cleanup(
+                    ts, age_cutoff, is_size_based
+                ):
                     continue
 
                 files_with_info.append((ts, 3, file_path))
