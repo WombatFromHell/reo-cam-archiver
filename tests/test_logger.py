@@ -9,8 +9,6 @@ import logging
 import os
 from pathlib import Path
 
-import pytest
-
 from src.archiver.config import Config
 from src.archiver.logger import Logger, ThreadSafeStreamHandler
 
@@ -138,98 +136,101 @@ class TestLoggerFileHandling:
 class TestLoggerLogRotation:
     """Test Logger log rotation functionality."""
 
-    @pytest.mark.parametrize(
-        "test_case",
-        [
-            {
-                "name": "no_backups",
-                "backup_files": [],
-                "expected_max": 0,
-            },
-            {
-                "name": "single_backup",
-                "backup_files": ["test.log.1"],
-                "expected_max": 1,
-            },
-            {
-                "name": "multiple_backups",
-                "backup_files": ["test.log.1", "test.log.3", "test.log.2"],
-                "expected_max": 3,
-            },
-            {
-                "name": "non_numeric_backups",
-                "backup_files": ["test.log.backup", "test.log.old", "test.log.1"],
-                "expected_max": 1,
-            },
-            {
-                "name": "mixed_backups",
-                "backup_files": [
-                    "test.log.5",
-                    "test.log.2",
-                    "test.log.old",
-                    "test.log.10",
-                ],
-                "expected_max": 10,
-            },
-        ],
-        ids=[
-            case["name"]
-            for case in [
-                {"name": "no_backups"},
-                {"name": "single_backup"},
-                {"name": "multiple_backups"},
-                {"name": "non_numeric_backups"},
-                {"name": "mixed_backups"},
-            ]
-        ],
-    )
-    def test_find_max_backup_number(self, temp_dir, test_case):
-        """Test _find_max_backup_number with various backup file scenarios."""
-        log_file = temp_dir / "test.log"
-
-        # Create backup files based on test case
-        for backup_file in test_case["backup_files"]:
-            (temp_dir / backup_file).touch()
-
-        max_backup = Logger._find_max_backup_number(log_file)
-        assert max_backup == test_case["expected_max"]
-
-    def test_rename_existing_backups(self, temp_dir):
-        """Test _rename_existing_backups functionality."""
-        log_file = temp_dir / "test.log"
-
-        # Create existing backup files
-        (temp_dir / "test.log.1").touch()
-        (temp_dir / "test.log.2").touch()
-
-        # Rename backups
-        Logger._rename_existing_backups(log_file, 2)
-
-        # Check that files were renamed correctly
-        # Original test.log.1 should be renamed to test.log.2
-        # Original test.log.2 should be renamed to test.log.3
-        assert not (temp_dir / "test.log.1").exists()  # Original .1 should be gone
-        assert (temp_dir / "test.log.2").exists()  # Original .1 renamed to .2
-        assert (temp_dir / "test.log.3").exists()  # Original .2 renamed to .3
-
-    def test_create_backup_and_new_log(self, temp_dir):
-        """Test _create_backup_and_new_log functionality."""
-        log_file = temp_dir / "test.log"
+    def test_rotate_log_files_basic(self, temp_dir):
+        """Test basic log file rotation functionality."""
+        log_file = temp_dir / "archiver.log"
 
         # Create original log file
         log_file.write_text("Original content")
 
-        # Create backup and new log
-        Logger._create_backup_and_new_log(log_file)
+        # Rotate the log files
+        Logger._rotate_log_files(log_file)
 
-        # Check that backup was created
-        backup_file = temp_dir / "test.log.1"
+        # Check that original file was moved to .0
+        backup_file = temp_dir / "archiver.log.0"
         assert backup_file.exists()
         assert backup_file.read_text() == "Original content"
 
-        # Check that new log file was created
+        # Check that original file no longer exists
+        assert not log_file.exists()
+
+    def test_rotate_log_files_with_existing_backups(self, temp_dir):
+        """Test log file rotation with existing backup files."""
+        log_file = temp_dir / "archiver.log"
+
+        # Create some existing backup files
+        (temp_dir / "archiver.log.0").write_text("Backup 0 content")
+        (temp_dir / "archiver.log.1").write_text("Backup 1 content")
+        (temp_dir / "archiver.log.2").write_text("Backup 2 content")
+
+        # Create original log file
+        log_file.write_text("New content")
+
+        # Rotate the log files
+        Logger._rotate_log_files(log_file)
+
+        # Check that files were shifted correctly
+        assert (temp_dir / "archiver.log.0").exists()
+        assert (temp_dir / "archiver.log.1").exists()
+        assert (temp_dir / "archiver.log.2").exists()
+        assert (temp_dir / "archiver.log.3").exists()
+
+        # Check content was preserved and shifted
+        assert (temp_dir / "archiver.log.0").read_text() == "New content"
+        assert (temp_dir / "archiver.log.1").read_text() == "Backup 0 content"
+        assert (temp_dir / "archiver.log.2").read_text() == "Backup 1 content"
+        assert (temp_dir / "archiver.log.3").read_text() == "Backup 2 content"
+
+        # Original file should no longer exist
+        assert not log_file.exists()
+
+    def test_rotate_log_files_removes_highest_number(self, temp_dir):
+        """Test that the highest numbered backup (9) is removed when rotating."""
+        log_file = temp_dir / "archiver.log"
+
+        # Create backup files from .0 to .9
+        for i in range(10):
+            (temp_dir / f"archiver.log.{i}").write_text(f"Backup {i} content")
+
+        # Create original log file
+        log_file.write_text("New content")
+
+        # Rotate the log files
+        Logger._rotate_log_files(log_file)
+
+        # Check that .9 file was removed and others shifted
+        assert (temp_dir / "archiver.log.0").exists()
+        assert (temp_dir / "archiver.log.1").exists()
+        assert (temp_dir / "archiver.log.2").exists()
+        assert (temp_dir / "archiver.log.3").exists()
+        assert (temp_dir / "archiver.log.4").exists()
+        assert (temp_dir / "archiver.log.5").exists()
+        assert (temp_dir / "archiver.log.6").exists()
+        assert (temp_dir / "archiver.log.7").exists()
+        assert (temp_dir / "archiver.log.8").exists()
+        assert (temp_dir / "archiver.log.9").exists()
+
+        # The original .9 file should be gone
+        assert (temp_dir / "archiver.log.9").read_text() == "Backup 8 content"
+
+        # Check that the new content is in .0
+        assert (temp_dir / "archiver.log.0").read_text() == "New content"
+
+        # Original file should no longer exist
+        assert not log_file.exists()
+
+    def test_rotate_log_file_creates_new_file(self, temp_dir):
+        """Test that _rotate_log_file creates a new log file if none exists."""
+        log_file = temp_dir / "archiver.log"
+
+        # Initially, no log file exists
+        assert not log_file.exists()
+
+        # Rotate (this should just create a new file)
+        Logger._rotate_log_file(log_file)
+
+        # Check that the file now exists
         assert log_file.exists()
-        assert log_file.read_text() == ""
 
     def test_create_new_log_file(self, temp_dir):
         """Test _create_new_log_file functionality."""
@@ -241,64 +242,24 @@ class TestLoggerLogRotation:
         # Check that file was created
         assert log_file.exists()
 
-    @pytest.mark.parametrize(
-        "test_case",
-        [
-            {
-                "name": "under_size_limit",
-                "content_size": "small",
-                "should_rotate": False,
-            },
-            {
-                "name": "over_size_limit",
-                "content_size": "large",
-                "should_rotate": True,
-            },
-            {
-                "name": "empty_file",
-                "content_size": "empty",
-                "should_rotate": False,
-            },
-        ],
-        ids=[
-            case["name"]
-            for case in [
-                {"name": "under_size_limit"},
-                {"name": "over_size_limit"},
-                {"name": "empty_file"},
-            ]
-        ],
-    )
-    def test_rotate_log_file(self, temp_dir, test_case):
-        """Test _rotate_log_file with various file size scenarios."""
-        log_file = temp_dir / "test.log"
+    def test_rotate_log_file_with_existing_file(self, temp_dir):
+        """Test _rotate_log_file with an existing log file."""
+        log_file = temp_dir / "archiver.log"
 
-        # Create log file with appropriate content based on test case
-        if test_case["content_size"] == "small":
-            log_file.write_text("Small content")
-        elif test_case["content_size"] == "large":
-            # Create large log file (over LOG_ROTATION_SIZE which is 4MB)
-            large_content = "x" * (5 * 1024 * 1024)  # 5MB
-            log_file.write_text(large_content)
-        elif test_case["content_size"] == "empty":
-            log_file.write_text("")
+        # Create original log file
+        log_file.write_text("Original content")
 
-        # Rotate
+        # Rotate the log file
         Logger._rotate_log_file(log_file)
 
-        if test_case["should_rotate"]:
-            # Check that rotation occurred
-            backup_file = temp_dir / "test.log.1"
-            assert backup_file.exists()
-            assert backup_file.stat().st_size > 0
+        # Check that original content was moved to .0
+        backup_file = temp_dir / "archiver.log.0"
+        assert backup_file.exists()
+        assert backup_file.read_text() == "Original content"
 
-            # Check that new log file was created
-            assert log_file.exists()
-            assert log_file.stat().st_size == 0
-        else:
-            # File should still exist and not be renamed
-            assert log_file.exists()
-            assert not (temp_dir / "test.log.1").exists()
+        # Check that a new empty log file was created
+        assert log_file.exists()
+        assert log_file.read_text() == ""
 
 
 class TestLoggerErrorHandling:

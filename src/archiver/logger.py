@@ -70,42 +70,33 @@ class Logger:
         return logger
 
     @staticmethod
-    def _find_max_backup_number(log_file_path) -> int:
-        """Find the highest backup number for existing backup files."""
-        max_backup_num = 0
-        for backup_path in log_file_path.parent.glob(f"{log_file_path.name}.*"):
-            if backup_path.is_file():
-                try:
-                    backup_num = int(backup_path.suffix[1:])
-                    max_backup_num = max(max_backup_num, backup_num)
-                except ValueError:
-                    continue
-        return max_backup_num
+    def _rotate_log_files(log_file_path) -> None:
+        """Rotate log files: archiver.log -> archiver.log.0, archiver.log.0 -> archiver.log.1, etc.
 
-    @staticmethod
-    def _rename_existing_backups(log_file_path, max_backup_num: int) -> None:
-        """Rename existing backup files to make room for new backup."""
-        for i in range(max_backup_num, 0, -1):
-            old_path = log_file_path.with_suffix(f"{log_file_path.suffix}.{i}")
-            new_path = log_file_path.with_suffix(f"{log_file_path.suffix}.{i + 1}")
-            if old_path.exists():
-                shutil.move(str(old_path), str(new_path))
+        This method implements the new rotation logic where:
+        1. Every invocation logs to archiver.log in the input directory
+        2. If there's an existing archiver.log, move it to archiver.log.0
+        3. If there are existing numbered logs (archiver.log.0 to archiver.log.9), shift them up by one
+        4. If there's a naming conflict (e.g., archiver.log.9 exists), delete the largest numbered log
+        """
+        # First, remove archiver.log.9 if it exists (the highest number we support)
+        max_log_path = log_file_path.with_suffix(f"{log_file_path.suffix}.9")
+        if max_log_path.exists():
+            max_log_path.unlink()  # Remove the file
 
-    @staticmethod
-    def _create_backup_and_new_log(log_file_path) -> None:
-        """Create backup of current log and create new empty log file."""
-        # Move current log to .1
-        backup_path = log_file_path.with_suffix(f"{log_file_path.suffix}.1")
-        shutil.move(str(log_file_path), str(backup_path))
+        # Shift all existing log files up by one number (8->9, 7->8, ..., 0->1)
+        for i in range(8, -1, -1):  # From 8 down to 0
+            current_path = log_file_path.with_suffix(f"{log_file_path.suffix}.{i}")
+            next_path = log_file_path.with_suffix(f"{log_file_path.suffix}.{i + 1}")
 
-        # Create new empty log file
-        try:
-            log_file_path.parent.mkdir(parents=True, exist_ok=True)
-            log_file_path.touch()
-        except (OSError, AttributeError):
-            # Handle cases where we can't create directory or file
-            # This could happen if log_file_path is a MagicMock or path doesn't exist
-            pass
+            if current_path.exists():
+                # Move current file to next number
+                shutil.move(str(current_path), str(next_path))
+
+        # Finally, move the current archiver.log to archiver.log.0
+        if log_file_path.exists():
+            backup_path = log_file_path.with_suffix(f"{log_file_path.suffix}.0")
+            shutil.move(str(log_file_path), str(backup_path))
 
     @staticmethod
     def _create_new_log_file(log_file_path) -> None:
@@ -120,17 +111,11 @@ class Logger:
 
     @staticmethod
     def _rotate_log_file(log_file_path) -> None:
-        """Rotate log file if it exceeds maximum size"""
-        from .utils import LOG_ROTATION_SIZE
+        """Rotate log file - every invocation logs to archiver.log, rotating existing files"""
+        # Always rotate the log files regardless of size
+        # This implements the new logic where every invocation gets its own log file
+        if log_file_path.exists():
+            Logger._rotate_log_files(log_file_path)
 
-        if log_file_path.exists() and log_file_path.stat().st_size > LOG_ROTATION_SIZE:
-            # Find existing backup files
-            max_backup_num = Logger._find_max_backup_number(log_file_path)
-
-            # Rename existing backups
-            Logger._rename_existing_backups(log_file_path, max_backup_num)
-
-            # Create backup and new log
-            Logger._create_backup_and_new_log(log_file_path)
-        elif not log_file_path.exists():
-            Logger._create_new_log_file(log_file_path)
+        # Always create a new empty log file after rotation
+        Logger._create_new_log_file(log_file_path)

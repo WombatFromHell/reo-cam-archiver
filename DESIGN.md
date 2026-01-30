@@ -44,6 +44,19 @@ graph TB
         utils --> helpers[Helper Functions]
         utils --> workflow[Workflow Functions]
     end
+
+    subgraph "Module Structure"
+        entry_py[entry.py] --> archiver_module[src/archiver/__init__.py]
+        archiver_module --> config_py[src/archiver/config.py]
+        archiver_module --> discovery_py[src/archiver/discovery.py]
+        archiver_module --> transcoder_py[src/archiver/transcoder.py]
+        archiver_module --> file_manager_py[src/archiver/file_manager.py]
+        archiver_module --> processor_py[src/archiver/processor.py]
+        archiver_module --> progress_py[src/archiver/progress.py]
+        archiver_module --> logger_py[src/archiver/logger.py]
+        archiver_module --> graceful_exit_py[src/archiver/graceful_exit.py]
+        archiver_module --> utils_py[src/archiver/utils.py]
+    end
 ```
 
 ## Core Data Structures and Constants
@@ -52,7 +65,7 @@ The application uses several key constants and type definitions:
 
 - **Constants**:
   - `MIN_ARCHIVE_SIZE_BYTES`: Minimum file size (1MB) to skip transcoding if archive already exists
-  - `LOG_ROTATION_SIZE`: Log file rotation threshold (4MB)
+  - `LOG_ROTATION_SIZE`: DEPRECATED - Log rotation now occurs on every invocation rather than based on size
   - `OUTPUT_LOCK`: Global threading lock for coordinating logging and progress updates
   - `DEFAULT_PROGRESS_WIDTH`: Default width for progress bars (30 characters)
   - `PROGRESS_UPDATE_INTERVAL`: Update interval for non-TTY output (5 seconds)
@@ -338,14 +351,14 @@ Provides thread-safe progress reporting with time estimates and visual progress 
 
 Sets up logging with rotation support and thread-safe console output.
 
-- Implements log file rotation based on size thresholds (4MB)
+- Implements log file rotation on every invocation (rather than size-based)
 - Includes thread-safe stream handler to coordinate with progress reporting
 - Handles log directory creation with error recovery
-- Supports multiple backup file management during rotation
+- Supports multiple backup file management during rotation (up to 9 backups: .0 to .9)
 - Provides file and console handlers with UTF-8 encoding
 - Uses ThreadSafeStreamHandler that coordinates with OUTPUT_LOCK to prevent interference with progress bars
-- Implements automatic log file rotation when size exceeds LOG_ROTATION_SIZE threshold
-- Manages log file backups by renaming existing backups in sequence (.1, .2, etc.)
+- Implements automatic log file rotation on every run by renaming existing files with numeric suffixes
+- Manages log file backups by renaming existing backups in sequence (.0, .1, .2, etc. up to .9)
 - Creates new empty log file after rotation
 - Clears existing handlers before setting up new ones to prevent duplicate log messages
 - Handles directory creation when log file's parent directory doesn't exist
@@ -362,11 +375,9 @@ Sets up logging with rotation support and thread-safe console output.
 - Uses strict typing for all methods and properties
 - Implements `emit()` for log record emission
 - Uses `setup()` for logger setup
-- Implements `_find_max_backup_number()` for backup number calculation
-- Uses `_rename_existing_backups()` for backup renaming
-- Implements `_create_backup_and_new_log()` for backup creation
+- Implements `_rotate_log_files()` for the new rotation logic that shifts files from .0 to .9
 - Uses `_create_new_log_file()` for new log file creation
-- Implements `_rotate_log_file()` for log file rotation
+- Implements `_rotate_log_file()` for log file rotation that calls the new rotation logic
 
 ### GracefulExit
 
@@ -870,6 +881,7 @@ The system accepts the following command-line arguments:
 - pyright for type checking
 - uv for package management
 - ffmpeg with QSV hardware acceleration support
+- zipapp for bundling the application into a single executable file
 
 ## Utility Functions
 
