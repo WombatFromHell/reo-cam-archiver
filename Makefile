@@ -40,3 +40,4 @@ clean:
 all: clean build
 
 .PHONY: build test lint prettier format radon quality clean all
+.SILENT: build test lint prettier format radon quality clean all

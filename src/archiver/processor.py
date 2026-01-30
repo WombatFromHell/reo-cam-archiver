@@ -56,6 +56,28 @@ class SizeBasedCleanupStrategy(CleanupStrategy):
         return True
 
 
+class CombinedCleanupStrategy(CleanupStrategy):
+    """Strategy for combined cleanup that applies age filtering first, then size-based prioritization"""
+
+    def should_include_file(self, file_info, config):
+        # First apply age-based filtering
+        _, _, file_path = file_info
+        # Extract timestamp from file_path using FileDiscovery methods
+        ts = FileDiscovery._parse_timestamp(file_path.name)
+        if not ts:
+            ts = FileDiscovery._parse_timestamp_from_archived_filename(file_path.name)
+
+        if not ts or config.older_than <= 0:
+            return True
+
+        age_cutoff = datetime.now() - timedelta(days=config.older_than)
+        # Only include files that meet the age threshold
+        if ts < age_cutoff:  # Only include files older than threshold
+            return True
+        else:
+            return False  # Exclude files that don't meet age threshold
+
+
 @dataclass
 class CleanupRules:
     """Encapsulates all cleanup rules and configuration"""
@@ -64,10 +86,17 @@ class CleanupRules:
     older_than_days: int
     clean_output: bool
     is_size_based: bool
+    use_combined_strategy: bool = False  # New flag to indicate combined strategy
 
     def should_include_file(self, file_timestamp: datetime) -> bool:
         """Encapsulated inclusion logic"""
-        if self.is_size_based:
+        if self.use_combined_strategy:
+            # For combined strategy, apply age threshold but allow size-based removal
+            if self.older_than_days <= 0:
+                return True
+            age_cutoff = datetime.now() - timedelta(days=self.older_than_days)
+            return file_timestamp < age_cutoff
+        elif self.is_size_based:
             # For size-based cleanup, ignore age thresholds
             return True
         if self.older_than_days <= 0:
@@ -794,14 +823,15 @@ class FileProcessor:
         return True
 
     def _collect_source_files_for_cleanup(
-        self, is_size_based: bool = False
+        self, is_size_based: bool = False, use_combined_strategy: bool = False
     ) -> List[Tuple[Timestamp, int, FilePath]]:
         """Collect source files that meet age requirements for cleanup"""
         files_with_info = []
 
-        # Calculate age cutoff if specified
+        # Determine if age filtering should be applied
+        apply_age_filter = not is_size_based or use_combined_strategy
         age_cutoff = None
-        if self.config.older_than > 0:
+        if apply_age_filter and self.config.older_than > 0:
             age_cutoff = datetime.now() - timedelta(days=self.config.older_than)
 
         # Always exclude output directory from source file collection
@@ -824,11 +854,14 @@ class FileProcessor:
                 if not ts:
                     continue  # Skip files we can't parse timestamps for
 
-                # Skip files that are too new (respect age requirement)
-                if self._should_skip_file_due_to_age_for_cleanup(
-                    ts, age_cutoff, is_size_based
-                ):
-                    continue
+                # Apply age threshold filtering based on strategy
+                if apply_age_filter and age_cutoff:
+                    if self._should_skip_file_due_to_age_for_cleanup(
+                        ts,
+                        age_cutoff,
+                        not use_combined_strategy,  # For combined strategy, don't ignore age
+                    ):
+                        continue
 
                 files_with_info.append(
                     (ts, 2, file_path)
@@ -893,7 +926,16 @@ class FileProcessor:
         total_size = self._calculate_total_directory_sizes()
 
         if self._is_cleanup_needed(total_size, max_bytes):
-            self._perform_cleanup_operations(total_size, max_bytes)
+            # Determine if we should use the combined strategy (both max_size and older_than specified)
+            use_combined_strategy = self.config.older_than > 0
+
+            # Perform cleanup with the appropriate strategy
+            if use_combined_strategy:
+                self._perform_cleanup_operations(
+                    total_size, max_bytes, use_combined_strategy=True
+                )
+            else:
+                self._perform_cleanup_operations(total_size, max_bytes)
 
     def _parse_max_size_with_error_handling(self) -> Optional[int]:
         """Parse max_size configuration with error handling."""
@@ -945,9 +987,14 @@ class FileProcessor:
         )
         return True
 
-    def _perform_cleanup_operations(self, total_size: int, max_bytes: int) -> None:
+    def _perform_cleanup_operations(
+        self, total_size: int, max_bytes: int, use_combined_strategy: bool = False
+    ) -> None:
         """Perform the actual cleanup operations."""
-        all_files_with_info = self._collect_all_files_for_cleanup(is_size_based=True)
+        all_files_with_info = self._collect_all_files_for_cleanup(
+            is_size_based=not use_combined_strategy,
+            use_combined_strategy=use_combined_strategy,
+        )
         sorted_files = self._sort_files_by_priority_and_age(all_files_with_info)
         removed_size = self._remove_files_until_under_limit(
             sorted_files, total_size, max_bytes
@@ -968,26 +1015,32 @@ class FileProcessor:
         self._log_cleanup_results(total_size, max_bytes, removed_size)
 
     def _collect_all_files_for_cleanup(
-        self, is_size_based: bool = False
+        self, is_size_based: bool = False, use_combined_strategy: bool = False
     ) -> List[Tuple[Timestamp, int, FilePath]]:
         """Collect all files that are candidates for cleanup."""
         all_files_with_info = []
 
         # Add trash files (priority 1 - highest priority for removal)
-        trash_files = self._collect_trash_files_for_cleanup(is_size_based)
+        trash_files = self._collect_trash_files_for_cleanup(
+            is_size_based, use_combined_strategy
+        )
         self.logger.debug(f"Collected {len(trash_files)} trash files for cleanup")
         all_files_with_info.extend(trash_files)
 
-        # Add archived files (priority 2 - second priority for removal)
+        # Add archived files (priority 3 - third priority for removal)
         if self.config.output:
-            archived_files = self._collect_archived_files_for_cleanup(is_size_based)
+            archived_files = self._collect_archived_files_for_cleanup(
+                is_size_based, use_combined_strategy
+            )
             self.logger.debug(
                 f"Collected {len(archived_files)} archived files for cleanup"
             )
             all_files_with_info.extend(archived_files)
 
-        # Add source files from the input directory (priority 3 - lowest priority for removal)
-        source_files = self._collect_source_files_for_cleanup(is_size_based)
+        # Add source files from the input directory (priority 2 - second priority for removal)
+        source_files = self._collect_source_files_for_cleanup(
+            is_size_based, use_combined_strategy
+        )
         self.logger.debug(f"Collected {len(source_files)} source files for cleanup")
         all_files_with_info.extend(source_files)
 
@@ -1037,13 +1090,14 @@ class FileProcessor:
         return all_files_with_info
 
     def _collect_trash_files_for_cleanup(
-        self, is_size_based: bool = False
+        self, is_size_based: bool = False, use_combined_strategy: bool = False
     ) -> List[Tuple[Timestamp, int, FilePath]]:
-        """Collect trash files for cleanup (no age threshold filtering - trash files are always eligible for removal)."""
+        """Collect trash files for cleanup."""
         trash_files = []
 
-        # Trash files are always eligible for removal regardless of age
-        # since they're already marked for deletion
+        # Determine if age filtering should be applied
+        apply_age_filter = use_combined_strategy and self.config.older_than > 0
+
         trash_root = self.config.trash_root or self.config.directory / ".deleted"
 
         for trash_type in ["input", "output"]:
@@ -1062,7 +1116,15 @@ class FileProcessor:
                     if not ts:
                         continue
 
-                    # Trash files are always included (no age filtering)
+                    # Apply age filtering if using combined strategy
+                    if apply_age_filter:
+                        age_cutoff = datetime.now() - timedelta(
+                            days=self.config.older_than
+                        )
+                        if ts >= age_cutoff:
+                            continue  # Skip files that don't meet age threshold
+
+                    # Trash files are included (with optional age filtering for combined strategy)
                     trash_files.append((ts, 1, file_path))
                 except Exception:
                     continue  # Skip files we can't process
@@ -1070,7 +1132,7 @@ class FileProcessor:
         return trash_files
 
     def _collect_archived_files_for_cleanup(
-        self, is_size_based: bool = False
+        self, is_size_based: bool = False, use_combined_strategy: bool = False
     ) -> List[Tuple[Timestamp, int, FilePath]]:
         """Collect archived files for cleanup with age threshold filtering."""
         files_with_info = []
@@ -1079,9 +1141,10 @@ class FileProcessor:
         if not self.config.output or not self.config.clean_output:
             return files_with_info
 
-        # Calculate age cutoff if specified (consistent with source file collection)
+        # Determine if age filtering should be applied
+        apply_age_filter = not is_size_based or use_combined_strategy
         age_cutoff = None
-        if self.config.older_than > 0:
+        if apply_age_filter and self.config.older_than > 0:
             age_cutoff = datetime.now() - timedelta(days=self.config.older_than)
 
         for file_path in self.config.output.rglob("*.*"):
@@ -1096,11 +1159,14 @@ class FileProcessor:
                 if not ts:
                     continue
 
-                # Apply age threshold filtering (consistent with source files)
-                if self._should_skip_file_due_to_age_for_cleanup(
-                    ts, age_cutoff, is_size_based
-                ):
-                    continue
+                # Apply age threshold filtering based on strategy
+                if apply_age_filter and age_cutoff:
+                    if self._should_skip_file_due_to_age_for_cleanup(
+                        ts,
+                        age_cutoff,
+                        not use_combined_strategy,  # For combined strategy, don't ignore age
+                    ):
+                        continue
 
                 files_with_info.append((ts, 3, file_path))
             except Exception:

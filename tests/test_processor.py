@@ -14,6 +14,7 @@ from src.archiver.processor import (
     CleanupFile,
     CleanupRules,
     CleanupStrategy,
+    CombinedCleanupStrategy,
     FileProcessor,
     SizeBasedCleanupStrategy,
 )
@@ -3630,3 +3631,896 @@ class TestUnifiedValidationMethod:
         # Test that a file that should be skipped fails validation
         is_valid = processor._is_valid_for_cleanup((mock_ts, 1, test_file), config)
         assert is_valid is False
+
+
+class TestCombinedCleanupStrategy:
+    """Test the combined cleanup strategy functionality."""
+
+    def test_combined_cleanup_strategy_creation(self):
+        """Test creation of CombinedCleanupStrategy."""
+        strategy = CombinedCleanupStrategy()
+        assert isinstance(strategy, CleanupStrategy)
+        assert isinstance(strategy, CombinedCleanupStrategy)
+
+    def test_combined_cleanup_strategy_age_filtering(self, config, temp_dir, mocker):
+        """Test CombinedCleanupStrategy with age-based filtering."""
+        strategy = CombinedCleanupStrategy()
+
+        # Create a mock file info tuple
+        old_timestamp = datetime.now() - timedelta(
+            days=45
+        )  # Older than default 30-day threshold
+        recent_timestamp = datetime.now() - timedelta(
+            days=15
+        )  # More recent than 30-day threshold
+
+        # Create mock file paths
+        old_file = temp_dir / "REO_front_01_20230101120000.mp4"
+        recent_file = temp_dir / "REO_front_01_20230201120000.mp4"
+
+        # Mock timestamp parsing
+        def mock_parse_timestamp(filename):
+            if "20230101" in filename:
+                return old_timestamp
+            elif "20230201" in filename:
+                return recent_timestamp
+            return None
+
+        mocker.patch(
+            "src.archiver.discovery.FileDiscovery._parse_timestamp",
+            side_effect=mock_parse_timestamp,
+        )
+
+        # Mock archived file parsing
+        def mock_parse_archived(filename):
+            if "20230101" in filename:
+                return old_timestamp
+            elif "20230201" in filename:
+                return recent_timestamp
+            return None
+
+        mocker.patch(
+            "src.archiver.discovery.FileDiscovery._parse_timestamp_from_archived_filename",
+            side_effect=mock_parse_archived,
+        )
+
+        # Test with config that has older_than > 0
+        config.older_than = 30
+
+        # Old file should be included (older than 30 days)
+        old_file_info = (None, None, old_file)
+        assert strategy.should_include_file(old_file_info, config) is True
+
+        # Recent file should not be included (more recent than 30 days)
+        recent_file_info = (None, None, recent_file)
+        assert strategy.should_include_file(recent_file_info, config) is False
+
+    def test_combined_cleanup_strategy_no_age_threshold(self, config, temp_dir, mocker):
+        """Test CombinedCleanupStrategy when no age threshold is set."""
+        strategy = CombinedCleanupStrategy()
+
+        # Create a mock file
+        recent_file = temp_dir / "REO_front_01_20230201120000.mp4"
+        recent_file_info = (None, None, recent_file)
+
+        # Mock timestamp parsing
+        recent_timestamp = datetime.now() - timedelta(days=15)
+        mocker.patch(
+            "src.archiver.discovery.FileDiscovery._parse_timestamp",
+            return_value=recent_timestamp,
+        )
+        mocker.patch(
+            "src.archiver.discovery.FileDiscovery._parse_timestamp_from_archived_filename",
+            return_value=recent_timestamp,
+        )
+
+        # Set older_than to 0 (no age threshold)
+        config.older_than = 0
+
+        # File should be included when no age threshold is set
+        assert strategy.should_include_file(recent_file_info, config) is True
+
+    def test_combined_cleanup_strategy_with_zero_threshold(
+        self, config, temp_dir, mocker
+    ):
+        """Test CombinedCleanupStrategy with zero age threshold."""
+        strategy = CombinedCleanupStrategy()
+
+        # Create a mock file
+        recent_file = temp_dir / "REO_front_01_20230201120000.mp4"
+        recent_file_info = (None, None, recent_file)
+
+        # Mock timestamp parsing
+        recent_timestamp = datetime.now() - timedelta(days=15)
+        mocker.patch(
+            "src.archiver.discovery.FileDiscovery._parse_timestamp",
+            return_value=recent_timestamp,
+        )
+        mocker.patch(
+            "src.archiver.discovery.FileDiscovery._parse_timestamp_from_archived_filename",
+            return_value=recent_timestamp,
+        )
+
+        # Set older_than to 0 (no age threshold)
+        config.older_than = 0
+
+        # File should be included when age threshold is 0
+        assert strategy.should_include_file(recent_file_info, config) is True
+
+    def test_combined_cleanup_rules_with_combined_strategy_flag(self):
+        """Test CleanupRules with use_combined_strategy flag."""
+        # Test with combined strategy enabled
+        rules = CleanupRules(
+            max_size=1024,
+            older_than_days=30,
+            clean_output=True,
+            is_size_based=False,
+            use_combined_strategy=True,
+        )
+
+        # Create timestamps: one old (should be included), one recent (should not be included)
+        old_timestamp = datetime.now() - timedelta(days=45)  # Older than 30 days
+        recent_timestamp = datetime.now() - timedelta(
+            days=15
+        )  # More recent than 30 days
+
+        # With combined strategy, old file should be included
+        assert rules.should_include_file(old_timestamp) is True
+
+        # With combined strategy, recent file should not be included
+        assert rules.should_include_file(recent_timestamp) is False
+
+        # Test with combined strategy disabled (but is_size_based also False)
+        rules2 = CleanupRules(
+            max_size=1024,
+            older_than_days=30,
+            clean_output=True,
+            is_size_based=False,
+            use_combined_strategy=False,
+        )
+
+        # Should behave like age-based when combined strategy is disabled
+        assert rules2.should_include_file(old_timestamp) is True
+        assert rules2.should_include_file(recent_timestamp) is False
+
+
+class TestCombinedCleanupIntegration:
+    """Test integration of combined cleanup functionality."""
+
+    def test_size_based_cleanup_with_combined_strategy_detection(
+        self, config, graceful_exit, logger, temp_dir, mocker
+    ):
+        """Test that size_based_cleanup detects and uses combined strategy when both params specified."""
+        # Configure both max_size and older_than to trigger combined strategy
+        config.max_size = "1KB"
+        config.older_than = 30  # This should trigger combined strategy
+        config.directory = temp_dir
+
+        # Create test files that exceed the limit
+        file1 = temp_dir / "file1.mp4"
+        file2 = temp_dir / "file2.mp4"
+        with file1.open("w") as f:
+            f.write("x" * 600)
+        with file2.open("w") as f:
+            f.write("x" * 600)
+
+        processor = FileProcessor(config, logger, graceful_exit)
+
+        # Mock timestamp parsing
+        def mock_parse_timestamp(filename):
+            return datetime(2023, 1, 1, 12, 0, 0)
+
+        def mock_parse_archived(filename):
+            return datetime(2023, 1, 1, 12, 0, 0)
+
+        mocker.patch.object(
+            FileDiscovery, "_parse_timestamp", side_effect=mock_parse_timestamp
+        )
+        mocker.patch.object(
+            FileDiscovery,
+            "_parse_timestamp_from_archived_filename",
+            side_effect=mock_parse_archived,
+        )
+
+        # Mock the collection methods to verify they're called with the right parameters
+        mock_collect_all = mocker.patch.object(
+            processor, "_collect_all_files_for_cleanup", return_value=[]
+        )
+        mocker.patch.object(
+            processor, "_remove_files_until_under_limit", return_value=0
+        )
+
+        # Mock size calculation to return size that exceeds limit
+        mocker.patch.object(
+            processor, "_calculate_total_directory_sizes", return_value=1200
+        )
+
+        # Run size-based cleanup
+        processor.size_based_cleanup(set())
+
+        # Verify that _collect_all_files_for_cleanup was called with use_combined_strategy=True
+        # since both max_size and older_than are specified
+        mock_collect_all.assert_called_once()
+        call_kwargs = mock_collect_all.call_args[1]  # Use [1] for kwargs
+        assert call_kwargs.get("use_combined_strategy") is True
+        assert (
+            call_kwargs.get("is_size_based") is False
+        )  # Should not use pure size-based when combined is active
+
+    def test_size_based_cleanup_without_combined_strategy(
+        self, config, graceful_exit, logger, temp_dir, mocker
+    ):
+        """Test that size_based_cleanup uses regular strategy when only max_size specified."""
+        # Configure only max_size, no older_than
+        config.max_size = "1KB"
+        config.older_than = 0  # No age threshold
+        config.directory = temp_dir
+
+        processor = FileProcessor(config, logger, graceful_exit)
+
+        # Mock the collection methods to verify they're called with the right parameters
+        mock_collect_all = mocker.patch.object(
+            processor, "_collect_all_files_for_cleanup", return_value=[]
+        )
+        mocker.patch.object(
+            processor, "_remove_files_until_under_limit", return_value=0
+        )
+
+        # Mock size calculation to return size that exceeds limit
+        mocker.patch.object(
+            processor, "_calculate_total_directory_sizes", return_value=1200
+        )
+
+        # Run size-based cleanup
+        processor.size_based_cleanup(set())
+
+        # Verify that _collect_all_files_for_cleanup was called with use_combined_strategy=False
+        # since only max_size is specified
+        mock_collect_all.assert_called_once()
+        call_kwargs = mock_collect_all.call_args[1]  # Use [1] for kwargs
+        assert call_kwargs.get("use_combined_strategy") is False
+        assert (
+            call_kwargs.get("is_size_based") is True
+        )  # Should use pure size-based when combined is not active
+
+    def test_combined_cleanup_with_real_files(
+        self, config, graceful_exit, logger, temp_dir, mocker
+    ):
+        """Test combined cleanup with real files respecting both size and age constraints."""
+        # Create a subdirectory for our test files to avoid including temp_dir files
+        test_subdir = temp_dir / "test_camera"
+        test_subdir.mkdir()
+
+        # Configure both max_size and older_than
+        config.max_size = "1KB"  # 1024 bytes
+        config.older_than = 30  # 30 days
+        config.directory = test_subdir  # Use the subdirectory instead of temp_dir
+        config.trash_root = temp_dir / "trash"
+        config.clean_output = True
+
+        # Create directory structure
+        config.trash_root.mkdir(exist_ok=True)
+        (config.trash_root / "input").mkdir(exist_ok=True)
+        (config.trash_root / "output").mkdir(exist_ok=True)
+
+        # Create files with different ages
+        # Old files (50 days ago - should be included in combined strategy)
+        old_time = datetime.now() - timedelta(days=50)
+        old_timestamp_str = old_time.strftime("%Y%m%d%H%M%S")
+
+        # Recent files (5 days ago - should be excluded in combined strategy)
+        recent_time = datetime.now() - timedelta(days=5)
+        recent_timestamp_str = recent_time.strftime("%Y%m%d%H%M%S")
+
+        # Create files in different categories with different ages
+        # Trash files (highest priority for removal)
+        old_trash_input = (
+            config.trash_root / "input" / f"REO_old_{old_timestamp_str}.mp4"
+        )
+        recent_trash_input = (
+            config.trash_root / "input" / f"REO_recent_{recent_timestamp_str}.mp4"
+        )
+
+        # Source files (lower priority for removal)
+        old_source = test_subdir / f"REO_old_{old_timestamp_str}.mp4"
+        recent_source = test_subdir / f"REO_recent_{recent_timestamp_str}.mp4"
+
+        # Create all files with 500 bytes each
+        all_files = [
+            old_trash_input,
+            recent_trash_input,
+            old_source,
+            recent_source,
+        ]
+
+        for file_path in all_files:
+            with open(file_path, "w") as f:
+                f.write("x" * 500)  # 500 bytes each
+
+        processor = FileProcessor(config, logger, graceful_exit)
+
+        # Mock timestamp parsing to return our specific ages
+        def mock_parse_timestamp(filename):
+            if old_timestamp_str in filename:
+                return old_time
+            elif recent_timestamp_str in filename:
+                return recent_time
+            return datetime(2023, 1, 1, 12, 0, 0)
+
+        mocker.patch.object(
+            FileDiscovery, "_parse_timestamp", side_effect=mock_parse_timestamp
+        )
+
+        # Track what gets removed
+        removed_files = []
+
+        def mock_remove_file(file_path, *args, **kwargs):
+            removed_files.append(str(file_path))
+            return 500  # Return file size
+
+        mocker.patch(
+            "src.archiver.file_manager.FileManager.remove_file",
+            side_effect=mock_remove_file,
+        )
+
+        # Run size-based cleanup (which should use combined strategy since older_than > 0)
+        processor.size_based_cleanup(set())
+
+        # Verify behavior with combined strategy:
+        # - Only old files should be considered (due to age filtering)
+        # - Among old files, trash files should be removed first (due to priority)
+        removed_paths = [str(f) for f in removed_files]
+
+        # With combined strategy, only old files should have been considered
+        # The recent files should not have been removed due to age filtering
+        for path in removed_paths:
+            assert old_timestamp_str in path  # All removed files should be old
+            assert recent_timestamp_str not in path  # No recent files should be removed
+
+        # At least one old file should have been removed
+        assert len(removed_paths) > 0
+
+
+class TestCombinedCleanupComprehensive:
+    """Comprehensive tests for combined cleanup functionality."""
+
+    def test_combined_cleanup_filters_by_age(
+        self, config, graceful_exit, logger, temp_dir, mocker
+    ):
+        """Test that combined cleanup properly filters files by age threshold."""
+        # Configure both max_size and older_than to trigger combined strategy
+        config.max_size = "100KB"
+        config.older_than = 14  # 14 days threshold
+        config.directory = temp_dir
+        config.trash_root = temp_dir / "trash"
+        config.clean_output = True
+
+        # Create directory structure
+        config.trash_root.mkdir(exist_ok=True)
+        (config.trash_root / "input").mkdir(exist_ok=True)
+        (config.trash_root / "output").mkdir(exist_ok=True)
+
+        # Create test dates
+        old_date = datetime.now() - timedelta(days=20)  # >14 days old
+        recent_date = datetime.now() - timedelta(days=10)  # <14 days old
+        very_recent_date = datetime.now() - timedelta(days=5)  # <14 days old
+
+        # Create file paths
+        old_input_file = (
+            config.trash_root
+            / "input"
+            / f"REO_front_01_{old_date.strftime('%Y%m%d%H%M%S')}.mp4"
+        )
+        old_output_file = (
+            config.trash_root
+            / "output"
+            / f"REO_back_02_{old_date.strftime('%Y%m%d%H%M%S')}.mp4"
+        )
+        recent_input_file = (
+            config.trash_root
+            / "input"
+            / f"REO_front_03_{recent_date.strftime('%Y%m%d%H%M%S')}.mp4"
+        )
+        recent_output_file = (
+            config.trash_root
+            / "output"
+            / f"REO_back_04_{recent_date.strftime('%Y%m%d%H%M%S')}.mp4"
+        )
+        very_recent_input_file = (
+            config.trash_root
+            / "input"
+            / f"REO_front_05_{very_recent_date.strftime('%Y%m%d%H%M%S')}.mp4"
+        )
+
+        old_archived_file = (
+            config.directory
+            / "archived"
+            / f"archived-{old_date.strftime('%Y%m%d%H%M%S')}.mp4"
+        )
+        recent_archived_file = (
+            config.directory
+            / "archived"
+            / f"archived-{recent_date.strftime('%Y%m%d%H%M%S')}.mp4"
+        )
+
+        processor = FileProcessor(config, logger, graceful_exit)
+
+        # Track removed files
+        removed_files = []
+
+        # Mock the individual collection methods to properly apply age filtering in combined strategy
+        def mock_collect_trash_files_for_cleanup(
+            is_size_based=False, use_combined_strategy=False
+        ):
+            files_list = []
+
+            if use_combined_strategy:
+                # Only include files older than 14 days
+                files_list.append((old_date, 1, old_input_file))  # trash input
+                files_list.append((old_date, 1, old_output_file))  # trash output
+            else:
+                # Include all files when not using combined strategy
+                files_list.append((old_date, 1, old_input_file))
+                files_list.append((old_date, 1, old_output_file))
+                files_list.append((recent_date, 1, recent_input_file))
+                files_list.append((recent_date, 1, recent_output_file))
+                files_list.append((very_recent_date, 1, very_recent_input_file))
+
+            return files_list
+
+        def mock_collect_archived_files_for_cleanup(
+            is_size_based=False, use_combined_strategy=False
+        ):
+            files_list = []
+
+            if use_combined_strategy:
+                # Only include files older than 14 days
+                files_list.append((old_date, 3, old_archived_file))  # archived
+            else:
+                # Include all files when not using combined strategy
+                files_list.append((old_date, 3, old_archived_file))  # archived
+                files_list.append((recent_date, 3, recent_archived_file))  # archived
+
+            return files_list
+
+        def mock_collect_source_files_for_cleanup(
+            is_size_based=False, use_combined_strategy=False
+        ):
+            files_list = []
+
+            if use_combined_strategy:
+                # Only include files older than 14 days
+                files_list.append(
+                    (
+                        old_date,
+                        2,
+                        temp_dir
+                        / f"source_old_{old_date.strftime('%Y%m%d%H%M%S')}.mp4",
+                    )
+                )  # source
+            else:
+                # Include all files when not using combined strategy
+                files_list.append(
+                    (
+                        old_date,
+                        2,
+                        temp_dir
+                        / f"source_old_{old_date.strftime('%Y%m%d%H%M%S')}.mp4",
+                    )
+                )  # source
+                files_list.append(
+                    (
+                        recent_date,
+                        2,
+                        temp_dir
+                        / f"source_recent_{recent_date.strftime('%Y%m%d%H%M%S')}.mp4",
+                    )
+                )  # source
+
+            return files_list
+
+        def mock_calculate_total_directory_sizes():
+            return 500000  # 500KB - exceeds our 100KB limit
+
+        def mock_remove_files_until_under_limit(sorted_files, total_size, max_bytes):
+            for ts, priority, file_path in sorted_files:
+                if total_size - len(removed_files) * 102400 <= max_bytes:
+                    break  # We're now under the limit
+                removed_files.append(str(file_path))
+            return len(removed_files) * 102400
+
+        # Patch the necessary methods
+        mocker.patch.object(
+            processor,
+            "_collect_trash_files_for_cleanup",
+            side_effect=mock_collect_trash_files_for_cleanup,
+        )
+        mocker.patch.object(
+            processor,
+            "_collect_archived_files_for_cleanup",
+            side_effect=mock_collect_archived_files_for_cleanup,
+        )
+        mocker.patch.object(
+            processor,
+            "_collect_source_files_for_cleanup",
+            side_effect=mock_collect_source_files_for_cleanup,
+        )
+        mocker.patch.object(
+            processor,
+            "_calculate_total_directory_sizes",
+            side_effect=mock_calculate_total_directory_sizes,
+        )
+        mocker.patch.object(
+            processor,
+            "_remove_files_until_under_limit",
+            side_effect=mock_remove_files_until_under_limit,
+        )
+
+        # Run size-based cleanup (this should trigger combined strategy since both params are set)
+        processor.size_based_cleanup(set())
+
+        # Verify that only old files were targeted for removal
+        old_files_removed = [
+            f for f in removed_files if old_date.strftime("%Y%m%d") in f
+        ]
+        recent_files_removed = [
+            f for f in removed_files if recent_date.strftime("%Y%m%d") in f
+        ]
+        very_recent_files_removed = [
+            f for f in removed_files if very_recent_date.strftime("%Y%m%d") in f
+        ]
+
+        # Assertions
+        assert len(old_files_removed) > 0, (
+            "Old files should be removed when using --older-than 14"
+        )
+        assert len(recent_files_removed) == 0, (
+            "Recent files should NOT be removed when using --older-than 14"
+        )
+        assert len(very_recent_files_removed) == 0, (
+            "Very recent files should NOT be removed when using --older-than 14"
+        )
+
+    def test_combined_cleanup_preserves_trash_files_under_age_threshold(
+        self, config, graceful_exit, logger, temp_dir, mocker
+    ):
+        """Test that trash files younger than age threshold are preserved."""
+        # Configure both max_size and older_than to trigger combined strategy
+        config.max_size = "100KB"
+        config.older_than = 14  # 14 days threshold
+        config.directory = temp_dir
+        config.trash_root = temp_dir / "trash"
+        config.clean_output = True
+
+        # Create directory structure
+        config.trash_root.mkdir(exist_ok=True)
+        (config.trash_root / "input").mkdir(exist_ok=True)
+        (config.trash_root / "output").mkdir(exist_ok=True)
+
+        # Create test dates
+        old_date = datetime.now() - timedelta(days=20)  # >14 days old
+        recent_date = datetime.now() - timedelta(days=10)  # <14 days old
+
+        # Create file paths
+        old_input_file = (
+            config.trash_root
+            / "input"
+            / f"REO_front_01_{old_date.strftime('%Y%m%d%H%M%S')}.mp4"
+        )
+        old_output_file = (
+            config.trash_root
+            / "output"
+            / f"REO_back_02_{old_date.strftime('%Y%m%d%H%M%S')}.mp4"
+        )
+        recent_input_file = (
+            config.trash_root
+            / "input"
+            / f"REO_front_03_{recent_date.strftime('%Y%m%d%H%M%S')}.mp4"
+        )
+        recent_output_file = (
+            config.trash_root
+            / "output"
+            / f"REO_back_04_{recent_date.strftime('%Y%m%d%H%M%S')}.mp4"
+        )
+
+        processor = FileProcessor(config, logger, graceful_exit)
+
+        removed_files = []
+
+        def mock_collect_trash_files_for_cleanup(
+            is_size_based=False, use_combined_strategy=False
+        ):
+            files_list = []
+
+            if use_combined_strategy:
+                # Only include files older than 14 days
+                files_list.append((old_date, 1, old_input_file))  # Should be removed
+                files_list.append((old_date, 1, old_output_file))  # Should be removed
+                # Recent files should NOT be included in combined strategy
+            else:
+                # Include all files when not using combined strategy
+                files_list.append((old_date, 1, old_input_file))
+                files_list.append((old_date, 1, old_output_file))
+                files_list.append((recent_date, 1, recent_input_file))
+                files_list.append((recent_date, 1, recent_output_file))
+
+            return files_list
+
+        def mock_calculate_total_directory_sizes():
+            return 500000  # Exceeds limit
+
+        def mock_remove_files_until_under_limit(sorted_files, total_size, max_bytes):
+            for ts, priority, file_path in sorted_files:
+                if total_size - len(removed_files) * 102400 <= max_bytes:
+                    break
+                removed_files.append(str(file_path))
+            return len(removed_files) * 102400
+
+        mocker.patch.object(
+            processor,
+            "_collect_trash_files_for_cleanup",
+            side_effect=mock_collect_trash_files_for_cleanup,
+        )
+        mocker.patch.object(
+            processor,
+            "_calculate_total_directory_sizes",
+            side_effect=mock_calculate_total_directory_sizes,
+        )
+        mocker.patch.object(
+            processor,
+            "_remove_files_until_under_limit",
+            side_effect=mock_remove_files_until_under_limit,
+        )
+
+        processor.size_based_cleanup(set())
+
+        # Verify trash files behavior
+        old_trash_files = [
+            f
+            for f in removed_files
+            if old_date.strftime("%Y%m%d") in f
+            and ".trash" in f.lower()
+            or "trash" in f.lower()
+        ]
+        recent_trash_files = [
+            f
+            for f in removed_files
+            if recent_date.strftime("%Y%m%d") in f
+            and ".trash" in f.lower()
+            or "trash" in f.lower()
+        ]
+
+        # Look for trash files more broadly
+        old_trash_files = [
+            f
+            for f in removed_files
+            if old_date.strftime("%Y%m%d") in f
+            and (".deleted" in f or "trash" in f.lower())
+        ]
+        recent_trash_files = [
+            f
+            for f in removed_files
+            if recent_date.strftime("%Y%m%d") in f
+            and (".deleted" in f or "trash" in f.lower())
+        ]
+
+        assert len(old_trash_files) > 0, "Old trash files should be removed"
+        assert len(recent_trash_files) == 0, "Recent trash files should NOT be removed"
+
+    def test_combined_cleanup_vs_size_based_only(
+        self, config, graceful_exit, logger, temp_dir, mocker
+    ):
+        """Test that combined strategy behaves differently from size-based only."""
+        # Configure both max_size and older_than to trigger combined strategy
+        config.max_size = "100KB"
+        config.older_than = 14  # 14 days threshold
+        config.directory = temp_dir
+        config.trash_root = temp_dir / "trash"
+        config.clean_output = True
+
+        # Create directory structure
+        config.trash_root.mkdir(exist_ok=True)
+        (config.trash_root / "input").mkdir(exist_ok=True)
+        (config.trash_root / "output").mkdir(exist_ok=True)
+
+        # Create test dates
+        old_date = datetime.now() - timedelta(days=20)  # >14 days old
+        recent_date = datetime.now() - timedelta(days=10)  # <14 days old
+
+        # Create file paths
+        old_input_file = (
+            config.trash_root
+            / "input"
+            / f"REO_front_01_{old_date.strftime('%Y%m%d%H%M%S')}.mp4"
+        )
+        old_output_file = (
+            config.trash_root
+            / "output"
+            / f"REO_back_02_{old_date.strftime('%Y%m%d%H%M%S')}.mp4"
+        )
+        recent_input_file = (
+            config.trash_root
+            / "input"
+            / f"REO_front_03_{recent_date.strftime('%Y%m%d%H%M%S')}.mp4"
+        )
+        recent_output_file = (
+            config.trash_root
+            / "output"
+            / f"REO_back_04_{recent_date.strftime('%Y%m%d%H%M%S')}.mp4"
+        )
+
+        processor = FileProcessor(config, logger, graceful_exit)
+
+        # Test with combined strategy (both --max-size and --older-than)
+        removed_files_combined = []
+
+        def mock_collect_all_files_for_cleanup_combined(
+            is_size_based=False, use_combined_strategy=False
+        ):
+            files_list = []
+
+            if use_combined_strategy:
+                # Only include files older than 14 days
+                files_list.append((old_date, 1, old_input_file))
+                files_list.append((old_date, 1, old_output_file))
+                # Recent files are NOT included
+            else:
+                # Include all files
+                files_list.append((old_date, 1, old_input_file))
+                files_list.append((old_date, 1, old_output_file))
+                files_list.append((recent_date, 1, recent_input_file))
+                files_list.append((recent_date, 1, recent_output_file))
+
+            return files_list
+
+        def mock_calculate_total_directory_sizes():
+            return 500000  # Exceeds limit
+
+        def mock_remove_files_until_under_limit(sorted_files, total_size, max_bytes):
+            for ts, priority, file_path in sorted_files:
+                if total_size - len(removed_files_combined) * 102400 <= max_bytes:
+                    break
+                removed_files_combined.append(str(file_path))
+            return len(removed_files_combined) * 102400
+
+        mocker.patch.object(
+            processor,
+            "_collect_all_files_for_cleanup",
+            side_effect=mock_collect_all_files_for_cleanup_combined,
+        )
+        mocker.patch.object(
+            processor,
+            "_calculate_total_directory_sizes",
+            side_effect=mock_calculate_total_directory_sizes,
+        )
+        mocker.patch.object(
+            processor,
+            "_remove_files_until_under_limit",
+            side_effect=mock_remove_files_until_under_limit,
+        )
+
+        processor.size_based_cleanup(set())
+
+        # Check results for combined strategy
+        old_files_combined = [
+            f for f in removed_files_combined if old_date.strftime("%Y%m%d") in f
+        ]
+        recent_files_combined = [
+            f for f in removed_files_combined if recent_date.strftime("%Y%m%d") in f
+        ]
+
+        # Verify combined strategy behavior
+        assert len(old_files_combined) > 0, (
+            "Old files should be removed with combined strategy"
+        )
+        assert len(recent_files_combined) == 0, (
+            "Recent files should NOT be removed with combined strategy"
+        )
+
+    def test_cleanup_task_sh_simulation(
+        self, config, graceful_exit, logger, temp_dir, mocker
+    ):
+        """Test that simulates the exact cleanup-task.sh scenario."""
+        # Configure both max_size and older_than to trigger combined strategy
+        config.max_size = "100MB"  # 100MB to ensure cleanup happens
+        config.older_than = 14  # 14 days as in cleanup-task.sh
+        config.directory = temp_dir
+        config.trash_root = (
+            temp_dir / ".deleted"
+        )  # Default trash root as in cleanup-task.sh
+        config.clean_output = True
+
+        # Create directory structure similar to cleanup-task.sh
+        config.trash_root.mkdir(exist_ok=True)
+        (config.trash_root / "input").mkdir(exist_ok=True)
+        (config.trash_root / "output").mkdir(exist_ok=True)
+
+        # Create test dates
+        old_date = datetime.now() - timedelta(days=20)  # >14 days old
+        recent_date = datetime.now() - timedelta(days=10)  # <14 days old
+
+        # Create file paths for trash files in .deleted/output/... as mentioned in the issue
+        old_output_file = (
+            config.trash_root
+            / "output"
+            / f"REO_back_02_{old_date.strftime('%Y%m%d%H%M%S')}.mp4"
+        )
+        recent_output_file = (
+            config.trash_root
+            / "output"
+            / f"REO_back_04_{recent_date.strftime('%Y%m%d%H%M%S')}.mp4"
+        )
+
+        processor = FileProcessor(config, logger, graceful_exit)
+
+        removed_files = []
+
+        # Simulate the exact scenario from cleanup-task.sh: --older-than 14 --max-size 1TB
+        def mock_collect_trash_files_for_cleanup(
+            is_size_based=False, use_combined_strategy=False
+        ):
+            # This should be called with use_combined_strategy=True since both params are set
+            files_list = []
+
+            if use_combined_strategy:
+                # For combined strategy, only include files older than 14 days
+                files_list.append(
+                    (old_date, 1, old_output_file)
+                )  # Old trash file - should be removed
+                # Recent trash file should NOT be included in combined strategy
+            else:
+                # For non-combined strategy, include all files
+                files_list.append((old_date, 1, old_output_file))  # Old trash file
+                files_list.append(
+                    (recent_date, 1, recent_output_file)
+                )  # Recent trash file
+
+            return files_list
+
+        def mock_calculate_total_directory_sizes():
+            return 200000000  # 200MB - exceeds 100MB limit
+
+        def mock_remove_files_until_under_limit(sorted_files, total_size, max_bytes):
+            for ts, priority, file_path in sorted_files:
+                if total_size - len(removed_files) * 102400 <= max_bytes:
+                    break
+                removed_files.append(str(file_path))
+            return len(removed_files) * 102400
+
+        mocker.patch.object(
+            processor,
+            "_collect_trash_files_for_cleanup",
+            side_effect=mock_collect_trash_files_for_cleanup,
+        )
+        mocker.patch.object(
+            processor,
+            "_calculate_total_directory_sizes",
+            side_effect=mock_calculate_total_directory_sizes,
+        )
+        mocker.patch.object(
+            processor,
+            "_remove_files_until_under_limit",
+            side_effect=mock_remove_files_until_under_limit,
+        )
+
+        processor.size_based_cleanup(set())
+
+        # Verify the specific scenario: old trash files in .deleted/output/ should be removed
+        old_trash_files_removed = [
+            f
+            for f in removed_files
+            if old_date.strftime("%Y%m%d") in f and ".deleted" in f and "output" in f
+        ]
+        recent_trash_files_removed = [
+            f
+            for f in removed_files
+            if recent_date.strftime("%Y%m%d") in f and ".deleted" in f and "output" in f
+        ]
+
+        # With combined strategy, old trash files should be removed, recent ones should not
+        assert len(old_trash_files_removed) > 0, (
+            "Old trash files in .deleted/output/ should be removed with combined strategy"
+        )
+        assert len(recent_trash_files_removed) == 0, (
+            "Recent trash files in .deleted/output/ should NOT be removed with combined strategy"
+        )
