@@ -19,6 +19,7 @@ from .utils import (
     FilePath,
     Timestamp,
     TimestampFileMapping,
+    format_bytes,
 )
 
 
@@ -894,7 +895,7 @@ class FileProcessor:
             )
 
             self.logger.info(
-                f"Removed {file_path} ({file_size} bytes) due to size-based cleanup"
+                f"Removed {file_path} ({format_bytes(file_size)}) due to size-based cleanup"
             )
 
             # Return the updated removed size
@@ -978,12 +979,12 @@ class FileProcessor:
         """Check if cleanup is needed based on size comparison."""
         if total_size <= max_bytes:
             self.logger.info(
-                f"Current size ({total_size} bytes) is within limit ({max_bytes} bytes), no size-based cleanup needed"
+                f"Current size ({format_bytes(total_size)}) is within limit ({format_bytes(max_bytes)}), no size-based cleanup needed"
             )
             return False
 
         self.logger.info(
-            f"Current size ({total_size} bytes) exceeds limit ({max_bytes} bytes), starting size-based cleanup..."
+            f"Current size ({format_bytes(total_size)}) exceeds limit ({format_bytes(max_bytes)}), starting size-based cleanup..."
         )
         return True
 
@@ -1207,7 +1208,7 @@ class FileProcessor:
     ) -> None:
         """Log the results of the cleanup operation."""
         self.logger.info(
-            f"Size-based cleanup completed. Removed {removed_size} bytes. Current size: {total_size - removed_size} bytes"
+            f"Size-based cleanup completed. Removed {format_bytes(removed_size)}. Current size: {format_bytes(total_size - removed_size)}"
         )
 
     def _output_path(self, input_file: FilePath, timestamp: Timestamp) -> FilePath:

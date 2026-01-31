@@ -132,6 +132,43 @@ def parse_size(size_str: str) -> int:
     return int(number * multipliers[unit])
 
 
+def format_bytes(size_bytes: int) -> str:
+    """Format bytes to human-readable string with appropriate unit.
+
+    Args:
+        size_bytes: Size in bytes
+
+    Returns:
+        Human-readable size string (e.g., '1.23 GiB', '512.00 MiB')
+    """
+    if size_bytes < 0:
+        return "0 B"
+
+    # Define units and their byte values (using 1024-based units)
+    units = [
+        ("B", 1),
+        ("KiB", 1024),
+        ("MiB", 1024**2),
+        ("GiB", 1024**3),
+        ("TiB", 1024**4),
+    ]
+
+    # Find the appropriate unit
+    unit = units[0][0]
+    divisor = units[0][1]
+
+    for i in range(len(units) - 1, -1, -1):
+        unit_name, unit_value = units[i]
+        if size_bytes >= unit_value:
+            unit = unit_name
+            divisor = unit_value
+            break
+
+    # Format the value with 2 decimal places
+    value = size_bytes / divisor
+    return f"{value:.2f} {unit}"
+
+
 def display_plan(plan: ActionPlanType, logger, config) -> None:
     """Display the action plan to the user"""
     _display_plan_header(logger)
