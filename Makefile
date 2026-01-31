@@ -15,8 +15,7 @@ test:
 	uv run pytest -xvs --cov=src --cov-report=term-missing --cov-branch
 
 lint:
-	ruff check ./src ./tests; \
-		pyright ./src ./tests
+	ty check ./src ./tests
 
 prettier:
 	prettier --cache -c -w *.md
