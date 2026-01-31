@@ -295,8 +295,8 @@ class FileProcessor:
 
         # Cast to maintain compatibility with expected return type
         result: Dict[str, List[Dict[str, Any]]] = {
-            "transcoding": transcoding_actions,  # type: ignore
-            "removals": removal_actions,  # type: ignore
+            "transcoding": transcoding_actions,
+            "removals": removal_actions,
         }
         return result
 
@@ -393,7 +393,7 @@ class FileProcessor:
                 is_output=False,
                 source_root=self.config.directory,
             )
-            removal_actions.remove(source_removal_action)  # type: ignore
+            removal_actions.remove(source_removal_action)
 
     def _filter_removal_actions(
         self, removal_actions: list, failed_transcodes: set, failed_jpgs_to_remove: set

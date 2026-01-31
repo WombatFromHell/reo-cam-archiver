@@ -24,6 +24,7 @@ from typing import (
 if TYPE_CHECKING:
     from .graceful_exit import GracefulExit
     from .processor import FileProcessor
+    from .progress import ProgressReporter
 
 # Constants
 MIN_ARCHIVE_SIZE_BYTES = 1_048_576  # 1MB
@@ -35,7 +36,7 @@ LOG_ROTATION_SIZE = 4_194_304  # 4MB (4096KB) in bytes
 OUTPUT_LOCK = threading.Lock()
 
 # Global reference to the active progress reporter to allow clearing
-ACTIVE_PROGRESS_REPORTER = None
+ACTIVE_PROGRESS_REPORTER: Optional["ProgressReporter"] = None
 
 
 # Type Definitions
@@ -50,13 +51,13 @@ ProgressCallback = Callable[[float], None]
 DiscoveredFiles = Tuple[
     List[Tuple[FilePath, Timestamp]],  # List of (file_path, timestamp) tuples
     Dict[
-        str, Dict[str, FilePath]
-    ],  # Mapping of timestamp keys to file extensions and paths
+        str, Dict[str, Optional[FilePath]]
+    ],  # Mapping of timestamp keys to file extensions and paths (allowing None)
     Set[FilePath],  # Set of trash file paths
 ]
 
 # Type alias for timestamp-to-file mapping (common pattern in the codebase)
-TimestampFileMapping = Dict[str, Dict[str, FilePath]]
+TimestampFileMapping = Dict[str, Dict[str, Optional[FilePath]]]
 
 # Type definitions for action plans
 GenericAction = Dict[str, Any]

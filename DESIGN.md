@@ -223,6 +223,17 @@ Manages file operations including moving to trash, permanent deletion, and clean
 
 Orchestrates the file processing workflow, generating action plans and executing them.
 
+- Implements strategy pattern for cleanup with AgeBasedCleanupStrategy, SizeBasedCleanupStrategy, and CombinedCleanupStrategy
+- Includes CleanupRules dataclass that encapsulates all cleanup rules and configuration parameters
+- Includes CleanupFile dataclass that encapsulates priority, age, and location information
+- Uses `_collect_files_from_location()` method that consolidates file collection logic across different locations with consistent logic
+- Uses `_validate_and_filter_files()` and `_is_valid_for_cleanup()` methods to apply all validation and filtering rules in one place
+- Includes `_get_age_cutoff_for_collection()`: Gets age cutoff for file collection based on configuration
+- Includes `_process_file_for_collection()`: Processes a single file for collection and returns file info if it should be included
+- Includes `_parse_timestamp_by_location_type()`: Parses timestamp based on the location type
+- Includes `_collect_files_for_cleanup_unified()` as an alternative implementation that uses the new unified collection approach
+- Uses `_remove_file_for_cleanup()` with improved error handling and proper return value calculation
+
 - Generates comprehensive action plans with both transcoding and removal operations
 - Implements age-based filtering for cleanup operations (skips files newer than age threshold)
 - Handles paired JPG file management with orphaned file detection
@@ -868,7 +879,6 @@ The system accepts the following command-line arguments:
 - `--cleanup`: Clean up old files based on age and size
 - `--clean-output`: Also clean output directory during cleanup
 - `--older-than`: Only remove files older than specified days (default: 30)
-- `--age`: DEPRECATED - Use `--older-than` instead
 - `--max-size`: Maximum size for cleanup (e.g., 500GB, 1TB) - deletes oldest files first when exceeded
 - `--log-file`: Log file path
 
@@ -908,6 +918,9 @@ The application includes several standalone utility functions that orchestrate t
 - `_handle_real_execution_if_confirmed()`: Handles real execution if user confirms
 - `_is_user_confirmation_required()`: Checks if user confirmation is required
 - `_handle_archiver_error()`: Handles archiver errors with logging
+- `_handle_action_type()`: Handles action types using pattern matching (match statement)
+- `_get_action_description()`: Gets description for action type using pattern matching (match statement)
+- `_handle_unknown_action_type()`: Handles unknown action types with logging
 
 ## Size-Based Cleanup Functionality
 
@@ -925,3 +938,8 @@ The system includes advanced size-based cleanup capabilities that help manage st
 - **Integration with main workflow**: Seamlessly integrates with the main archiving workflow
 - **Comprehensive error handling**: Handles various error scenarios during cleanup operations
 - **Detailed progress reporting**: Provides progress updates during cleanup operations
+- **Cleanup Strategies**: Implements strategy pattern with AgeBasedCleanupStrategy, SizeBasedCleanupStrategy, and CombinedCleanupStrategy for flexible cleanup logic
+- **Unified Collection Methods**: Uses `_collect_files_from_location()` method that consolidates file collection logic across different locations with consistent logic
+- **Cleanup Configuration Object**: Created `CleanupRules` dataclass that encapsulates all cleanup rules and configuration parameters (max_size, older_than_days, clean_output, is_size_based)
+- **Unified File Metadata Class**: Created `CleanupFile` dataclass that encapsulates priority, age, and location information with unified inclusion logic
+- **Enhanced Error Handling**: Improved error handling in `_remove_file_for_cleanup()` with proper return value calculation
