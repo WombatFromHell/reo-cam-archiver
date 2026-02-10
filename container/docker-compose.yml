@@ -1,0 +1,14 @@
+services:
+  cam_archiver:
+    build:
+      context: ${COMPOSEROOT}
+      dockerfile: container/Containerfile
+      args:
+        TZ: ${TZ}
+    image: ${IMAGENAME}:${VERSION}
+    pull_policy: never
+    restart: unless-stopped
+    devices:
+      - "/dev/dri:/dev/dri"
+    volumes:
+      - "${SHAREROOT}:/camera"

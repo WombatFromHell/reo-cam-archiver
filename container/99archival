@@ -1,0 +1,4 @@
+# run FFMPEG archival and organization Mon-Sat @ 1am
+0 1 * * 1-6 /app/archive-task.sh >> /var/log/cron.log 2>&1
+# run cleanup task weekly on Sunday @ 1am
+0 1 * * 0 /app/cleanup-task.sh >> /var/log/cron.log 2>&1

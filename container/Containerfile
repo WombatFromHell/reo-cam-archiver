@@ -1,0 +1,39 @@
+FROM linuxserver/ffmpeg:version-8.0.1-cli
+
+ARG TZ=$TZ
+#
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Latest releases available at https://github.com/aptible/supercronic/releases
+ENV SUPERCRONIC_URL=https://github.com/aptible/supercronic/releases/download/v0.2.34/supercronic-linux-amd64 \
+  SUPERCRONIC_SHA1SUM=e8631edc1775000d119b70fd40339a7238eece14 \
+  SUPERCRONIC=supercronic-linux-amd64
+
+RUN apt-get update -y && \
+  apt-get install -y curl tmux nano ca-certificates && \
+  # ensure we have a timezone set
+  ln -snf /usr/share/zoneinfo/${TZ} /etc/localtime && \
+  echo "${TZ}" > /etc/timezone
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+RUN curl -fsSLO "$SUPERCRONIC_URL" \
+  && echo "${SUPERCRONIC_SHA1SUM}  ${SUPERCRONIC}" | sha1sum -c - \
+  && chmod +x "$SUPERCRONIC" \
+  && mv "$SUPERCRONIC" "/usr/local/bin/${SUPERCRONIC}" \
+  && ln -s "/usr/local/bin/${SUPERCRONIC}" /usr/local/bin/supercronic
+
+COPY container/entrypoint.sh /root/
+COPY container/99archival /root/99archival
+
+RUN chmod 0644 /root/99archival && \
+  chown root:root /root/99archival && \
+  touch /var/log/cron.log
+
+WORKDIR /app/
+
+COPY reo-archiver.sh \
+  container/archive-task.sh \
+  container/cleanup-task.sh /app/
+RUN chmod +x /app/*.sh
+
+ENTRYPOINT ["/root/entrypoint.sh"]
