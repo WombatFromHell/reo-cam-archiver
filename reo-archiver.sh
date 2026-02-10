@@ -181,6 +181,10 @@ parse_args() {
         log_error "Age must be a positive integer."
         exit 1
       fi
+      if [[ "$2" -lt 2 ]]; then
+        log_error "Age must be greater than 1 day."
+        exit 1
+      fi
       AGE_DAYS="$2"
       shift 2
       ;;
@@ -400,7 +404,6 @@ setup_logging() {
 
 display_config() {
   local cutoff_ts="$1"
-  local recent_threshold="$2"
 
   echo "============================================================"
   echo "Camera Cleanup Script - $(date '+%Y-%m-%d %H:%M:%S')"
@@ -409,11 +412,8 @@ display_config() {
   log_info "Target Directory : $TARGET_DIR"
   log_info "Age Threshold    : $AGE_DAYS days (before $cutoff_ts)"
 
-  # Fix SC2015: Use explicit if/else instead of &&
   if [[ "$ARCHIVE_MODE" == true ]]; then
     log_info "Mode             : ARCHIVE -> $ARCHIVE_DIR"
-    # Fix SC2034: Actually use the recent_threshold variable in the output
-    log_info "Recent Threshold : $recent_threshold (Files newer than this are skipped)"
   else
     log_info "Mode             : DELETE"
   fi
@@ -451,8 +451,7 @@ get_total_files_fast() {
 # Populates the files_to_process array with files matching age criteria
 filter_files_by_age() {
   local cutoff_ts="$1"
-  local recent_ts="$2"
-  local -n files_array="$3" # nameref to output array
+  local -n files_array="$2"
 
   while IFS= read -r -d '' file; do
     local filename
@@ -463,9 +462,6 @@ filter_files_by_age() {
     # Guards
     [[ -z "$file_ts" ]] && continue
     [[ "$file_ts" < "$cutoff_ts" ]] || continue
-    if [[ "$ARCHIVE_MODE" == true ]] && [[ -n "$recent_ts" ]]; then
-      [[ "$file_ts" > "$recent_ts" ]] && continue
-    fi
 
     files_array+=("$file")
   done < <("${find_cmd[@]}")
@@ -485,10 +481,8 @@ main() {
 
   local cutoff_ts
   cutoff_ts=$(get_cutoff_timestamp "$AGE_DAYS")
-  local recent_ts=""
-  [[ "$ARCHIVE_MODE" == true ]] && recent_ts=$(get_recent_threshold)
 
-  display_config "$cutoff_ts" "$recent_ts"
+  display_config "$cutoff_ts"
 
   PROGRESS_RUN_START=$(date +%s)
   PROGRESS_CURRENT_FILE=0
@@ -504,7 +498,7 @@ main() {
   # 1. Scan and filter files
   log_info "Scanning and filtering files..."
   local -a files_to_process=()
-  filter_files_by_age "$cutoff_ts" "$recent_ts" files_to_process
+  filter_files_by_age "$cutoff_ts" files_to_process
 
   PROGRESS_TOTAL_FILES=${#files_to_process[@]}
 
