@@ -33,9 +33,27 @@ PROGRESS_RUN_START=0
 
 # --- Logging Functions ---
 log_info() { echo -e "[INFO] $*"; }
-log_success() { echo -e "[\033[0;32mOK\033[0m] $*"; }
-log_warn() { echo -e "[\033[1;33mWARN\033[0m] $*" >&2; }
-log_error() { echo -e "[\033[0;31mERROR\033[0m] $*" >&2; }
+log_success() {
+  if [[ "$IS_INTERACTIVE" == true ]]; then
+    echo -e "[\033[0;32mOK\033[0m] $*"
+  else
+    echo -e "[OK] $*"
+  fi
+}
+log_warn() {
+  if [[ "$IS_INTERACTIVE" == true ]]; then
+    echo -e "[\033[1;33mWARN\033[0m] $*" >&2
+  else
+    echo -e "[WARN] $*" >&2
+  fi
+}
+log_error() {
+  if [[ "$IS_INTERACTIVE" == true ]]; then
+    echo -e "[\033[0;31mERROR\033[0m] $*" >&2
+  else
+    echo -e "[ERROR] $*" >&2
+  fi
+}
 
 # --- Terminal Detection ---
 detect_interactive_terminal() {
