@@ -137,7 +137,6 @@ rotate_logs() {
 }
 
 # --- Centralized File Collection ---
-# --- Centralized File Collection ---
 collect_all_files() {
   local cutoff_ts
   cutoff_ts=$(get_cutoff_timestamp "$AGE_DAYS")
@@ -153,59 +152,73 @@ collect_all_files() {
   TRASH_CLEANUP_FILES=()
   MAIN_PROCESSING_FILES=()
 
-  # Helper function to process a file entry
-  process_file_entry() {
-    local file="$1" size="$2" location="$3"
-    local basename ts is_video
+  # Local variables for the loop (declared once for performance)
+  local file size filename base ts is_video location
+  local find_args=()
 
-    basename=$(basename "$file")
-    ts=$(extract_timestamp "$basename")
-    [[ -z "$ts" ]] && return 0
+  # Define sources to scan: "Path|LocationType"
+  local sources=()
+  [[ -d "$TRASH_DIR" ]] && sources+=("$TRASH_DIR|trash")
+  sources+=("$TARGET_DIR|input")
+  [[ "$ARCHIVE_MODE" == true && -d "$ARCHIVE_DIR" ]] && sources+=("$ARCHIVE_DIR|archive")
 
-    is_video="false"
-    [[ "$basename" =~ \.(mp4|MP4)$ ]] && is_video="true"
+  for src in "${sources[@]}"; do
+    # Split "Path|Location" into variables
+    IFS='|' read -r root location <<<"$src"
 
-    ALL_FILES+=("$file|$ts|$size|$is_video|$location")
+    # Build find command arguments
+    find_args=("$root" -type f \( -iname "*.mp4" -o -iname "*.jpg" \))
 
-    # For size limit enforcement (age threshold)
-    if [[ "$ts" < "$cutoff_ts" ]]; then
-      SIZE_LIMIT_FILES+=("$file|$ts|$size")
-
-      # For main processing (input files only)
-      [[ "$location" == "input" ]] && MAIN_PROCESSING_FILES+=("$file|$ts|$size|$is_video")
+    # Add exclusions only for the main input directory
+    if [[ "$location" == "input" ]]; then
+      [[ -d "$TRASH_DIR" ]] && find_args+=(! -path "${TRASH_DIR}/*")
+      [[ "$ARCHIVE_MODE" == true && -d "$ARCHIVE_DIR" ]] && find_args+=(! -path "${ARCHIVE_DIR}/*")
     fi
 
-    # For trash cleanup (trash age threshold)
-    [[ "$location" == "trash" && "$ts" < "$trash_cutoff_ts" ]] && TRASH_CLEANUP_FILES+=("$file|$ts|$size")
+    # Use printf to output path and size null-terminated
+    find_args+=(-printf '%p\0%s\0')
 
-    return 0
-  }
-
-  # Collect from trash directory
-  # Using -printf '%p\0%s\0' to get path and size in one find call
-  if [[ -d "$TRASH_DIR" ]]; then
+    # Process output directly via while loop
     while IFS= read -r -d '' file && IFS= read -r -d '' size; do
-      process_file_entry "$file" "$size" "trash"
-    done < <(find "$TRASH_DIR" -type f \( -iname "*.mp4" -o -iname "*.jpg" \) -printf '%p\0%s\0' 2>/dev/null)
-  fi
 
-  # Collect from input directory (excluding trash and archive)
-  local exclude_args=()
-  [[ -d "$TRASH_DIR" ]] && exclude_args+=(! -path "${TRASH_DIR}/*")
-  [[ "$ARCHIVE_MODE" == true ]] && [[ -d "$ARCHIVE_DIR" ]] && exclude_args+=(! -path "${ARCHIVE_DIR}/*")
+      # --- Optimized Inline Processing ---
+      # 1. Get filename using Bash parameter expansion (no fork)
+      filename="${file##*/}"
 
-  while IFS= read -r -d '' file && IFS= read -r -d '' size; do
-    process_file_entry "$file" "$size" "input"
-  done < <(find "$TARGET_DIR" -type f \( -iname "*.mp4" -o -iname "*.jpg" \) "${exclude_args[@]}" -printf '%p\0%s\0' 2>/dev/null)
+      # 2. Extract timestamp base (no fork)
+      base="${filename%.*}"
+      ts="${base: -14}"
 
-  # Collect from archive directory (if archive mode enabled)
-  if [[ "$ARCHIVE_MODE" == true ]] && [[ -d "$ARCHIVE_DIR" ]]; then
-    while IFS= read -r -d '' file && IFS= read -r -d '' size; do
-      process_file_entry "$file" "$size" "archive"
-    done < <(find "$ARCHIVE_DIR" -type f -iname "*.mp4" -printf '%p\0%s\0' 2>/dev/null)
-  fi
+      # 3. Validate timestamp (length and digits)
+      # Using glob pattern [[ $var == *pattern* ]] is faster than regex for simple cases
+      if [[ ${#ts} -eq 14 && "$ts" == [0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9] ]]; then
+
+        # 4. Determine if video
+        is_video="false"
+        # Case insensitive check using glob
+        [[ "$filename" == *.mp4 || "$filename" == *.MP4 ]] && is_video="true"
+
+        # Populate Arrays
+        ALL_FILES+=("$file|$ts|$size|$is_video|$location")
+
+        # Categorize based on age
+        if [[ "$ts" < "$cutoff_ts" ]]; then
+          SIZE_LIMIT_FILES+=("$file|$ts|$size")
+          [[ "$location" == "input" ]] && MAIN_PROCESSING_FILES+=("$file|$ts|$size|$is_video")
+        fi
+
+        # Trash cleanup check
+        [[ "$location" == "trash" && "$ts" < "$trash_cutoff_ts" ]] && TRASH_CLEANUP_FILES+=("$file|$ts|$size")
+
+      fi
+      # --- End Optimized Processing ---
+
+    done < <(find "${find_args[@]}" 2>/dev/null)
+  done
 
   log_info "Collected ${#ALL_FILES[@]} total files across all directories."
+
+  return 0
 }
 
 # --- Size Utilities ---
@@ -388,7 +401,7 @@ enforce_size_limit() {
   [[ $MAX_SIZE_BYTES -le 0 ]] && return
 
   echo "============================================================"
-  echo "PHASE 0: Size Limit Enforcement"
+  echo "PHASE 1: Size Limit Enforcement"
   echo "============================================================"
 
   # Calculate sizes in priority order: trash, input, archive
@@ -683,21 +696,21 @@ main() {
   # COLLECT ALL FILES ONCE - used by all phases
   collect_all_files
 
-  # Phase 0: Size Limit Enforcement (if enabled)
+  # Phase 1: Size Limit Enforcement (if enabled)
   enforce_size_limit
 
-  # Phase 1: Trash Cleanup
+  # Phase 2: Trash Cleanup
   if [[ "$USE_TRASH" == true ]] && [[ ${#TRASH_CLEANUP_FILES[@]} -gt 0 ]]; then
     echo "============================================================"
-    echo "PHASE 1: Trash Cleanup"
+    echo "PHASE 2: Trash Cleanup"
     echo "============================================================"
     cleanup_trash_folder
     echo ""
   fi
 
-  # Phase 2: File Processing
+  # Phase 3: File Processing
   echo "============================================================"
-  echo "PHASE 2: Main File Processing"
+  echo "PHASE 3: Main File Processing"
   echo "============================================================"
 
   PROGRESS_RUN_START=$(date +%s)
