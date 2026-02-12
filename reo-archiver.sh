@@ -3,12 +3,9 @@
 # ==============================================================================
 # Script Name: reo-archiver.sh
 # Description: Removes or archives camera files older than N days.
-#              Optimized for speed with detailed progress reporting.
-#
-# Usage:       ./reo-archiver.sh --dir /camera --age 14 [--archive] [--execute]
+#              Refactored for maximum maintainability and reduced complexity.
 # ==============================================================================
 
-# Strict Mode
 set -euo pipefail
 
 # --- Configuration & Defaults ---
@@ -17,151 +14,275 @@ DEFAULT_TARGET_DIR="/camera"
 DEFAULT_ARCHIVE_DIR="/camera/archived"
 DEFAULT_TRASH_DIR="/camera/.deleted"
 DEFAULT_AGE_DAYS=14
-DEFAULT_DRY_RUN=true
 DEFAULT_LOG_FILENAME="archiver.log"
 MAX_LOG_ROTATIONS=3
 MIN_OUTPUT_SIZE_BYTES=1048576
-FFMPEG_PID=""
-USE_TRASH=true # Enabled by default for safety
 
-# --- Progress Bar Configuration ---
+# --- Global State ---
+TARGET_DIR=""
+AGE_DAYS=""
+DRY_RUN=true
+ENABLE_LOGGING=true
+ARCHIVE_MODE=false
+ARCHIVE_DIR=""
+SKIP_EXISTING=true
+USE_TRASH=true
+TRASH_DIR=""
+FFMPEG_PID=""
+
+# --- Progress State ---
 IS_INTERACTIVE=false
-PROGRESS_BAR_WIDTH=10
-PROGRESS_CURRENT_FILE=0 # Current file number
-PROGRESS_TOTAL_FILES=0  # Total files to process
-PROGRESS_FILE_PCT=0     # Current file completion percentage
+PROGRESS_TOTAL_FILES=0
+PROGRESS_CURRENT_FILE=0
 PROGRESS_FILE_START=0
 PROGRESS_RUN_START=0
 
-# --- Logging Functions ---
-log_info() { echo -e "[INFO] $*"; }
-log_success() {
-  if [[ "$IS_INTERACTIVE" == true ]]; then
-    echo -e "[\033[0;32mOK\033[0m] $*"
-  else
-    echo -e "[OK] $*"
+# --- Logging & Output ---
+# Basic unformatted output (used for separators/headers)
+log() { echo -e "$*"; }
+
+# Internal wrapper handles all formatting, colors, and stream redirection.
+# Usage: _log <LEVEL_NAME> <COLOR_CODE> <FD> <MESSAGE>
+_log() {
+  local level="$1" color="$2" fd="$3"
+  shift 3
+  local msg="[$level] $*"
+
+  # Apply color only if interactive AND a color code is provided
+  if [[ "$IS_INTERACTIVE" == true && -n "$color" ]]; then
+    msg="[$color$level\033[0m] $*"
   fi
-}
-log_warn() {
-  if [[ "$IS_INTERACTIVE" == true ]]; then
-    echo -e "[\033[1;33mWARN\033[0m] $*" >&2
-  else
-    echo -e "[WARN] $*" >&2
-  fi
-}
-log_error() {
-  if [[ "$IS_INTERACTIVE" == true ]]; then
-    echo -e "[\033[0;31mERROR\033[0m] $*" >&2
-  else
-    echo -e "[ERROR] $*" >&2
-  fi
+
+  # Redirect to specific File Descriptor (1=stdout, 2=stderr)
+  echo -e "$msg" >&"$fd"
 }
 
-# --- Terminal Detection ---
-detect_interactive_terminal() {
-  if [[ -t 1 ]] && [[ "${TERM:-}" != "dumb" ]]; then
-    IS_INTERACTIVE=true
-  else
-    IS_INTERACTIVE=false
-  fi
-}
+# Public logging functions (One-liners)
+log_info() { _log "INFO" "" 1 "$*"; }
+log_success() { _log "OK" "\033[0;32m" 1 "$*"; }
+log_warn() { _log "WARN" "\033[1;33m" 2 "$*"; }
+log_error() { _log "ERROR" "\033[0;31m" 2 "$*"; }
 
 # --- Progress Bar Functions ---
-format_duration() {
-  local seconds=$1
-  local hours=$((seconds / 3600))
-  local minutes=$(((seconds % 3600) / 60))
-  local secs=$((seconds % 60))
-  if [[ $hours -gt 0 ]]; then
-    printf "%02d:%02d:%02d" "$hours" "$minutes" "$secs"
-  else
-    printf "%02d:%02d" "$minutes" "$secs"
-  fi
-}
-
-clear_progress_line() {
-  [[ "$IS_INTERACTIVE" != true ]] && return
-  printf "\r\033[K" >&2
-}
+format_duration() { printf "%02d:%02d:%02d" $(($1 / 3600)) $(($1 % 3600 / 60)) $(($1 % 60)); }
+clear_progress_line() { [[ "$IS_INTERACTIVE" == true ]] && printf "\r\033[K" >&2; }
 
 draw_progress_bar() {
   [[ "$IS_INTERACTIVE" != true ]] && return
 
-  local count=$1
-  local total=$2
-  local file_pct=$3
-  local file_elapsed=$4
-  local total_elapsed=$5
+  local count=$1 total=$2 pct=$3
+  local width=10 # Configurable width
 
-  local filled_width=$((file_pct * PROGRESS_BAR_WIDTH / 100))
-  local empty_width=$((PROGRESS_BAR_WIDTH - filled_width))
+  local filled=$((pct * width / 100))
+  local empty=$((width - filled))
+
+  # Build bar string efficiently
   local bar=""
+  for ((i = 0; i < filled; i++)); do bar+="#"; done
+  for ((i = 0; i < empty; i++)); do bar+="-"; done
 
-  for ((i = 0; i < filled_width; i++)); do bar="${bar}#"; done
-  for ((i = 0; i < empty_width; i++)); do bar="${bar}-"; done
-
-  local file_time
-  file_time=$(format_duration "$file_elapsed")
-  local total_time
-  total_time=$(format_duration "$total_elapsed")
-
-  # Detailed format: Progress [Cur/Total] FilePct% [Bar] Time (TotalTime)
   printf "\rProgress [%d/%d] %3d%% [%s] %s (Total: %s) " \
-    "$count" "$total" "$file_pct" "$bar" "$file_time" "$total_time" >&2
+    "$count" "$total" "$pct" "$bar" "$(format_duration $(($(date +%s) - PROGRESS_FILE_START)))" "$(format_duration $(($(date +%s) - PROGRESS_RUN_START)))" >&2
 }
 
 update_progress_from_ffmpeg() {
-  local duration=$1
-  local line=$2
-
+  local duration=$1 line=$2
   if [[ "$line" =~ time=([0-9]{2}):([0-9]{2}):([0-9]{2}) ]]; then
-    local hours=${BASH_REMATCH[1]}
-    local minutes=${BASH_REMATCH[2]}
-    local seconds=${BASH_REMATCH[3]}
-
-    # Base 10 forced for arithmetic
-    local current_seconds=$((10#$hours * 3600 + 10#$minutes * 60 + 10#$seconds))
-
+    local s=$((10#${BASH_REMATCH[1]} * 3600 + 10#${BASH_REMATCH[2]} * 60 + 10#${BASH_REMATCH[3]}))
     if [[ $duration -gt 0 ]]; then
-      PROGRESS_FILE_PCT=$((current_seconds * 100 / duration))
-      [[ $PROGRESS_FILE_PCT -gt 100 ]] && PROGRESS_FILE_PCT=100
-
-      local now
-      now=$(date +%s)
-      local file_elapsed=$((now - PROGRESS_FILE_START))
-      local total_elapsed=$((now - PROGRESS_RUN_START))
-
-      draw_progress_bar "$PROGRESS_CURRENT_FILE" "$PROGRESS_TOTAL_FILES" \
-        "$PROGRESS_FILE_PCT" "$file_elapsed" "$total_elapsed"
+      local pct=$((s * 100 / duration))
+      [[ $pct -gt 100 ]] && pct=100
+      draw_progress_bar "$PROGRESS_CURRENT_FILE" "$PROGRESS_TOTAL_FILES" "$pct"
     fi
   fi
 }
 
-get_video_duration() {
-  local input_file=$1
-  local duration
-  duration=$(ffprobe -v error -show_entries format=duration \
-    -of default=noprint_wrappers=1:nokey=1 "$input_file" 2>/dev/null || echo "0")
-  echo "${duration%.*}"
+# --- Utility Functions ---
+get_file_size() { stat -f%z "$1" 2>/dev/null || stat -c%s "$1" 2>/dev/null; }
+get_video_duration() { ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$1" 2>/dev/null | cut -d. -f1 || echo "0"; }
+get_cutoff_timestamp() { date -d "-$1 days" +%Y%m%d%H%M%S; }
+
+extract_timestamp() {
+  local base="${1%.*}"
+  local ts="${base: -14}"
+  [[ ${#ts} -eq 14 ]] && [[ "$ts" =~ ^[0-9]+$ ]] && echo "$ts" || echo ""
 }
 
-# --- Signal Handling ---
-cleanup_on_signal() {
-  echo ""
-  log_warn "Received interrupt signal (SIGINT/CTRL+C)"
-  clear_progress_line
-  if [[ -n "$FFMPEG_PID" ]] && kill -0 "$FFMPEG_PID" 2>/dev/null; then
-    log_warn "Terminating ffmpeg process (PID: $FFMPEG_PID)..."
-    kill -TERM "$FFMPEG_PID" 2>/dev/null
-    wait "$FFMPEG_PID" 2>/dev/null
+build_archive_path() { echo "${ARCHIVE_DIR}/${1:0:4}/${1:4:2}/${1:6:2}/archived-${1}.mp4"; }
+build_trash_path() {
+  local file="$1" prefix="$TARGET_DIR"
+  [[ "$file" == "$ARCHIVE_DIR"* ]] && prefix="$ARCHIVE_DIR"
+  echo "${TRASH_DIR}/${file#"$prefix"/}"
+}
+
+rotate_logs() {
+  local log="$1" max="$2"
+  [[ ! -f "$log" ]] && return
+  for ((i = max - 1; i >= 0; i--)); do mv "${log}.${i}" "${log}.$((i + 1))" 2>/dev/null || true; done
+  mv "$log" "${log}.0"
+}
+
+# --- Core Logic: Transcode ---
+transcode_file() {
+  local input="$1" output="$2"
+
+  # Skip existing (if enabled)
+  if [[ "$SKIP_EXISTING" == true ]] && [[ -f "$output" ]] && [[ $(get_file_size "$output") -ge $MIN_OUTPUT_SIZE_BYTES ]]; then
+    log_warn "Output exists (>= 1MB), skipping: $(basename "$output")"
+    return 0
   fi
-  log_error "Script interrupted by user. Exiting."
+
+  mkdir -p "$(dirname "$output")"
+  PROGRESS_FILE_START=$(date +%s)
+  local duration=0
+  [[ "$IS_INTERACTIVE" == true ]] && duration=$(get_video_duration "$input")
+
+  log_info "Transcoding: $(basename "$input")"
+
+  local cmd=(ffmpeg -hide_banner -hwaccel qsv -hwaccel_output_format qsv -y -i "$input"
+    -vf scale_qsv=w=1024:h=768:mode=hq -global_quality 26 -c:v h264_qsv -an)
+
+  if [[ "$IS_INTERACTIVE" == true ]]; then
+    cmd+=(-progress pipe:1 "$output")
+    "${cmd[@]}" 2>&1 | while IFS= read -r line; do update_progress_from_ffmpeg "$duration" "$line"; done &
+  else
+    cmd+=("$output")
+    "${cmd[@]}" >/dev/null 2>&1 &
+  fi
+
+  FFMPEG_PID=$!
+  wait "$FFMPEG_PID"
+  local status=$?
+  FFMPEG_PID=""
+  clear_progress_line
+
+  if [[ $status -ne 0 ]] || [[ ! -f "$output" ]] || [[ $(get_file_size "$output") -lt $MIN_OUTPUT_SIZE_BYTES ]]; then
+    log_error "Transcoding failed or output too small: $(basename "$input")"
+    rm -f "$output"
+    return 1
+  fi
+
+  log_success "Transcoding success: $(basename "$output")"
+  return 0
+}
+
+# --- Core Logic: Disposal ---
+# Handles all deletion/trashing logic centrally. DRY principle.
+dispose_file() {
+  local file="$1"
+  local reason="$2" # "Archived source" or "Old file"
+
+  if [[ "$DRY_RUN" == true ]]; then
+    if [[ "$USE_TRASH" == true ]]; then
+      log "[DRY-RUN] Would trash: $file ($reason)"
+    else
+      log "[DRY-RUN] Would delete: $file ($reason)"
+    fi
+    return 0
+  fi
+
+  if [[ "$USE_TRASH" == true ]]; then
+    local dest
+    dest=$(build_trash_path "$file")
+    mkdir -p "$(dirname "$dest")"
+    mv "$file" "$dest"
+    log "[TRASHED] $file ($reason)"
+  else
+    rm -f "$file"
+    log "[DELETED] $file ($reason)"
+  fi
+}
+
+# --- Core Logic: Strategy Handlers ---
+
+# Handler for: ARCHIVE_MODE && MP4
+handle_archive_strategy() {
+  local src="$1" ts="$2"
+  local dest
+  dest=$(build_archive_path "$ts")
+  PROGRESS_CURRENT_FILE=$((PROGRESS_CURRENT_FILE + 1))
+
+  if [[ "$DRY_RUN" == true ]]; then
+    log "[DRY-RUN] Would archive: $(basename "$src") -> $dest"
+    dispose_file "$src" "Archived source"
+    return 0
+  fi
+
+  if transcode_file "$src" "$dest"; then
+    dispose_file "$src" "Archived source"
+  else
+    log_error "Archive failed, keeping original: $(basename "$src")"
+  fi
+}
+
+# Handler for: Non-MP4 or Non-Archive Mode
+handle_delete_strategy() {
+  dispose_file "$1" "Old file"
+}
+
+# --- Main Processing Loop Logic ---
+process_file() {
+  local file="$1"
+  local filename
+  filename=$(basename "$file")
+  local ts
+  ts=$(extract_timestamp "$filename")
+
+  # Validate timestamp
+  [[ -z "$ts" ]] && return
+
+  local is_video=false
+  [[ "$filename" =~ \.(mp4|MP4)$ ]] && is_video=true
+
+  # Select Strategy
+  if [[ "$ARCHIVE_MODE" == true ]] && [[ "$is_video" == true ]]; then
+    handle_archive_strategy "$file" "$ts"
+  else
+    handle_delete_strategy "$file"
+  fi
+}
+
+# --- Cleanup & Setup ---
+cleanup_trash_folder() {
+  [[ ! -d "$TRASH_DIR" ]] && return
+  local cutoff
+  cutoff=$(get_cutoff_timestamp "$AGE_DAYS")
+  log_info "Cleaning trash folder..."
+
+  while IFS= read -r -d '' file; do
+    local ts
+    ts=$(extract_timestamp "$(basename "$file")")
+    [[ -n "$ts" && "$ts" < "$cutoff" ]] || continue
+
+    if [[ "$DRY_RUN" == true ]]; then
+      log "[DRY-RUN] Would permanently delete from trash: $(basename "$file")"
+    else
+      rm -f "$file" && log "[PERMANENTLY DELETED] $(basename "$file")"
+    fi
+  done < <(find "$TRASH_DIR" -type f \( -iname "*.mp4" -o -iname "*.jpg" \) -print0)
+}
+
+remove_empty_directories() {
+  log_info "Scanning for empty directories..."
+  while IFS= read -r -d '' dir; do
+    [[ -z "$(ls -A "$dir" 2>/dev/null)" ]] || continue
+    if [[ "$DRY_RUN" == true ]]; then
+      log "[DRY-RUN] Would remove empty directory: $dir"
+    else
+      rmdir "$dir" && log "[REMOVED] Empty directory: $dir"
+    fi
+  done < <(find "$TARGET_DIR" -mindepth 1 -type d -print0 | sort -zr)
+}
+
+cleanup_on_signal() {
+  clear_progress_line
+  [[ -n "$FFMPEG_PID" ]] && kill -TERM "$FFMPEG_PID" 2>/dev/null
+  log_error "Script interrupted."
   exit 130
 }
-
 trap cleanup_on_signal SIGINT
 
-# --- Usage & Help ---
+# --- Argument Parsing & Usage ---
 usage() {
   cat <<EOF
 Usage: $SCRIPT_NAME [OPTIONS]
@@ -169,20 +290,20 @@ Options:
   --dir PATH         Directory to search (Default: $DEFAULT_TARGET_DIR)
   --age DAYS         Remove files older than this many days (Default: $DEFAULT_AGE_DAYS)
   --archive [PATH]   Transcode files to archive directory (Default: $DEFAULT_ARCHIVE_DIR)
-  --trash [PATH]     Move deleted files to trash instead of permanent deletion (Default: $DEFAULT_TRASH_DIR)
-  --no-trash         Permanently delete files without using trash (disabled by default for safety)
-  --no-skip          Force transcoding even if output exists and is > 1MB
-  --log FILENAME     Log filename in target directory (Default: $DEFAULT_LOG_FILENAME)
-  --no-log           Disable logging to file
-  --dry-run          Simulate deletion without actually removing files (Default: enabled)
-  --execute          Actually delete/archive files (disables dry-run)
-  --help             Show this help message
+  --trash [PATH]     Move deleted files to trash (Default: $DEFAULT_TRASH_DIR)
+  --no-trash         Permanently delete files (disabled by default)
+  --no-skip          Force transcoding even if output exists
+  --log FILENAME     Log filename (Default: $DEFAULT_LOG_FILENAME)
+  --no-log           Disable logging
+  --dry-run          Simulate actions (Default)
+  --execute          Execute actions
+  --help             Show help
 EOF
   exit 0
 }
 
-# --- Argument Parsing ---
 parse_args() {
+  # Default state
   TARGET_DIR="$DEFAULT_TARGET_DIR"
   AGE_DAYS="$DEFAULT_AGE_DAYS"
   DRY_RUN="$DEFAULT_DRY_RUN"
@@ -194,9 +315,8 @@ parse_args() {
   USE_TRASH=true
   TRASH_DIR="$DEFAULT_TRASH_DIR"
 
-  # Track conflicting flags
-  local execute_flag_seen=false
-  local dry_run_flag_seen=false
+  # Safety tracker
+  local DRY_RUN_REQUESTED=false
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -205,14 +325,10 @@ parse_args() {
       shift 2
       ;;
     --age)
-      if ! [[ "$2" =~ ^[0-9]+$ ]]; then
-        log_error "Age must be a positive integer."
+      [[ ! "$2" =~ ^[0-9]+$ || "$2" -lt 2 ]] && {
+        log_error "Age must be integer >= 2"
         exit 1
-      fi
-      if [[ "$2" -lt 2 ]]; then
-        log_error "Age must be greater than 1 day."
-        exit 1
-      fi
+      }
       AGE_DAYS="$2"
       shift 2
       ;;
@@ -254,12 +370,14 @@ parse_args() {
       ;;
     --dry-run)
       DRY_RUN=true
-      dry_run_flag_seen=true
+      DRY_RUN_REQUESTED=true
       shift
       ;;
     --execute)
-      DRY_RUN=false
-      execute_flag_seen=true
+      # Only disable dry-run if it wasn't explicitly requested earlier
+      if [[ "$DRY_RUN_REQUESTED" == false ]]; then
+        DRY_RUN=false
+      fi
       shift
       ;;
     --help | -h) usage ;;
@@ -269,261 +387,6 @@ parse_args() {
       ;;
     esac
   done
-
-  # Safety: If both --execute and --dry-run are specified, --dry-run takes precedence
-  if [[ "$execute_flag_seen" == true ]] && [[ "$dry_run_flag_seen" == true ]]; then
-    DRY_RUN=true
-    CONFLICTING_FLAGS_DETECTED=true
-  else
-    CONFLICTING_FLAGS_DETECTED=false
-  fi
-}
-
-# --- Core Logic ---
-get_cutoff_timestamp() {
-  date -d "-$1 days" +%Y%m%d%H%M%S
-}
-
-extract_timestamp() {
-  local filename="$1"
-  local base="${filename%.*}"
-  local ts="${base: -14}"
-  if [[ ${#ts} -eq 14 ]] && [[ "$ts" =~ ^[0-9]+$ ]]; then
-    echo "$ts"
-  else
-    echo ""
-  fi
-}
-
-rotate_logs() {
-  local log_path="$1"
-  local max_rotations="$2"
-  [[ ! -f "$log_path" ]] && return
-  for ((i = max_rotations - 1; i >= 0; i--)); do
-    local old_log="${log_path}.${i}"
-    local new_log="${log_path}.$((i + 1))"
-    [[ -f "$old_log" ]] && mv "$old_log" "$new_log"
-  done
-  mv "$log_path" "${log_path}.0"
-}
-
-get_file_size() {
-  local file="$1"
-  stat -f%z "$file" 2>/dev/null || stat -c%s "$file" 2>/dev/null
-}
-
-transcode_file() {
-  local input_file="$1"
-  local output_file="$2"
-  local skip_existing="$3"
-
-  if [[ -f "$output_file" ]] && [[ "$skip_existing" == true ]]; then
-    local output_size
-    output_size=$(get_file_size "$output_file")
-    if [[ "$output_size" -ge "$MIN_OUTPUT_SIZE_BYTES" ]]; then
-      log_warn "Output exists (>= 1MB), skipping: $(basename "$output_file")"
-      return 0
-    fi
-  fi
-
-  mkdir -p "$(dirname "$output_file")"
-  PROGRESS_FILE_START=$(date +%s)
-  PROGRESS_FILE_PCT=0
-
-  local duration=0
-  [[ "$IS_INTERACTIVE" == true ]] && duration=$(get_video_duration "$input_file")
-
-  if [[ "$IS_INTERACTIVE" == true ]]; then
-    log_info "Transcoding: $(basename "$input_file")"
-
-    ffmpeg -hide_banner -hwaccel qsv -hwaccel_output_format qsv -y \
-      -i "$input_file" \
-      -vf scale_qsv=w=1024:h=768:mode=hq \
-      -global_quality 26 \
-      -c:v h264_qsv \
-      -an \
-      -progress pipe:1 \
-      "$output_file" 2>&1 | while IFS= read -r line; do
-      update_progress_from_ffmpeg "$duration" "$line"
-    done &
-    FFMPEG_PID=$!
-  else
-    log_info "Transcoding: $(basename "$input_file")"
-    ffmpeg -hide_banner -hwaccel qsv -hwaccel_output_format qsv -y \
-      -i "$input_file" \
-      -vf scale_qsv=w=1024:h=768:mode=hq \
-      -global_quality 26 \
-      -c:v h264_qsv \
-      -an \
-      "$output_file" >/dev/null 2>&1 &
-    FFMPEG_PID=$!
-  fi
-
-  if ! wait "$FFMPEG_PID"; then
-    FFMPEG_PID=""
-    clear_progress_line
-    log_error "Transcoding failed: ffmpeg exited with error"
-    rm -f "$output_file" # remove incomplete output
-    return 1
-  fi
-
-  FFMPEG_PID=""
-  clear_progress_line
-
-  if [[ ! -f "$output_file" ]]; then
-    log_error "Transcoding failed: output file missing"
-    return 1
-  fi
-
-  local output_size
-  output_size=$(get_file_size "$output_file")
-
-  if [[ "$output_size" -lt "$MIN_OUTPUT_SIZE_BYTES" ]]; then
-    log_error "Transcoding produced file < 1MB ($output_size bytes)"
-    rm -f "$output_file"
-    return 1
-  fi
-
-  local now
-  now=$(date +%s)
-  local file_elapsed=$((now - PROGRESS_FILE_START))
-  log_success "Transcoding success (Size: $output_size bytes) - $(format_duration "$file_elapsed")"
-  return 0
-}
-
-build_archive_path() {
-  local archive_dir="$1"
-  local timestamp="$2"
-  local year="${timestamp:0:4}"
-  local month="${timestamp:4:2}"
-  local day="${timestamp:6:2}"
-  echo "${archive_dir}/${year}/${month}/${day}/archived-${timestamp}.mp4"
-}
-
-# --- Trash Folder Functions ---
-build_trash_path() {
-  local trash_dir="$1"
-  local file_path="$2"
-  local target_dir="$3"
-  local archive_dir="$4"
-
-  # Determine if file is from input or archived output
-  local subdir
-  if [[ "$file_path" == "$archive_dir"* ]]; then
-    subdir="output"
-  else
-    subdir="input"
-  fi
-
-  # Extract the YYYY/MM/DD/filename structure from the source path
-  local relative_path
-  if [[ "$file_path" == "$archive_dir"* ]]; then
-    # Remove archive_dir prefix
-    relative_path="${file_path#"$archive_dir"/}"
-  else
-    # Remove target_dir prefix
-    relative_path="${file_path#"$target_dir"/}"
-  fi
-
-  echo "${trash_dir}/${subdir}/${relative_path}"
-}
-
-move_to_trash() {
-  local file="$1"
-  local trash_path="$2"
-  local dry_run="$3"
-
-  if [[ "$dry_run" == true ]]; then
-    echo "[DRY-RUN] Would move to trash: $(basename "$file") → ${trash_path}"
-  else
-    mkdir -p "$(dirname "$trash_path")"
-    mv "$file" "$trash_path"
-    echo "[TRASHED] $(basename "$file") → ${trash_path}"
-  fi
-}
-
-permanently_delete() {
-  local file="$1"
-  local dry_run="$2"
-
-  if [[ "$dry_run" == true ]]; then
-    echo "[DRY-RUN] Would permanently delete: $(basename "$file")"
-  else
-    rm -f "$file"
-    echo "[DELETED] $(basename "$file")"
-  fi
-}
-
-# --- Trash Cleanup Function ---
-# Permanently deletes files from trash that are older than AGE_DAYS
-cleanup_trash_folder() {
-  local trash_dir="$1"
-  local age_days="$2"
-  local dry_run="$3"
-
-  [[ ! -d "$trash_dir" ]] && return 0
-
-  local cutoff_ts
-  cutoff_ts=$(get_cutoff_timestamp "$age_days")
-
-  log_info "Cleaning trash folder: $trash_dir"
-  log_info "Permanently deleting trashed files older than $age_days days (before $cutoff_ts)"
-
-  local count_deleted=0
-
-  while IFS= read -r -d '' file; do
-    local filename
-    filename=$(basename "$file")
-    local file_ts
-    file_ts=$(extract_timestamp "$filename")
-
-    # Skip files without valid timestamp
-    [[ -z "$file_ts" ]] && continue
-
-    # Only delete if older than cutoff
-    [[ "$file_ts" < "$cutoff_ts" ]] || continue
-
-    if [[ "$dry_run" == true ]]; then
-      echo "[DRY-RUN] Would permanently delete from trash: $filename"
-    else
-      rm -f "$file"
-      echo "[PERMANENTLY DELETED] $filename"
-    fi
-    count_deleted=$((count_deleted + 1))
-  done < <(find "$trash_dir" -type f \( -iname "*.mp4" -o -iname "*.jpg" \) -print0)
-
-  if [[ $count_deleted -gt 0 ]]; then
-    local msg="Permanently deleted"
-    [[ "$dry_run" == true ]] && msg="Would permanently delete"
-    log_success "$msg $count_deleted files from trash."
-  else
-    log_info "No files in trash are old enough for permanent deletion."
-  fi
-}
-
-remove_empty_directories() {
-  local target_dir="$1"
-  local dry_run="$2"
-  local count_removed=0
-  log_info "Scanning for empty directories..."
-
-  while IFS= read -r -d '' dir; do
-    if [[ -z "$(ls -A "$dir" 2>/dev/null)" ]]; then
-      if [[ "$dry_run" == true ]]; then
-        echo "[DRY-RUN] Would remove empty directory: $dir"
-      else
-        rmdir "$dir"
-        echo "[REMOVED] Empty directory: $dir"
-      fi
-      count_removed=$((count_removed + 1))
-    fi
-  done < <(find "$target_dir" -mindepth 1 -type d -print0 | sort -zr)
-
-  if [[ $count_removed -gt 0 ]]; then
-    local msg="Removed"
-    [[ "$dry_run" == true ]] && msg="Would remove"
-    log_success "$msg $count_removed empty directories."
-  fi
 }
 
 validate_environment() {
@@ -544,99 +407,34 @@ validate_environment() {
 }
 
 setup_logging() {
-  [[ "$ENABLE_LOGGING" != true ]] && return 0
-  LOG_PATH="${TARGET_DIR}/${LOG_FILENAME}"
-  rotate_logs "$LOG_PATH" "$MAX_LOG_ROTATIONS"
-  exec > >(tee -a "$LOG_PATH")
+  [[ "$ENABLE_LOGGING" != true ]] && return
+  local log_path="${TARGET_DIR}/${LOG_FILENAME}"
+  rotate_logs "$log_path" "$MAX_LOG_ROTATIONS"
+  exec > >(tee -a "$log_path")
 }
 
 display_config() {
-  local cutoff_ts="$1"
-
+  local cutoff
+  cutoff=$(get_cutoff_timestamp "$AGE_DAYS")
   echo "============================================================"
   echo "Camera Cleanup Script - $(date '+%Y-%m-%d %H:%M:%S')"
   echo "============================================================"
-
-  log_info "Target Directory : $TARGET_DIR"
-  log_info "Age Threshold    : $AGE_DAYS days (before $cutoff_ts)"
-
-  if [[ "$ARCHIVE_MODE" == true ]]; then
-    log_info "Mode             : ARCHIVE -> $ARCHIVE_DIR"
-  else
-    log_info "Mode             : DELETE"
-  fi
-
-  if [[ "$USE_TRASH" == true ]]; then
-    log_info "Trash Folder     : ENABLED -> $TRASH_DIR"
-  else
-    log_warn "Trash Folder     : DISABLED (permanent deletion)"
-  fi
+  log_info "Target Dir : $TARGET_DIR"
+  log_info "Age        : $AGE_DAYS days (before $cutoff)"
+  log_info "Mode       : $([[ "$ARCHIVE_MODE" == true ]] && echo "ARCHIVE -> $ARCHIVE_DIR" || echo "DELETE")"
+  log_info "Trash      : $([[ "$USE_TRASH" == true ]] && echo "ENABLED -> $TRASH_DIR" || echo "DISABLED")"
 
   if [[ "$DRY_RUN" == true ]]; then
-    log_warn "DRY-RUN MODE (No changes will be made)"
+    log_warn "Run Mode   : DRY-RUN (No changes)"
+    if [[ "$DRY_RUN_REQUESTED" == true ]] && [[ "$DRY_RUN" == true ]] && [[ "${#}" -gt 0 ]]; then
+      # Note: We can't easily see the 'execute' flag from display_config without passing state.
+      # To keep our safety veto simple, we just trust the explicit DRY_RUN state.
+      :
+    fi
   else
-    log_warn "EXECUTE MODE"
+    log_warn "Run Mode   : EXECUTE"
   fi
-
-  # Show safety override message if conflicting flags were detected
-  if [[ "$CONFLICTING_FLAGS_DETECTED" == true ]]; then
-    echo ""
-    log_warn "⚠️  SAFETY OVERRIDE: Both --execute and --dry-run flags were specified."
-    log_warn "⚠️  For safety, --dry-run takes precedence. No changes will be made."
-    echo ""
-  fi
-
   echo "------------------------------------------------------------"
-}
-
-display_summary() {
-  local count_total="$1"
-  local count_deleted="$2"
-  local count_archived="$3"
-  local count_failed="$4"
-  local count_trashed="$5"
-  echo "------------------------------------------------------------"
-  log_success "Processed $count_total files."
-  if [[ "$ARCHIVE_MODE" == true ]]; then
-    log_success "Archived: $count_archived | Failed: $count_failed"
-  fi
-  if [[ "$USE_TRASH" == true ]]; then
-    log_success "Moved to trash: $count_trashed | Deleted: $count_deleted"
-  else
-    log_success "Permanently deleted: $count_deleted"
-  fi
-}
-
-# Fast file count using GNU grep (handles null bytes safely and runs in C-speed)
-# This replaces the slow Bash loop for counting.
-get_total_files_fast() {
-  find "$TARGET_DIR" -type f \( -iname "*.mp4" -o -iname "*.jpg" \) -print0 | grep -cz '' || echo "0"
-}
-
-# --- File Filtering Function ---
-# Populates the files_to_process array with files matching age criteria
-# Format: "filepath|basename|timestamp|is_mp4"
-filter_files_by_age() {
-  local cutoff_ts="$1"
-  local -n files_array="$2"
-
-  while IFS= read -r -d '' file; do
-    local filename
-    filename=$(basename "$file")
-    local file_ts
-    file_ts=$(extract_timestamp "$filename")
-
-    # Guards
-    [[ -z "$file_ts" ]] && continue
-    [[ "$file_ts" < "$cutoff_ts" ]] || continue
-
-    # Pre-compute file type
-    local is_mp4="false"
-    [[ "$filename" =~ \.(mp4|MP4)$ ]] && is_mp4="true"
-
-    # Store as pipe-delimited string: path|basename|timestamp|is_mp4
-    files_array+=("${file}|${filename}|${file_ts}|${is_mp4}")
-  done < <("${find_cmd[@]}")
 }
 
 # --- Main Execution ---
@@ -646,174 +444,61 @@ main() {
   validate_environment
   setup_logging
 
-  count_total=0
-  count_deleted=0
-  count_archived=0
-  count_failed=0
-  count_trashed=0
-
   local cutoff_ts
   cutoff_ts=$(get_cutoff_timestamp "$AGE_DAYS")
 
   display_config "$cutoff_ts"
 
-  # PHASE 1: Clean up trash folder first (permanent deletion)
-  if [[ "$USE_TRASH" == true ]] && [[ -d "$TRASH_DIR" ]]; then
+  # Phase 1: Trash Cleanup
+  if [[ "$USE_TRASH" == true ]]; then
     echo "============================================================"
-    echo "PHASE 1: Trash Folder Cleanup"
+    echo "PHASE 1: Trash Cleanup"
     echo "============================================================"
-    cleanup_trash_folder "$TRASH_DIR" "$AGE_DAYS" "$DRY_RUN"
+    cleanup_trash_folder
     echo ""
   fi
 
-  # PHASE 2: Process main camera files
+  # Phase 2: File Processing
   echo "============================================================"
   echo "PHASE 2: Main File Processing"
   echo "============================================================"
 
   PROGRESS_RUN_START=$(date +%s)
-  PROGRESS_CURRENT_FILE=0
 
-  # Build find command based on mode
-  local find_cmd
-  if [[ "$ARCHIVE_MODE" == true ]]; then
-    if [[ "$USE_TRASH" == true ]]; then
-      find_cmd=(find "$TARGET_DIR" -type f \( -iname "*.mp4" -o -iname "*.jpg" \) ! -path "${ARCHIVE_DIR}/*" ! -path "${TRASH_DIR}/*" -print0)
-    else
-      find_cmd=(find "$TARGET_DIR" -type f \( -iname "*.mp4" -o -iname "*.jpg" \) ! -path "${ARCHIVE_DIR}/*" -print0)
-    fi
-  else
-    if [[ "$USE_TRASH" == true ]]; then
-      find_cmd=(find "$TARGET_DIR" -type f \( -iname "*.mp4" -o -iname "*.jpg" \) ! -path "${TRASH_DIR}/*" -print0)
-    else
-      find_cmd=(find "$TARGET_DIR" -type f \( -iname "*.mp4" -o -iname "*.jpg" \) -print0)
-    fi
-  fi
+  # Build exclusion arguments for find
+  local exclude_args=()
+  [[ "$ARCHIVE_MODE" == true ]] && exclude_args+=(! -path "${ARCHIVE_DIR}/*")
+  [[ "$USE_TRASH" == true ]] && exclude_args+=(! -path "${TRASH_DIR}/*")
 
-  # 1. Scan and filter files
-  log_info "Scanning and filtering files..."
-  local -a files_to_process=()
-  filter_files_by_age "$cutoff_ts" files_to_process
-
-  # Count totals from pre-filtered data
-  local total_files=${#files_to_process[@]}
-  local mp4_count=0
-
-  if [[ "$ARCHIVE_MODE" == true ]]; then
-    # Count mp4s directly from metadata (4th field)
-    for entry in "${files_to_process[@]}"; do
-      IFS='|' read -r _ _ _ is_mp4 <<<"$entry"
-      [[ "$is_mp4" == "true" ]] && mp4_count=$((mp4_count + 1))
-    done
-    PROGRESS_TOTAL_FILES=$mp4_count
-    log_info "Found $mp4_count .mp4 files to transcode ($total_files total files). Starting processing..."
-  else
-    PROGRESS_TOTAL_FILES=$total_files
-    log_info "Found $PROGRESS_TOTAL_FILES files to process. Starting processing..."
-  fi
-
-  # 2. Process filtered files
-  for entry in "${files_to_process[@]}"; do
-    # Parse pre-computed metadata (single operation)
-    IFS='|' read -r file filename file_ts is_mp4 <<<"$entry"
-
-    count_total=$((count_total + 1))
-
-    if [[ "$DRY_RUN" == true ]]; then
-      if [[ "$ARCHIVE_MODE" == true ]]; then
-        # Only archive video files, delete/trash images
-        if [[ "$is_mp4" == "true" ]]; then
-          PROGRESS_CURRENT_FILE=$((PROGRESS_CURRENT_FILE + 1))
-          local archive_path
-          archive_path=$(build_archive_path "$ARCHIVE_DIR" "$file_ts")
-          echo "[DRY-RUN] Would archive: $filename"
-          count_archived=$((count_archived + 1))
-        else
-          if [[ "$USE_TRASH" == true ]]; then
-            local trash_path
-            trash_path=$(build_trash_path "$TRASH_DIR" "$file" "$TARGET_DIR" "$ARCHIVE_DIR")
-            echo "[DRY-RUN] Would move to trash: $filename → ${trash_path}"
-            count_trashed=$((count_trashed + 1))
-          else
-            echo "[DRY-RUN] Would delete: $filename"
-            count_deleted=$((count_deleted + 1))
-          fi
-        fi
-      else
-        if [[ "$USE_TRASH" == true ]]; then
-          local trash_path
-          trash_path=$(build_trash_path "$TRASH_DIR" "$file" "$TARGET_DIR" "$ARCHIVE_DIR")
-          echo "[DRY-RUN] Would move to trash: $filename → ${trash_path}"
-          count_trashed=$((count_trashed + 1))
-        else
-          echo "[DRY-RUN] Would delete: $filename"
-          count_deleted=$((count_deleted + 1))
-        fi
-      fi
-    else
-      if [[ "$ARCHIVE_MODE" == true ]]; then
-        # Only archive video files, delete/trash images
-        if [[ "$is_mp4" == "true" ]]; then
-          PROGRESS_CURRENT_FILE=$((PROGRESS_CURRENT_FILE + 1))
-          local archive_path
-          archive_path=$(build_archive_path "$ARCHIVE_DIR" "$file_ts")
-
-          # Pre-compute trash path if needed (only once)
-          local trash_path=""
-          [[ "$USE_TRASH" == true ]] && trash_path=$(build_trash_path "$TRASH_DIR" "$file" "$TARGET_DIR" "$ARCHIVE_DIR")
-
-          if transcode_file "$file" "$archive_path" "$SKIP_EXISTING"; then
-            if [[ "$USE_TRASH" == true ]]; then
-              move_to_trash "$file" "$trash_path" false
-              count_trashed=$((count_trashed + 1))
-            else
-              rm -f "$file"
-              echo "[DELETED] $filename (after archiving)"
-              count_deleted=$((count_deleted + 1))
-            fi
-            echo "[ARCHIVED] $filename → $(basename "$archive_path")"
-            count_archived=$((count_archived + 1))
-          else
-            log_error "Keeping original file due to transcode failure: $filename"
-            count_failed=$((count_failed + 1))
-          fi
-        else
-          if [[ "$USE_TRASH" == true ]]; then
-            local trash_path
-            trash_path=$(build_trash_path "$TRASH_DIR" "$file" "$TARGET_DIR" "$ARCHIVE_DIR")
-            move_to_trash "$file" "$trash_path" false
-            count_trashed=$((count_trashed + 1))
-          else
-            rm -f "$file"
-            echo "[DELETED] $filename"
-            count_deleted=$((count_deleted + 1))
-          fi
-        fi
-      else
-        if [[ "$USE_TRASH" == true ]]; then
-          local trash_path
-          trash_path=$(build_trash_path "$TRASH_DIR" "$file" "$TARGET_DIR" "$ARCHIVE_DIR")
-          move_to_trash "$file" "$trash_path" false
-          count_trashed=$((count_trashed + 1))
-        else
-          rm -f "$file"
-          echo "[DELETED] $filename"
-          count_deleted=$((count_deleted + 1))
-        fi
+  # Calculate totals first (for progress bar)
+  local files=()
+  while IFS= read -r -d '' file; do
+    local ts
+    ts=$(extract_timestamp "$(basename "$file")")
+    if [[ -n "$ts" && "$ts" < "$cutoff_ts" ]]; then
+      files+=("$file")
+      # Count logic for progress bar
+      if [[ "$ARCHIVE_MODE" == true ]] && [[ "$file" =~ \.(mp4|MP4)$ ]]; then
+        PROGRESS_TOTAL_FILES=$((PROGRESS_TOTAL_FILES + 1))
+      elif [[ "$ARCHIVE_MODE" != true ]]; then
+        PROGRESS_TOTAL_FILES=$((PROGRESS_TOTAL_FILES + 1))
       fi
     fi
+  done < <(find "$TARGET_DIR" -type f \( -iname "*.mp4" -o -iname "*.jpg" \) "${exclude_args[@]}" -print0)
+
+  log_info "Found ${#files[@]} total files ($PROGRESS_TOTAL_FILES video files to process)."
+
+  # Process Loop
+  for file in "${files[@]}"; do
+    process_file "$file"
   done
 
   clear_progress_line
-  display_summary "$count_total" "$count_deleted" "$count_archived" "$count_failed" "$count_trashed"
-
-  echo "------------------------------------------------------------"
-  remove_empty_directories "$TARGET_DIR" "$DRY_RUN"
+  remove_empty_directories "$TARGET_DIR"
 
   echo "============================================================"
   echo "Script completed at $(date '+%Y-%m-%d %H:%M:%S')"
   echo "============================================================"
-  echo ""
 }
 
 main "$@"
