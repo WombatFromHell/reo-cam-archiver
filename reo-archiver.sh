@@ -137,6 +137,7 @@ rotate_logs() {
 }
 
 # --- Centralized File Collection ---
+# --- Centralized File Collection ---
 collect_all_files() {
   local cutoff_ts
   cutoff_ts=$(get_cutoff_timestamp "$AGE_DAYS")
@@ -152,25 +153,40 @@ collect_all_files() {
   TRASH_CLEANUP_FILES=()
   MAIN_PROCESSING_FILES=()
 
+  # Helper function to process a file entry
+  process_file_entry() {
+    local file="$1" size="$2" location="$3"
+    local basename ts is_video
+
+    basename=$(basename "$file")
+    ts=$(extract_timestamp "$basename")
+    [[ -z "$ts" ]] && return 0
+
+    is_video="false"
+    [[ "$basename" =~ \.(mp4|MP4)$ ]] && is_video="true"
+
+    ALL_FILES+=("$file|$ts|$size|$is_video|$location")
+
+    # For size limit enforcement (age threshold)
+    if [[ "$ts" < "$cutoff_ts" ]]; then
+      SIZE_LIMIT_FILES+=("$file|$ts|$size")
+
+      # For main processing (input files only)
+      [[ "$location" == "input" ]] && MAIN_PROCESSING_FILES+=("$file|$ts|$size|$is_video")
+    fi
+
+    # For trash cleanup (trash age threshold)
+    [[ "$location" == "trash" && "$ts" < "$trash_cutoff_ts" ]] && TRASH_CLEANUP_FILES+=("$file|$ts|$size")
+
+    return 0
+  }
+
   # Collect from trash directory
+  # Using -printf '%p\0%s\0' to get path and size in one find call
   if [[ -d "$TRASH_DIR" ]]; then
-    while IFS= read -r -d '' file; do
-      local ts size is_video
-      ts=$(extract_timestamp "$(basename "$file")")
-      [[ -z "$ts" ]] && continue
-
-      size=$(get_file_size "$file")
-      is_video="false"
-      [[ "$file" =~ \.(mp4|MP4)$ ]] && is_video="true"
-
-      ALL_FILES+=("$file|$ts|$size|$is_video|trash")
-
-      # For size limit enforcement (age threshold)
-      [[ "$ts" < "$cutoff_ts" ]] && SIZE_LIMIT_FILES+=("$file|$ts|$size")
-
-      # For trash cleanup (trash age threshold)
-      [[ "$ts" < "$trash_cutoff_ts" ]] && TRASH_CLEANUP_FILES+=("$file|$ts|$size")
-    done < <(find "$TRASH_DIR" -type f \( -iname "*.mp4" -o -iname "*.jpg" \) -print0 2>/dev/null)
+    while IFS= read -r -d '' file && IFS= read -r -d '' size; do
+      process_file_entry "$file" "$size" "trash"
+    done < <(find "$TRASH_DIR" -type f \( -iname "*.mp4" -o -iname "*.jpg" \) -printf '%p\0%s\0' 2>/dev/null)
   fi
 
   # Collect from input directory (excluding trash and archive)
@@ -178,39 +194,15 @@ collect_all_files() {
   [[ -d "$TRASH_DIR" ]] && exclude_args+=(! -path "${TRASH_DIR}/*")
   [[ "$ARCHIVE_MODE" == true ]] && [[ -d "$ARCHIVE_DIR" ]] && exclude_args+=(! -path "${ARCHIVE_DIR}/*")
 
-  while IFS= read -r -d '' file; do
-    local ts size is_video
-    ts=$(extract_timestamp "$(basename "$file")")
-    [[ -z "$ts" ]] && continue
-
-    size=$(get_file_size "$file")
-    is_video="false"
-    [[ "$file" =~ \.(mp4|MP4)$ ]] && is_video="true"
-
-    ALL_FILES+=("$file|$ts|$size|$is_video|input")
-
-    # For size limit enforcement (age threshold)
-    [[ "$ts" < "$cutoff_ts" ]] && SIZE_LIMIT_FILES+=("$file|$ts|$size")
-
-    # For main processing (age threshold)
-    [[ "$ts" < "$cutoff_ts" ]] && MAIN_PROCESSING_FILES+=("$file|$ts|$size|$is_video")
-  done < <(find "$TARGET_DIR" -type f \( -iname "*.mp4" -o -iname "*.jpg" \) "${exclude_args[@]}" -print0 2>/dev/null)
+  while IFS= read -r -d '' file && IFS= read -r -d '' size; do
+    process_file_entry "$file" "$size" "input"
+  done < <(find "$TARGET_DIR" -type f \( -iname "*.mp4" -o -iname "*.jpg" \) "${exclude_args[@]}" -printf '%p\0%s\0' 2>/dev/null)
 
   # Collect from archive directory (if archive mode enabled)
   if [[ "$ARCHIVE_MODE" == true ]] && [[ -d "$ARCHIVE_DIR" ]]; then
-    while IFS= read -r -d '' file; do
-      local ts size is_video
-      ts=$(extract_timestamp "$(basename "$file")")
-      [[ -z "$ts" ]] && continue
-
-      size=$(get_file_size "$file")
-      is_video="true" # Archive only has videos
-
-      ALL_FILES+=("$file|$ts|$size|$is_video|archive")
-
-      # For size limit enforcement (age threshold)
-      [[ "$ts" < "$cutoff_ts" ]] && SIZE_LIMIT_FILES+=("$file|$ts|$size")
-    done < <(find "$ARCHIVE_DIR" -type f -iname "*.mp4" -print0 2>/dev/null)
+    while IFS= read -r -d '' file && IFS= read -r -d '' size; do
+      process_file_entry "$file" "$size" "archive"
+    done < <(find "$ARCHIVE_DIR" -type f -iname "*.mp4" -printf '%p\0%s\0' 2>/dev/null)
   fi
 
   log_info "Collected ${#ALL_FILES[@]} total files across all directories."
