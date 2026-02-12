@@ -103,9 +103,21 @@ extract_timestamp() {
 
 build_archive_path() { echo "${ARCHIVE_DIR}/${1:0:4}/${1:4:2}/${1:6:2}/archived-${1}.mp4"; }
 build_trash_path() {
-  local file="$1" prefix="$TARGET_DIR"
-  [[ "$file" == "$ARCHIVE_DIR"* ]] && prefix="$ARCHIVE_DIR"
-  echo "${TRASH_DIR}/${file#"$prefix"/}"
+  local file="$1"
+
+  # Default to 'input' category (files originating from TARGET_DIR)
+  local source_root="$TARGET_DIR"
+  local category="input"
+
+  # Override: switch to 'output' category for archived files
+  if [[ -n "${ARCHIVE_DIR:-}" ]] && [[ "$file" == "$ARCHIVE_DIR"* ]]; then
+    source_root="$ARCHIVE_DIR"
+    category="output"
+  fi
+
+  # Assemble path: TRASH_DIR/<category>/<relative_path>
+  # where <relative_path> = '<YYYY>/<MM>/<DD>/...'
+  printf "%s/%s/%s\n" "$TRASH_DIR" "$category" "${file#"$source_root"/}"
 }
 
 rotate_logs() {
