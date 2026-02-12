@@ -16,6 +16,7 @@ DEFAULT_AGE_DAYS=14
 DEFAULT_TRASH_AGE_DAYS=21
 DEFAULT_LOG_FILENAME="archiver.log"
 DEFAULT_DRY_RUN=true
+DEFAULT_MAX_SIZE="1TB"
 MAX_LOG_ROTATIONS=3
 MIN_OUTPUT_SIZE_BYTES=1048576
 
@@ -29,6 +30,14 @@ ARCHIVE_DIR=""
 SKIP_EXISTING=true
 USE_TRASH=true
 TRASH_DIR=""
+MAX_SIZE_BYTES=0
+
+# --- File Collection Cache ---
+# Arrays to hold pre-collected file data (populated once, used by all phases)
+declare -a ALL_FILES=()             # All files with metadata: "path|timestamp|size|is_video"
+declare -a SIZE_LIMIT_FILES=()      # Files eligible for size-based cleanup
+declare -a TRASH_CLEANUP_FILES=()   # Files in trash older than trash age
+declare -a MAIN_PROCESSING_FILES=() # Files for main processing (archive/delete)
 
 # --- Progress State ---
 IS_INTERACTIVE=false
@@ -125,6 +134,146 @@ rotate_logs() {
   [[ ! -f "$log" ]] && return
   for ((i = max - 1; i >= 0; i--)); do mv "${log}.${i}" "${log}.$((i + 1))" 2>/dev/null || true; done
   mv "$log" "${log}.0"
+}
+
+# --- Centralized File Collection ---
+collect_all_files() {
+  local cutoff_ts
+  cutoff_ts=$(get_cutoff_timestamp "$AGE_DAYS")
+
+  local trash_cutoff_ts
+  trash_cutoff_ts=$(get_cutoff_timestamp "$DEFAULT_TRASH_AGE_DAYS")
+
+  log_info "Collecting files from all managed directories..."
+
+  # Clear arrays
+  ALL_FILES=()
+  SIZE_LIMIT_FILES=()
+  TRASH_CLEANUP_FILES=()
+  MAIN_PROCESSING_FILES=()
+
+  # Collect from trash directory
+  if [[ -d "$TRASH_DIR" ]]; then
+    while IFS= read -r -d '' file; do
+      local ts size is_video
+      ts=$(extract_timestamp "$(basename "$file")")
+      [[ -z "$ts" ]] && continue
+
+      size=$(get_file_size "$file")
+      is_video="false"
+      [[ "$file" =~ \.(mp4|MP4)$ ]] && is_video="true"
+
+      ALL_FILES+=("$file|$ts|$size|$is_video|trash")
+
+      # For size limit enforcement (age threshold)
+      [[ "$ts" < "$cutoff_ts" ]] && SIZE_LIMIT_FILES+=("$file|$ts|$size")
+
+      # For trash cleanup (trash age threshold)
+      [[ "$ts" < "$trash_cutoff_ts" ]] && TRASH_CLEANUP_FILES+=("$file|$ts|$size")
+    done < <(find "$TRASH_DIR" -type f \( -iname "*.mp4" -o -iname "*.jpg" \) -print0 2>/dev/null)
+  fi
+
+  # Collect from input directory (excluding trash and archive)
+  local exclude_args=()
+  [[ -d "$TRASH_DIR" ]] && exclude_args+=(! -path "${TRASH_DIR}/*")
+  [[ "$ARCHIVE_MODE" == true ]] && [[ -d "$ARCHIVE_DIR" ]] && exclude_args+=(! -path "${ARCHIVE_DIR}/*")
+
+  while IFS= read -r -d '' file; do
+    local ts size is_video
+    ts=$(extract_timestamp "$(basename "$file")")
+    [[ -z "$ts" ]] && continue
+
+    size=$(get_file_size "$file")
+    is_video="false"
+    [[ "$file" =~ \.(mp4|MP4)$ ]] && is_video="true"
+
+    ALL_FILES+=("$file|$ts|$size|$is_video|input")
+
+    # For size limit enforcement (age threshold)
+    [[ "$ts" < "$cutoff_ts" ]] && SIZE_LIMIT_FILES+=("$file|$ts|$size")
+
+    # For main processing (age threshold)
+    [[ "$ts" < "$cutoff_ts" ]] && MAIN_PROCESSING_FILES+=("$file|$ts|$size|$is_video")
+  done < <(find "$TARGET_DIR" -type f \( -iname "*.mp4" -o -iname "*.jpg" \) "${exclude_args[@]}" -print0 2>/dev/null)
+
+  # Collect from archive directory (if archive mode enabled)
+  if [[ "$ARCHIVE_MODE" == true ]] && [[ -d "$ARCHIVE_DIR" ]]; then
+    while IFS= read -r -d '' file; do
+      local ts size is_video
+      ts=$(extract_timestamp "$(basename "$file")")
+      [[ -z "$ts" ]] && continue
+
+      size=$(get_file_size "$file")
+      is_video="true" # Archive only has videos
+
+      ALL_FILES+=("$file|$ts|$size|$is_video|archive")
+
+      # For size limit enforcement (age threshold)
+      [[ "$ts" < "$cutoff_ts" ]] && SIZE_LIMIT_FILES+=("$file|$ts|$size")
+    done < <(find "$ARCHIVE_DIR" -type f -iname "*.mp4" -print0 2>/dev/null)
+  fi
+
+  log_info "Collected ${#ALL_FILES[@]} total files across all directories."
+}
+
+# --- Size Utilities ---
+parse_size() {
+  local input="$1"
+  local size_value size_unit
+
+  # Extract numeric value and unit
+  if [[ "$input" =~ ^([0-9]+\.?[0-9]*)([KMGTkmgt]i?[Bb]?)$ ]]; then
+    size_value="${BASH_REMATCH[1]}"
+    size_unit="${BASH_REMATCH[2]}"
+  else
+    echo "0"
+    return 1
+  fi
+
+  # Convert to uppercase for consistency
+  size_unit="${size_unit^^}"
+
+  # Calculate bytes based on unit
+  local multiplier=1
+  case "$size_unit" in
+  KB | K) multiplier=1000 ;;
+  KIB) multiplier=1024 ;;
+  MB | M) multiplier=1000000 ;;
+  MIB) multiplier=1048576 ;;
+  GB | G) multiplier=1000000000 ;;
+  GIB) multiplier=1073741824 ;;
+  TB | T) multiplier=1000000000000 ;;
+  TIB) multiplier=1099511627776 ;;
+  B | "") multiplier=1 ;;
+  *)
+    echo "0"
+    return 1
+    ;;
+  esac
+
+  # Use awk for floating point multiplication
+  awk -v val="$size_value" -v mult="$multiplier" 'BEGIN { printf "%.0f", val * mult }'
+}
+
+format_size() {
+  local bytes=$1
+  if [[ $bytes -lt 1024 ]]; then
+    echo "${bytes}B"
+  elif [[ $bytes -lt 1048576 ]]; then
+    awk -v b="$bytes" 'BEGIN { printf "%.2fKiB", b/1024 }'
+  elif [[ $bytes -lt 1073741824 ]]; then
+    awk -v b="$bytes" 'BEGIN { printf "%.2fMiB", b/1048576 }'
+  elif [[ $bytes -lt 1099511627776 ]]; then
+    awk -v b="$bytes" 'BEGIN { printf "%.2fGiB", b/1073741824 }'
+  else
+    awk -v b="$bytes" 'BEGIN { printf "%.2fTiB", b/1099511627776 }'
+  fi
+}
+
+get_directory_size() {
+  local dir="$1"
+  [[ ! -d "$dir" ]] && echo "0" && return
+  du -sb "$dir" 2>/dev/null | cut -f1 || echo "0"
 }
 
 # --- Core Logic: Transcode ---
@@ -242,27 +391,103 @@ process_file() {
   fi
 }
 
+# --- Size-Based Cleanup ---
+enforce_size_limit() {
+  [[ $MAX_SIZE_BYTES -le 0 ]] && return
+
+  echo "============================================================"
+  echo "PHASE 0: Size Limit Enforcement"
+  echo "============================================================"
+
+  # Calculate sizes in priority order: trash, input, archive
+  local trash_size=0 input_size=0 archive_size=0
+
+  log_info "Calculating directory sizes..."
+
+  if [[ -d "$TRASH_DIR" ]]; then
+    trash_size=$(get_directory_size "$TRASH_DIR")
+    log_info "Trash size: $(format_size "$trash_size")"
+  fi
+
+  # Calculate input size (year directories in TARGET_DIR)
+  if [[ -d "$TARGET_DIR" ]]; then
+    for year_dir in "$TARGET_DIR"/[0-9][0-9][0-9][0-9]; do
+      [[ -d "$year_dir" ]] || continue
+      local year_size
+      year_size=$(get_directory_size "$year_dir")
+      input_size=$((input_size + year_size))
+    done
+    log_info "Input size: $(format_size "$input_size")"
+  fi
+
+  if [[ "$ARCHIVE_MODE" == true ]] && [[ -d "$ARCHIVE_DIR" ]]; then
+    archive_size=$(get_directory_size "$ARCHIVE_DIR")
+    log_info "Archive size: $(format_size "$archive_size")"
+  fi
+
+  local total_size=$((trash_size + input_size + archive_size))
+  log_info "Total managed size: $(format_size "$total_size") / $(format_size "$MAX_SIZE_BYTES")"
+
+  if [[ $total_size -le $MAX_SIZE_BYTES ]]; then
+    log_success "Total size within limit. No size-based cleanup needed."
+    echo ""
+    return
+  fi
+
+  local excess=$((total_size - MAX_SIZE_BYTES))
+  log_warn "Exceeding size limit by $(format_size "$excess"). Finding files to remove..."
+
+  # Use pre-collected files and sort by timestamp (oldest first)
+  local -a sorted_candidates=()
+  while IFS= read -r line; do
+    sorted_candidates+=("$line")
+  done < <(printf "%s\n" "${SIZE_LIMIT_FILES[@]}" | sort -t'|' -k2)
+
+  log_info "Found ${#sorted_candidates[@]} eligible files older than $AGE_DAYS days."
+
+  # Remove files oldest-first until we're under the limit
+  local removed_size=0
+  local removed_count=0
+
+  for entry in "${sorted_candidates[@]}"; do
+    [[ $removed_size -ge $excess ]] && break
+
+    IFS='|' read -r file_path _ file_size <<<"$entry"
+
+    if [[ "$DRY_RUN" == true ]]; then
+      log "[DRY-RUN] Would permanently delete: $(basename "$file_path") ($(format_size "$file_size"))"
+    else
+      rm -f "$file_path" && log "[SIZE-LIMIT] Deleted: $(basename "$file_path") ($(format_size "$file_size"))"
+    fi
+
+    removed_size=$((removed_size + file_size))
+    removed_count=$((removed_count + 1))
+  done
+
+  log_success "Size-based cleanup: removed $removed_count files ($(format_size "$removed_size"))"
+  log_info "New total size: $(format_size $((total_size - removed_size)))"
+  echo ""
+}
+
 # --- Cleanup & Setup ---
 cleanup_trash_folder() {
   [[ ! -d "$TRASH_DIR" ]] && return
 
-  local trash_age="${DEFAULT_TRASH_AGE_DAYS:-30}"
-  local cutoff
-  cutoff=$(get_cutoff_timestamp "$trash_age")
+  log_info "Cleaning trash folder (files older than $DEFAULT_TRASH_AGE_DAYS days)..."
 
-  log_info "Cleaning trash folder (files older than $trash_age days)..."
-
-  while IFS= read -r -d '' file; do
-    local ts
-    ts=$(extract_timestamp "$(basename "$file")")
-    [[ -n "$ts" && "$ts" < "$cutoff" ]] || continue
+  local cleaned_count=0
+  for entry in "${TRASH_CLEANUP_FILES[@]}"; do
+    IFS='|' read -r file_path _ _ <<<"$entry"
 
     if [[ "$DRY_RUN" == true ]]; then
-      log "[DRY-RUN] Would permanently delete from trash: $(basename "$file")"
+      log "[DRY-RUN] Would permanently delete from trash: $(basename "$file_path")"
     else
-      rm -f "$file" && log "[PERMANENTLY DELETED] $(basename "$file")"
+      rm -f "$file_path" && log "[PERMANENTLY DELETED] $(basename "$file_path")"
     fi
-  done < <(find "$TRASH_DIR" -type f \( -iname "*.mp4" -o -iname "*.jpg" \) -print0)
+    cleaned_count=$((cleaned_count + 1))
+  done
+
+  [[ $cleaned_count -gt 0 ]] && log_info "Cleaned $cleaned_count files from trash."
 }
 
 remove_empty_directories() {
@@ -297,6 +522,7 @@ Options:
   --trash [PATH]     Move deleted files to trash (Default: $DEFAULT_TRASH_DIR)
   --no-trash         Permanently delete files (disabled by default)
   --no-skip          Force transcoding even if output exists
+  --max-size SIZE    Maximum total size (Default: $DEFAULT_MAX_SIZE, use 0 to disable)
   --log FILENAME     Log filename (Default: $DEFAULT_LOG_FILENAME)
   --no-log           Disable logging
   --dry-run          Simulate actions (Default)
@@ -317,6 +543,9 @@ parse_args() {
   SKIP_EXISTING=true
   USE_TRASH=true
   TRASH_DIR="$DEFAULT_TRASH_DIR"
+
+  # Parse default max size
+  MAX_SIZE_BYTES=$(parse_size "$DEFAULT_MAX_SIZE")
 
   local DRY_RUN_REQUESTED=false
 
@@ -361,6 +590,18 @@ parse_args() {
     --no-skip)
       SKIP_EXISTING=false
       shift
+      ;;
+    --max-size)
+      if [[ "$2" == "0" ]]; then
+        MAX_SIZE_BYTES=0
+      else
+        MAX_SIZE_BYTES=$(parse_size "$2")
+        if [[ $MAX_SIZE_BYTES -eq 0 ]]; then
+          log_error "Invalid size format: $2 (use format like 1TiB, 500GiB, 100GB, or 0 to disable)"
+          exit 1
+        fi
+      fi
+      shift 2
       ;;
     --log)
       LOG_FILENAME="$2"
@@ -425,6 +666,12 @@ display_config() {
   log_info "Mode       : $([[ "$ARCHIVE_MODE" == true ]] && echo "ARCHIVE -> $ARCHIVE_DIR" || echo "DELETE")"
   log_info "Trash      : $([[ "$USE_TRASH" == true ]] && echo "ENABLED -> $TRASH_DIR" || echo "DISABLED")"
 
+  if [[ $MAX_SIZE_BYTES -gt 0 ]]; then
+    log_info "Size Limit : $(format_size "$MAX_SIZE_BYTES")"
+  else
+    log_info "Size Limit : DISABLED"
+  fi
+
   if [[ "$DRY_RUN" == true ]]; then
     log_warn "Run Mode   : DRY-RUN (No changes)"
   else
@@ -439,13 +686,16 @@ main() {
   validate_environment
   setup_logging
 
-  local cutoff_ts
-  cutoff_ts=$(get_cutoff_timestamp "$AGE_DAYS")
-
   display_config
 
+  # COLLECT ALL FILES ONCE - used by all phases
+  collect_all_files
+
+  # Phase 0: Size Limit Enforcement (if enabled)
+  enforce_size_limit
+
   # Phase 1: Trash Cleanup
-  if [[ "$USE_TRASH" == true ]]; then
+  if [[ "$USE_TRASH" == true ]] && [[ ${#TRASH_CLEANUP_FILES[@]} -gt 0 ]]; then
     echo "============================================================"
     echo "PHASE 1: Trash Cleanup"
     echo "============================================================"
@@ -460,32 +710,23 @@ main() {
 
   PROGRESS_RUN_START=$(date +%s)
 
-  local exclude_args=()
-  [[ "$ARCHIVE_MODE" == true ]] && exclude_args+=(! -path "${ARCHIVE_DIR}/*")
-  [[ "$USE_TRASH" == true ]] && exclude_args+=(! -path "${TRASH_DIR}/*")
+  # Count video files for progress tracking
+  PROGRESS_TOTAL_FILES=0
+  if [[ "$ARCHIVE_MODE" == true ]]; then
+    for entry in "${MAIN_PROCESSING_FILES[@]}"; do
+      IFS='|' read -r _ _ _ is_video <<<"$entry"
+      [[ "$is_video" == "true" ]] && PROGRESS_TOTAL_FILES=$((PROGRESS_TOTAL_FILES + 1))
+    done
+  else
+    PROGRESS_TOTAL_FILES=${#MAIN_PROCESSING_FILES[@]}
+  fi
 
-  local files=()
-  while IFS= read -r -d '' file; do
-    local ts
-    ts=$(extract_timestamp "$(basename "$file")")
+  log_info "Found ${#MAIN_PROCESSING_FILES[@]} total files ($PROGRESS_TOTAL_FILES video files to process)."
 
-    if [[ -n "$ts" && "$ts" < "$cutoff_ts" ]]; then
-      files+=("$file")
-
-      if [[ "$ARCHIVE_MODE" == true ]]; then
-        if [[ "$file" =~ \.(mp4|MP4)$ ]]; then
-          PROGRESS_TOTAL_FILES=$((PROGRESS_TOTAL_FILES + 1))
-        fi
-      else
-        PROGRESS_TOTAL_FILES=$((PROGRESS_TOTAL_FILES + 1))
-      fi
-    fi
-  done < <(find "$TARGET_DIR" -type f \( -iname "*.mp4" -o -iname "*.jpg" \) "${exclude_args[@]}" -print0)
-
-  log_info "Found ${#files[@]} total files ($PROGRESS_TOTAL_FILES video files to process)."
-
-  for file in "${files[@]}"; do
-    process_file "$file"
+  # Process each file
+  for entry in "${MAIN_PROCESSING_FILES[@]}"; do
+    IFS='|' read -r file_path _ _ _ <<<"$entry"
+    process_file "$file_path"
   done
 
   clear_progress_line
