@@ -34,10 +34,10 @@ MAX_SIZE_BYTES=0
 
 # --- File Collection Cache ---
 # Arrays to hold pre-collected file data (populated once, used by all phases)
-declare -a ALL_FILES=()             # All files with metadata: "path|timestamp|size|is_video"
 declare -a SIZE_LIMIT_FILES=()      # Files eligible for size-based cleanup
 declare -a TRASH_CLEANUP_FILES=()   # Files in trash older than trash age
 declare -a MAIN_PROCESSING_FILES=() # Files for main processing (archive/delete)
+TOTAL_FILE_COUNT=0
 
 # --- Progress State ---
 IS_INTERACTIVE=false
@@ -46,17 +46,14 @@ PROGRESS_CURRENT_FILE=0
 PROGRESS_FILE_START=0
 PROGRESS_RUN_START=0
 
-# --- Summary Statistics ---
-STATS_ARCHIVED_COUNT=0
-STATS_ARCHIVED_SIZE=0
-STATS_DELETED_COUNT=0
-STATS_DELETED_SIZE=0
-STATS_TRASHED_COUNT=0
-STATS_TRASHED_SIZE=0
-STATS_SIZE_LIMIT_COUNT=0
-STATS_SIZE_LIMIT_SIZE=0
-STATS_TRASH_CLEANUP_COUNT=0
-STATS_TRASH_CLEANUP_SIZE=0
+# --- Summary Statistics (Associative Array) ---
+declare -A STATS=(
+  [archived_count]=0 [archived_size]=0
+  [deleted_count]=0 [deleted_size]=0
+  [trashed_count]=0 [trashed_size]=0
+  [size_limit_count]=0 [size_limit_size]=0
+  [trash_cleanup_count]=0 [trash_cleanup_size]=0
+)
 
 # --- Logging & Output ---
 log() { echo -e "$*"; }
@@ -162,12 +159,11 @@ collect_all_files() {
   log_info "Collecting files from all managed directories..."
 
   # Clear arrays
-  ALL_FILES=()
   SIZE_LIMIT_FILES=()
   TRASH_CLEANUP_FILES=()
   MAIN_PROCESSING_FILES=()
+  TOTAL_FILE_COUNT=0
 
-  # Local variables for the loop (declared once for performance)
   local file size filename base ts is_video location
   local find_args=()
 
@@ -178,46 +174,28 @@ collect_all_files() {
   [[ "$ARCHIVE_MODE" == true && -d "$ARCHIVE_DIR" ]] && sources+=("$ARCHIVE_DIR|archive")
 
   for src in "${sources[@]}"; do
-    # Split "Path|Location" into variables
     IFS='|' read -r root location <<<"$src"
-
-    # Skip if directory doesn't exist
     [[ ! -d "$root" ]] && continue
 
-    # Build find command arguments
+    # Build find command
     find_args=("$root" -type f \( -iname "*.mp4" -o -iname "*.jpg" \))
-
-    # Add exclusions only for the main input directory
     if [[ "$location" == "input" ]]; then
       [[ -d "$TRASH_DIR" ]] && find_args+=(! -path "${TRASH_DIR}/*")
       [[ "$ARCHIVE_MODE" == true && -d "$ARCHIVE_DIR" ]] && find_args+=(! -path "${ARCHIVE_DIR}/*")
     fi
-
-    # Use printf to output path and size null-terminated
     find_args+=(-printf '%p\0%s\0')
 
-    # Process output directly via while loop
     while IFS= read -r -d '' file && IFS= read -r -d '' size; do
-
-      # --- Optimized Inline Processing ---
-      # 1. Get filename using Bash parameter expansion (no fork)
       filename="${file##*/}"
-
-      # 2. Extract timestamp base (no fork)
       base="${filename%.*}"
       ts="${base: -14}"
 
-      # 3. Validate timestamp (length and digits)
-      # Using glob pattern [[ $var == *pattern* ]] is faster than regex for simple cases
       if [[ ${#ts} -eq 14 && "$ts" == [0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9] ]]; then
-
-        # 4. Determine if video
         is_video="false"
-        # Case insensitive check using glob
         [[ "$filename" == *.mp4 || "$filename" == *.MP4 ]] && is_video="true"
 
-        # Populate Arrays
-        ALL_FILES+=("$file|$ts|$size|$is_video|$location")
+        # Increment counter instead of storing in huge array
+        TOTAL_FILE_COUNT=$((TOTAL_FILE_COUNT + 1))
 
         # Categorize based on age
         if [[ "$ts" < "$cutoff_ts" ]]; then
@@ -225,17 +203,12 @@ collect_all_files() {
           [[ "$location" == "input" ]] && MAIN_PROCESSING_FILES+=("$file|$ts|$size|$is_video")
         fi
 
-        # Trash cleanup check
         [[ "$location" == "trash" && "$ts" < "$trash_cutoff_ts" ]] && TRASH_CLEANUP_FILES+=("$file|$ts|$size")
-
       fi
-      # --- End Optimized Processing ---
-
     done < <(find "${find_args[@]}" 2>/dev/null)
   done
 
-  log_info "Collected ${#ALL_FILES[@]} total files across all directories."
-
+  log_info "Collected $TOTAL_FILE_COUNT total files across all directories."
   return 0
 }
 
@@ -355,12 +328,12 @@ dispose_file() {
   if [[ "$DRY_RUN" == true ]]; then
     if [[ "$USE_TRASH" == true ]]; then
       log "[DRY-RUN] Would trash: $file ($reason)"
-      STATS_TRASHED_COUNT=$((STATS_TRASHED_COUNT + 1))
-      STATS_TRASHED_SIZE=$((STATS_TRASHED_SIZE + file_size))
+      STATS[trashed_count]=$((STATS[trashed_count] + 1))
+      STATS[trashed_size]=$((STATS[trashed_size] + file_size))
     else
       log "[DRY-RUN] Would delete: $file ($reason)"
-      STATS_DELETED_COUNT=$((STATS_DELETED_COUNT + 1))
-      STATS_DELETED_SIZE=$((STATS_DELETED_SIZE + file_size))
+      STATS[deleted_count]=$((STATS[deleted_count] + 1))
+      STATS[deleted_size]=$((STATS[deleted_size] + file_size))
     fi
     return 0
   fi
@@ -371,13 +344,13 @@ dispose_file() {
     mkdir -p "$(dirname "$dest")"
     mv "$file" "$dest"
     log "[TRASHED] $file ($reason)"
-    STATS_TRASHED_COUNT=$((STATS_TRASHED_COUNT + 1))
-    STATS_TRASHED_SIZE=$((STATS_TRASHED_SIZE + file_size))
+    STATS[trashed_count]=$((STATS[trashed_count] + 1))
+    STATS[trashed_size]=$((STATS[trashed_size] + file_size))
   else
     rm -f "$file"
     log "[DELETED] $file ($reason)"
-    STATS_DELETED_COUNT=$((STATS_DELETED_COUNT + 1))
-    STATS_DELETED_SIZE=$((STATS_DELETED_SIZE + file_size))
+    STATS[deleted_count]=$((STATS[deleted_count] + 1))
+    STATS[deleted_size]=$((STATS[deleted_size] + file_size))
   fi
 }
 
@@ -394,23 +367,20 @@ handle_archive_strategy() {
 
   PROGRESS_CURRENT_FILE=$((PROGRESS_CURRENT_FILE + 1))
 
+  # Calculate size once for stats
+  local src_size
+  src_size=$(get_file_size "$src")
+
   if [[ "$DRY_RUN" == true ]]; then
     log "[DRY-RUN] Would archive: $filename -> $dest"
-    # Track statistics for dry run
-    local src_size
-    src_size=$(get_file_size "$src")
-    STATS_ARCHIVED_COUNT=$((STATS_ARCHIVED_COUNT + 1))
-    STATS_ARCHIVED_SIZE=$((STATS_ARCHIVED_SIZE + src_size))
+    STATS[archived_count]=$((STATS[archived_count] + 1))
+    STATS[archived_size]=$((STATS[archived_size] + src_size))
     return 0
   fi
 
   if transcode_file "$src" "$dest"; then
-    # Track successful archive
-    local src_size
-    src_size=$(get_file_size "$src")
-    STATS_ARCHIVED_COUNT=$((STATS_ARCHIVED_COUNT + 1))
-    STATS_ARCHIVED_SIZE=$((STATS_ARCHIVED_SIZE + src_size))
-
+    STATS[archived_count]=$((STATS[archived_count] + 1))
+    STATS[archived_size]=$((STATS[archived_size] + src_size))
     dispose_file "$src" "Archived source"
   else
     log_error "Archive failed, keeping original: $filename"
@@ -420,11 +390,9 @@ handle_archive_strategy() {
 # --- Main Processing Loop Logic ---
 process_file() {
   local file="$1"
+  local is_video="$2"
   local filename
   filename=$(basename "$file")
-
-  local is_video=false
-  [[ "$filename" =~ \.(mp4|MP4)$ ]] && is_video=true
 
   if [[ "$ARCHIVE_MODE" == true ]] && [[ "$is_video" == true ]]; then
     handle_archive_strategy "$file" "$filename"
@@ -477,6 +445,7 @@ enforce_size_limit() {
   log_warn "Exceeding size limit by $(format_size "$excess"). Finding files to remove..."
 
   # Use pre-collected files and sort by timestamp (oldest first)
+  # SIZE_LIMIT_FILES format: "path|timestamp|size"
   local -a sorted_candidates=()
   if [[ ${#SIZE_LIMIT_FILES[@]} -gt 0 ]]; then
     while IFS= read -r line; do
@@ -504,9 +473,9 @@ enforce_size_limit() {
     removed_size=$((removed_size + file_size))
     removed_count=$((removed_count + 1))
 
-    # Track in statistics
-    STATS_SIZE_LIMIT_COUNT=$((STATS_SIZE_LIMIT_COUNT + 1))
-    STATS_SIZE_LIMIT_SIZE=$((STATS_SIZE_LIMIT_SIZE + file_size))
+    # Track in statistics (Safe increment for set -e)
+    STATS[size_limit_count]=$((STATS[size_limit_count] + 1))
+    STATS[size_limit_size]=$((STATS[size_limit_size] + file_size))
   done
 
   log_success "Size-based cleanup: removed $removed_count files ($(format_size "$removed_size"))"
@@ -521,6 +490,8 @@ cleanup_trash_folder() {
   log_info "Cleaning trash folder (files older than $DEFAULT_TRASH_AGE_DAYS days)..."
 
   local cleaned_count=0
+
+  # TRASH_CLEANUP_FILES format: "path|timestamp|size"
   if [[ ${#TRASH_CLEANUP_FILES[@]} -gt 0 ]]; then
     for entry in "${TRASH_CLEANUP_FILES[@]}"; do
       IFS='|' read -r file_path _ file_size <<<"$entry"
@@ -530,11 +501,12 @@ cleanup_trash_folder() {
       else
         rm -f "$file_path" && log "[PERMANENTLY DELETED] $(basename "$file_path")"
       fi
+
       cleaned_count=$((cleaned_count + 1))
 
-      # Track in statistics
-      STATS_TRASH_CLEANUP_COUNT=$((STATS_TRASH_CLEANUP_COUNT + 1))
-      STATS_TRASH_CLEANUP_SIZE=$((STATS_TRASH_CLEANUP_SIZE + file_size))
+      # Track in statistics (Safe increment for set -e)
+      STATS[trash_cleanup_count]=$((STATS[trash_cleanup_count] + 1))
+      STATS[trash_cleanup_size]=$((STATS[trash_cleanup_size] + file_size))
     done
   fi
 
@@ -574,39 +546,34 @@ display_summary() {
   log_info "Run Mode: $mode_label"
   echo ""
 
-  # Main Processing Summary
   echo "Main Processing (files older than $AGE_DAYS days):"
   if [[ "$ARCHIVE_MODE" == true ]]; then
-    echo "  Archived:        $STATS_ARCHIVED_COUNT files ($(format_size "$STATS_ARCHIVED_SIZE"))"
+    printf "  Archived:        %d files (%s)\n" "${STATS[archived_count]}" "$(format_size "${STATS[archived_size]}")"
   fi
   if [[ "$USE_TRASH" == true ]]; then
-    echo "  Trashed:         $STATS_TRASHED_COUNT files ($(format_size "$STATS_TRASHED_SIZE"))"
-  fi
-  if [[ "$USE_TRASH" == false ]]; then
-    echo "  Deleted:         $STATS_DELETED_COUNT files ($(format_size "$STATS_DELETED_SIZE"))"
+    printf "  Trashed:         %d files (%s)\n" "${STATS[trashed_count]}" "$(format_size "${STATS[trashed_size]}")"
+  else
+    printf "  Deleted:         %d files (%s)\n" "${STATS[deleted_count]}" "$(format_size "${STATS[deleted_size]}")"
   fi
   echo ""
 
-  # Size Limit Summary
-  if [[ $MAX_SIZE_BYTES -gt 0 && $STATS_SIZE_LIMIT_COUNT -gt 0 ]]; then
+  if [[ $MAX_SIZE_BYTES -gt 0 && ${STATS[size_limit_count]} -gt 0 ]]; then
     echo "Size Limit Enforcement:"
-    echo "  Removed:         $STATS_SIZE_LIMIT_COUNT files ($(format_size "$STATS_SIZE_LIMIT_SIZE"))"
+    printf "  Removed:         %d files (%s)\n" "${STATS[size_limit_count]}" "$(format_size "${STATS[size_limit_size]}")"
     echo ""
   fi
 
-  # Trash Cleanup Summary
-  if [[ $STATS_TRASH_CLEANUP_COUNT -gt 0 ]]; then
+  if [[ ${STATS[trash_cleanup_count]} -gt 0 ]]; then
     echo "Trash Cleanup (files older than $DEFAULT_TRASH_AGE_DAYS days):"
-    echo "  Purged:          $STATS_TRASH_CLEANUP_COUNT files ($(format_size "$STATS_TRASH_CLEANUP_SIZE"))"
+    printf "  Purged:          %d files (%s)\n" "${STATS[trash_cleanup_count]}" "$(format_size "${STATS[trash_cleanup_size]}")"
     echo ""
   fi
 
-  # Total Summary
-  local total_count=$((STATS_ARCHIVED_COUNT + STATS_DELETED_COUNT + STATS_TRASHED_COUNT + STATS_SIZE_LIMIT_COUNT + STATS_TRASH_CLEANUP_COUNT))
-  local total_size=$((STATS_ARCHIVED_SIZE + STATS_DELETED_SIZE + STATS_TRASHED_SIZE + STATS_SIZE_LIMIT_SIZE + STATS_TRASH_CLEANUP_SIZE))
+  local total_count=$((STATS[archived_count] + STATS[deleted_count] + STATS[trashed_count] + STATS[size_limit_count] + STATS[trash_cleanup_count]))
+  local total_size=$((STATS[archived_size] + STATS[deleted_size] + STATS[trashed_size] + STATS[size_limit_size] + STATS[trash_cleanup_size]))
 
   echo "============================================================"
-  echo "Total Files Processed: $total_count files ($(format_size "$total_size"))"
+  printf "Total Files Processed: %d files (%s)\n" "$total_count" "$(format_size "$total_size")"
   echo "============================================================"
 }
 
@@ -837,8 +804,9 @@ main() {
   # Process each file
   if [[ ${#MAIN_PROCESSING_FILES[@]} -gt 0 ]]; then
     for entry in "${MAIN_PROCESSING_FILES[@]}"; do
-      IFS='|' read -r file_path _ _ _ <<<"$entry"
-      process_file "$file_path"
+      # file|ts|size|is_video
+      IFS='|' read -r file_path _ _ is_video <<<"$entry"
+      process_file "$file_path" "$is_video"
     done
   fi
 
