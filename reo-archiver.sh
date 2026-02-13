@@ -400,10 +400,6 @@ process_file() {
 enforce_size_limit() {
   [[ $MAX_SIZE_BYTES -le 0 ]] && return
 
-  echo "============================================================"
-  echo "PHASE 1: Size Limit Enforcement"
-  echo "============================================================"
-
   # Calculate sizes in priority order: trash, input, archive
   local trash_size=0 input_size=0 archive_size=0
 
@@ -497,14 +493,27 @@ cleanup_trash_folder() {
 
 remove_empty_directories() {
   log_info "Scanning for empty directories..."
-  while IFS= read -r -d '' dir; do
-    [[ -z "$(ls -A "$dir" 2>/dev/null)" ]] || continue
-    if [[ "$DRY_RUN" == true ]]; then
-      log "[DRY-RUN] Would remove empty directory: $dir"
-    else
-      rmdir "$dir" && log "[REMOVED] Empty directory: $dir"
-    fi
-  done < <(find "$TARGET_DIR" -mindepth 1 -type d -print0 | sort -zr)
+
+  local dirs_to_scan=()
+  dirs_to_scan+=("$TARGET_DIR")
+  [[ "$ARCHIVE_MODE" == true ]] && [[ -d "$ARCHIVE_DIR" ]] && dirs_to_scan+=("$ARCHIVE_DIR")
+  [[ "$USE_TRASH" == true ]] && [[ -d "$TRASH_DIR" ]] && dirs_to_scan+=("$TRASH_DIR")
+
+  for scan_dir in "${dirs_to_scan[@]}"; do
+    log_info "Checking for empty directories in: $scan_dir"
+
+    while IFS= read -r -d '' dir; do
+      if [[ -z "$(ls -A "$dir" 2>/dev/null)" ]]; then
+        if [[ "$DRY_RUN" == true ]]; then
+          log "[DRY-RUN] Would remove empty directory: $dir"
+        else
+          if rmdir "$dir" 2>/dev/null; then
+            log "[REMOVED] Empty directory: $dir"
+          fi
+        fi
+      fi
+    done < <(find "$scan_dir" -mindepth 1 -type d -depth -print0)
+  done
 }
 
 cleanup_on_signal() {
@@ -697,6 +706,9 @@ main() {
   collect_all_files
 
   # Phase 1: Size Limit Enforcement (if enabled)
+  echo "============================================================"
+  echo "PHASE 1: Size Limit Enforcement"
+  echo "============================================================"
   enforce_size_limit
 
   # Phase 2: Trash Cleanup
