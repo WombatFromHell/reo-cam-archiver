@@ -80,7 +80,10 @@ log_error() { _log "ERROR" "\033[0;31m" 2 "$*"; }
 
 # --- Progress Bar Functions ---
 format_duration() { printf "%02d:%02d:%02d" $(($1 / 3600)) $(($1 % 3600 / 60)) $(($1 % 60)); }
-clear_progress_line() { [[ "$IS_INTERACTIVE" == true ]] && printf "\r\033[K" >&2; }
+clear_progress_line() {
+  [[ "$IS_INTERACTIVE" == true ]] && printf "\r\033[K" >&2
+  return 0
+}
 
 draw_progress_bar() {
   [[ "$IS_INTERACTIVE" != true ]] && return
@@ -518,20 +521,22 @@ cleanup_trash_folder() {
   log_info "Cleaning trash folder (files older than $DEFAULT_TRASH_AGE_DAYS days)..."
 
   local cleaned_count=0
-  for entry in "${TRASH_CLEANUP_FILES[@]}"; do
-    IFS='|' read -r file_path _ file_size <<<"$entry"
+  if [[ ${#TRASH_CLEANUP_FILES[@]} -gt 0 ]]; then
+    for entry in "${TRASH_CLEANUP_FILES[@]}"; do
+      IFS='|' read -r file_path _ file_size <<<"$entry"
 
-    if [[ "$DRY_RUN" == true ]]; then
-      log "[DRY-RUN] Would permanently delete from trash: $(basename "$file_path")"
-    else
-      rm -f "$file_path" && log "[PERMANENTLY DELETED] $(basename "$file_path")"
-    fi
-    cleaned_count=$((cleaned_count + 1))
+      if [[ "$DRY_RUN" == true ]]; then
+        log "[DRY-RUN] Would permanently delete from trash: $(basename "$file_path")"
+      else
+        rm -f "$file_path" && log "[PERMANENTLY DELETED] $(basename "$file_path")"
+      fi
+      cleaned_count=$((cleaned_count + 1))
 
-    # Track in statistics
-    STATS_TRASH_CLEANUP_COUNT=$((STATS_TRASH_CLEANUP_COUNT + 1))
-    STATS_TRASH_CLEANUP_SIZE=$((STATS_TRASH_CLEANUP_SIZE + file_size))
-  done
+      # Track in statistics
+      STATS_TRASH_CLEANUP_COUNT=$((STATS_TRASH_CLEANUP_COUNT + 1))
+      STATS_TRASH_CLEANUP_SIZE=$((STATS_TRASH_CLEANUP_SIZE + file_size))
+    done
+  fi
 
   [[ $cleaned_count -gt 0 ]] && log_info "Cleaned $cleaned_count files from trash."
 }
@@ -600,7 +605,7 @@ display_summary() {
   local total_count=$((STATS_ARCHIVED_COUNT + STATS_DELETED_COUNT + STATS_TRASHED_COUNT + STATS_SIZE_LIMIT_COUNT + STATS_TRASH_CLEANUP_COUNT))
   local total_size=$((STATS_ARCHIVED_SIZE + STATS_DELETED_SIZE + STATS_TRASHED_SIZE + STATS_SIZE_LIMIT_SIZE + STATS_TRASH_CLEANUP_SIZE))
 
-  echo "------------------------------------------------------------"
+  echo "============================================================"
   echo "Total Files Processed: $total_count files ($(format_size "$total_size"))"
   echo "============================================================"
 }
@@ -761,7 +766,7 @@ setup_logging() {
 display_config() {
   local cutoff
   cutoff=$(get_cutoff_timestamp "$AGE_DAYS")
-  echo "============================================================"
+
   echo "Camera Cleanup Script - $(date '+%Y-%m-%d %H:%M:%S')"
   echo "============================================================"
   log_info "Target Dir : $TARGET_DIR"
@@ -818,7 +823,7 @@ main() {
 
   # Count video files for progress tracking
   PROGRESS_TOTAL_FILES=0
-  if [[ "$ARCHIVE_MODE" == true ]]; then
+  if [[ "$ARCHIVE_MODE" == true ]] && [[ ${#MAIN_PROCESSING_FILES[@]} -gt 0 ]]; then
     for entry in "${MAIN_PROCESSING_FILES[@]}"; do
       IFS='|' read -r _ _ _ is_video <<<"$entry"
       [[ "$is_video" == "true" ]] && PROGRESS_TOTAL_FILES=$((PROGRESS_TOTAL_FILES + 1))
@@ -830,10 +835,12 @@ main() {
   log_info "Found ${#MAIN_PROCESSING_FILES[@]} total files ($PROGRESS_TOTAL_FILES video files to process)."
 
   # Process each file
-  for entry in "${MAIN_PROCESSING_FILES[@]}"; do
-    IFS='|' read -r file_path _ _ _ <<<"$entry"
-    process_file "$file_path"
-  done
+  if [[ ${#MAIN_PROCESSING_FILES[@]} -gt 0 ]]; then
+    for entry in "${MAIN_PROCESSING_FILES[@]}"; do
+      IFS='|' read -r file_path _ _ _ <<<"$entry"
+      process_file "$file_path"
+    done
+  fi
 
   clear_progress_line
   remove_empty_directories
@@ -845,9 +852,7 @@ main() {
   echo "============================================================"
   display_summary
 
-  echo ""
   echo "Script completed at $(date '+%Y-%m-%d %H:%M:%S')"
-  echo "============================================================"
 }
 
 main "$@"
