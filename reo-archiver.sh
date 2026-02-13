@@ -46,6 +46,18 @@ PROGRESS_CURRENT_FILE=0
 PROGRESS_FILE_START=0
 PROGRESS_RUN_START=0
 
+# --- Summary Statistics ---
+STATS_ARCHIVED_COUNT=0
+STATS_ARCHIVED_SIZE=0
+STATS_DELETED_COUNT=0
+STATS_DELETED_SIZE=0
+STATS_TRASHED_COUNT=0
+STATS_TRASHED_SIZE=0
+STATS_SIZE_LIMIT_COUNT=0
+STATS_SIZE_LIMIT_SIZE=0
+STATS_TRASH_CLEANUP_COUNT=0
+STATS_TRASH_CLEANUP_SIZE=0
+
 # --- Logging & Output ---
 log() { echo -e "$*"; }
 
@@ -165,6 +177,9 @@ collect_all_files() {
   for src in "${sources[@]}"; do
     # Split "Path|Location" into variables
     IFS='|' read -r root location <<<"$src"
+
+    # Skip if directory doesn't exist
+    [[ ! -d "$root" ]] && continue
 
     # Build find command arguments
     find_args=("$root" -type f \( -iname "*.mp4" -o -iname "*.jpg" \))
@@ -331,12 +346,18 @@ transcode_file() {
 dispose_file() {
   local file="$1"
   local reason="$2"
+  local file_size
+  file_size=$(get_file_size "$file")
 
   if [[ "$DRY_RUN" == true ]]; then
     if [[ "$USE_TRASH" == true ]]; then
       log "[DRY-RUN] Would trash: $file ($reason)"
+      STATS_TRASHED_COUNT=$((STATS_TRASHED_COUNT + 1))
+      STATS_TRASHED_SIZE=$((STATS_TRASHED_SIZE + file_size))
     else
       log "[DRY-RUN] Would delete: $file ($reason)"
+      STATS_DELETED_COUNT=$((STATS_DELETED_COUNT + 1))
+      STATS_DELETED_SIZE=$((STATS_DELETED_SIZE + file_size))
     fi
     return 0
   fi
@@ -347,9 +368,13 @@ dispose_file() {
     mkdir -p "$(dirname "$dest")"
     mv "$file" "$dest"
     log "[TRASHED] $file ($reason)"
+    STATS_TRASHED_COUNT=$((STATS_TRASHED_COUNT + 1))
+    STATS_TRASHED_SIZE=$((STATS_TRASHED_SIZE + file_size))
   else
     rm -f "$file"
     log "[DELETED] $file ($reason)"
+    STATS_DELETED_COUNT=$((STATS_DELETED_COUNT + 1))
+    STATS_DELETED_SIZE=$((STATS_DELETED_SIZE + file_size))
   fi
 }
 
@@ -368,11 +393,21 @@ handle_archive_strategy() {
 
   if [[ "$DRY_RUN" == true ]]; then
     log "[DRY-RUN] Would archive: $filename -> $dest"
-    # Simulate disposal for dry run consistency
+    # Track statistics for dry run
+    local src_size
+    src_size=$(get_file_size "$src")
+    STATS_ARCHIVED_COUNT=$((STATS_ARCHIVED_COUNT + 1))
+    STATS_ARCHIVED_SIZE=$((STATS_ARCHIVED_SIZE + src_size))
     return 0
   fi
 
   if transcode_file "$src" "$dest"; then
+    # Track successful archive
+    local src_size
+    src_size=$(get_file_size "$src")
+    STATS_ARCHIVED_COUNT=$((STATS_ARCHIVED_COUNT + 1))
+    STATS_ARCHIVED_SIZE=$((STATS_ARCHIVED_SIZE + src_size))
+
     dispose_file "$src" "Archived source"
   else
     log_error "Archive failed, keeping original: $filename"
@@ -440,9 +475,11 @@ enforce_size_limit() {
 
   # Use pre-collected files and sort by timestamp (oldest first)
   local -a sorted_candidates=()
-  while IFS= read -r line; do
-    sorted_candidates+=("$line")
-  done < <(printf "%s\n" "${SIZE_LIMIT_FILES[@]}" | sort -t'|' -k2)
+  if [[ ${#SIZE_LIMIT_FILES[@]} -gt 0 ]]; then
+    while IFS= read -r line; do
+      sorted_candidates+=("$line")
+    done < <(printf "%s\n" "${SIZE_LIMIT_FILES[@]}" | sort -t'|' -k2)
+  fi
 
   log_info "Found ${#sorted_candidates[@]} eligible files older than $AGE_DAYS days."
 
@@ -463,6 +500,10 @@ enforce_size_limit() {
 
     removed_size=$((removed_size + file_size))
     removed_count=$((removed_count + 1))
+
+    # Track in statistics
+    STATS_SIZE_LIMIT_COUNT=$((STATS_SIZE_LIMIT_COUNT + 1))
+    STATS_SIZE_LIMIT_SIZE=$((STATS_SIZE_LIMIT_SIZE + file_size))
   done
 
   log_success "Size-based cleanup: removed $removed_count files ($(format_size "$removed_size"))"
@@ -478,7 +519,7 @@ cleanup_trash_folder() {
 
   local cleaned_count=0
   for entry in "${TRASH_CLEANUP_FILES[@]}"; do
-    IFS='|' read -r file_path _ _ <<<"$entry"
+    IFS='|' read -r file_path _ file_size <<<"$entry"
 
     if [[ "$DRY_RUN" == true ]]; then
       log "[DRY-RUN] Would permanently delete from trash: $(basename "$file_path")"
@@ -486,6 +527,10 @@ cleanup_trash_folder() {
       rm -f "$file_path" && log "[PERMANENTLY DELETED] $(basename "$file_path")"
     fi
     cleaned_count=$((cleaned_count + 1))
+
+    # Track in statistics
+    STATS_TRASH_CLEANUP_COUNT=$((STATS_TRASH_CLEANUP_COUNT + 1))
+    STATS_TRASH_CLEANUP_SIZE=$((STATS_TRASH_CLEANUP_SIZE + file_size))
   done
 
   [[ $cleaned_count -gt 0 ]] && log_info "Cleaned $cleaned_count files from trash."
@@ -512,8 +557,52 @@ remove_empty_directories() {
           fi
         fi
       fi
-    done < <(find "$scan_dir" -mindepth 1 -type d -depth -print0)
+    done < <(find "$scan_dir" -mindepth 1 -type d -depth -print0 2>/dev/null || true)
   done
+}
+
+# --- Summary Display ---
+display_summary() {
+  local mode_label="DRY-RUN"
+  [[ "$DRY_RUN" == false ]] && mode_label="EXECUTED"
+
+  log_info "Run Mode: $mode_label"
+  echo ""
+
+  # Main Processing Summary
+  echo "Main Processing (files older than $AGE_DAYS days):"
+  if [[ "$ARCHIVE_MODE" == true ]]; then
+    echo "  Archived:        $STATS_ARCHIVED_COUNT files ($(format_size "$STATS_ARCHIVED_SIZE"))"
+  fi
+  if [[ "$USE_TRASH" == true ]]; then
+    echo "  Trashed:         $STATS_TRASHED_COUNT files ($(format_size "$STATS_TRASHED_SIZE"))"
+  fi
+  if [[ "$USE_TRASH" == false ]]; then
+    echo "  Deleted:         $STATS_DELETED_COUNT files ($(format_size "$STATS_DELETED_SIZE"))"
+  fi
+  echo ""
+
+  # Size Limit Summary
+  if [[ $MAX_SIZE_BYTES -gt 0 && $STATS_SIZE_LIMIT_COUNT -gt 0 ]]; then
+    echo "Size Limit Enforcement:"
+    echo "  Removed:         $STATS_SIZE_LIMIT_COUNT files ($(format_size "$STATS_SIZE_LIMIT_SIZE"))"
+    echo ""
+  fi
+
+  # Trash Cleanup Summary
+  if [[ $STATS_TRASH_CLEANUP_COUNT -gt 0 ]]; then
+    echo "Trash Cleanup (files older than $DEFAULT_TRASH_AGE_DAYS days):"
+    echo "  Purged:          $STATS_TRASH_CLEANUP_COUNT files ($(format_size "$STATS_TRASH_CLEANUP_SIZE"))"
+    echo ""
+  fi
+
+  # Total Summary
+  local total_count=$((STATS_ARCHIVED_COUNT + STATS_DELETED_COUNT + STATS_TRASHED_COUNT + STATS_SIZE_LIMIT_COUNT + STATS_TRASH_CLEANUP_COUNT))
+  local total_size=$((STATS_ARCHIVED_SIZE + STATS_DELETED_SIZE + STATS_TRASHED_SIZE + STATS_SIZE_LIMIT_SIZE + STATS_TRASH_CLEANUP_SIZE))
+
+  echo "------------------------------------------------------------"
+  echo "Total Files Processed: $total_count files ($(format_size "$total_size"))"
+  echo "============================================================"
 }
 
 cleanup_on_signal() {
@@ -749,7 +838,14 @@ main() {
   clear_progress_line
   remove_empty_directories
 
+  # Phase 4: Display Summary
+  echo ""
   echo "============================================================"
+  echo "PHASE 4: Summary"
+  echo "============================================================"
+  display_summary
+
+  echo ""
   echo "Script completed at $(date '+%Y-%m-%d %H:%M:%S')"
   echo "============================================================"
 }
