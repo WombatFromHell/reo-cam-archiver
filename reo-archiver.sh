@@ -130,10 +130,27 @@ build_trash_path() {
   local source_root="$TARGET_DIR"
   local category="input"
 
-  # Override: switch to 'output' category for archived files
-  if [[ -n "${ARCHIVE_DIR:-}" ]] && [[ "$file" == "$ARCHIVE_DIR"* ]]; then
-    source_root="$ARCHIVE_DIR"
+  # Determine the actual archive directory to check against.
+  # Use configured ARCHIVE_DIR if set, otherwise fallback to DEFAULT_ARCHIVE_DIR.
+  # This ensures we correctly categorize files even if ARCHIVE_MODE is currently off
+  # but archived files exist from previous runs.
+  local check_archive_dir="${ARCHIVE_DIR:-$DEFAULT_ARCHIVE_DIR}"
+
+  # Normalize paths for comparison (remove trailing slashes)
+  file="${file%/}"
+  check_archive_dir="${check_archive_dir%/}"
+
+  # Override: switch to 'output' category for archived files.
+  # We check this FIRST because ARCHIVE_DIR is often a subdirectory of TARGET_DIR,
+  # and we want the more specific categorization.
+  if [[ -n "$check_archive_dir" ]] && [[ "$file" == "$check_archive_dir"* ]]; then
+    source_root="$check_archive_dir"
     category="output"
+  elif [[ "$file" == "$TARGET_DIR"* ]]; then
+    # Explicitly handling input files (optional logic step, defaults handle this,
+    # but good for clarity if we wanted different logic).
+    source_root="$TARGET_DIR"
+    category="input"
   fi
 
   # Assemble path: TRASH_DIR/<category>/<relative_path>
@@ -465,9 +482,27 @@ enforce_size_limit() {
     IFS='|' read -r file_path _ file_size <<<"$entry"
 
     if [[ "$DRY_RUN" == true ]]; then
-      log "[DRY-RUN] Would permanently delete: $(basename "$file_path") ($(format_size "$file_size"))"
+      log "[DRY-RUN] Would remove for size limit: $(basename "$file_path") ($(format_size "$file_size"))"
     else
-      rm -f "$file_path" && log "[SIZE-LIMIT] Deleted: $(basename "$file_path") ($(format_size "$file_size"))"
+      # Use the centralized disposal logic to respect trash settings and paths
+      if [[ "$USE_TRASH" == true ]]; then
+        local dest
+        dest=$(build_trash_path "$file_path")
+        mkdir -p "$(dirname "$dest")"
+        if mv "$file_path" "$dest"; then
+          log "[SIZE-LIMIT] Trashed: $(basename "$file_path") ($(format_size "$file_size"))"
+        else
+          log_error "Failed to trash: $file_path"
+          continue # Skip stats update if move failed
+        fi
+      else
+        if rm -f "$file_path"; then
+          log "[SIZE-LIMIT] Deleted: $(basename "$file_path") ($(format_size "$file_size"))"
+        else
+          log_error "Failed to delete: $file_path"
+          continue
+        fi
+      fi
     fi
 
     removed_size=$((removed_size + file_size))
