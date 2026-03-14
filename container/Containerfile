@@ -1,14 +1,8 @@
-FROM linuxserver/ffmpeg:version-8.0.1-cli
+FROM ghcr.io/linuxserver/ffmpeg:8.0.1
 
 ARG TZ=$TZ
-#
+
 ENV DEBIAN_FRONTEND=noninteractive
-
-# Latest releases available at https://github.com/aptible/supercronic/releases
-ENV SUPERCRONIC_URL=https://github.com/aptible/supercronic/releases/download/v0.2.34/supercronic-linux-amd64 \
-  SUPERCRONIC_SHA1SUM=e8631edc1775000d119b70fd40339a7238eece14 \
-  SUPERCRONIC=supercronic-linux-amd64
-
 RUN apt-get update -y && \
   apt-get install -y curl tmux nano ca-certificates && \
   # ensure we have a timezone set
@@ -16,11 +10,15 @@ RUN apt-get update -y && \
   echo "${TZ}" > /etc/timezone
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+# Install supercronic v0.2.44
+ENV SUPERCRONIC_URL=https://github.com/aptible/supercronic/releases/download/v0.2.44/supercronic-linux-amd64 \
+  SUPERCRONIC_SHA1SUM=6eb0a8e1e6673675dc67668c1a9b6409f79c37bc \
+  SUPERCRONIC=supercronic-linux-amd64 \
+  TARGET_DIR=/usr/local/bin
 RUN curl -fsSLO "$SUPERCRONIC_URL" \
   && echo "${SUPERCRONIC_SHA1SUM}  ${SUPERCRONIC}" | sha1sum -c - \
-  && chmod +x "$SUPERCRONIC" \
-  && mv "$SUPERCRONIC" "/usr/local/bin/${SUPERCRONIC}" \
-  && ln -s "/usr/local/bin/${SUPERCRONIC}" /usr/local/bin/supercronic
+  && install -D -m 755 "$SUPERCRONIC" "${TARGET_DIR}/${SUPERCRONIC}" \
+  && ln -s "${TARGET_DIR}/${SUPERCRONIC}" "${TARGET_DIR}"/supercronic
 
 COPY container/entrypoint.sh /root/
 COPY container/99archival /root/99archival
@@ -34,6 +32,6 @@ WORKDIR /app/
 COPY reo-archiver.sh \
   container/archive-task.sh \
   container/cleanup-task.sh /app/
-RUN chmod +x /app/*.sh
+RUN chmod 0755 /app/*.sh
 
 ENTRYPOINT ["/root/entrypoint.sh"]
