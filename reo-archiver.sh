@@ -62,7 +62,7 @@ _log() {
   shift 3
   local msg="[$level] $*"
 
-  if [[ "$IS_INTERACTIVE" == true && -n "$color" ]]; then
+  if [[ $IS_INTERACTIVE == true && -n $color ]]; then
     msg="[$color$level\033[0m] $*"
   fi
 
@@ -77,12 +77,12 @@ log_error() { _log "ERROR" "\033[0;31m" 2 "$*"; }
 # --- Progress Bar Functions ---
 format_duration() { printf "%02d:%02d:%02d" $(($1 / 3600)) $(($1 % 3600 / 60)) $(($1 % 60)); }
 clear_progress_line() {
-  [[ "$IS_INTERACTIVE" == true ]] && printf "\r\033[K" >&2
+  [[ $IS_INTERACTIVE == true ]] && printf "\r\033[K" >&2
   return 0
 }
 
 draw_progress_bar() {
-  [[ "$IS_INTERACTIVE" != true ]] && return
+  [[ $IS_INTERACTIVE != true ]] && return
 
   local count=$1 total=$2 pct=$3
   local width=10
@@ -100,7 +100,7 @@ draw_progress_bar() {
 
 update_progress_from_ffmpeg() {
   local duration=$1 line=$2
-  if [[ "$line" =~ time=([0-9]{2}):([0-9]{2}):([0-9]{2}) ]]; then
+  if [[ $line =~ time=([0-9]{2}):([0-9]{2}):([0-9]{2}) ]]; then
     local s=$((10#${BASH_REMATCH[1]} * 3600 + 10#${BASH_REMATCH[2]} * 60 + 10#${BASH_REMATCH[3]}))
     if [[ $duration -gt 0 ]]; then
       local pct=$((s * 100 / duration))
@@ -118,7 +118,7 @@ get_cutoff_timestamp() { date -d "-$1 days" +%Y%m%d%H%M%S; }
 extract_timestamp() {
   local base="${1%.*}"
   local ts="${base: -14}"
-  [[ ${#ts} -eq 14 ]] && [[ "$ts" =~ ^[0-9]+$ ]] && echo "$ts" || echo ""
+  [[ ${#ts} -eq 14 ]] && [[ $ts =~ ^[0-9]+$ ]] && echo "$ts" || echo ""
 }
 
 build_archive_path() { echo "${ARCHIVE_DIR}/${1:0:4}/${1:4:2}/${1:6:2}/archived-${1}.mp4"; }
@@ -135,7 +135,7 @@ build_trash_path() {
   check_archive_dir="${check_archive_dir%/}"
 
   local source_root="$TARGET_DIR" category="input"
-  if [[ -n "$check_archive_dir" && "$file" == "$check_archive_dir"* ]]; then
+  if [[ -n $check_archive_dir && $file == "$check_archive_dir"* ]]; then
     source_root="$check_archive_dir"
     category="output"
   fi
@@ -145,7 +145,7 @@ build_trash_path() {
 
 rotate_logs() {
   local log="$1" max="$2"
-  [[ ! -f "$log" ]] && return
+  [[ ! -f $log ]] && return
   for ((i = max - 1; i >= 0; i--)); do mv "${log}.${i}" "${log}.$((i + 1))" 2>/dev/null || true; done
   mv "$log" "${log}.0"
 }
@@ -169,18 +169,18 @@ collect_all_files() {
   local find_args=()
 
   local sources=()
-  [[ -d "$TRASH_DIR" ]] && sources+=("$TRASH_DIR|trash")
+  [[ -d $TRASH_DIR ]] && sources+=("$TRASH_DIR|trash")
   sources+=("$TARGET_DIR|input")
-  [[ "$ARCHIVE_MODE" == true && -d "$ARCHIVE_DIR" ]] && sources+=("$ARCHIVE_DIR|archive")
+  [[ $ARCHIVE_MODE == true && -d $ARCHIVE_DIR ]] && sources+=("$ARCHIVE_DIR|archive")
 
   for src in "${sources[@]}"; do
     IFS='|' read -r root location <<<"$src"
-    [[ ! -d "$root" ]] && continue
+    [[ ! -d $root ]] && continue
 
     find_args=("$root" -type f \( -iname "*.mp4" -o -iname "*.jpg" \))
-    if [[ "$location" == "input" ]]; then
-      [[ -d "$TRASH_DIR" ]] && find_args+=(! -path "${TRASH_DIR}/*")
-      [[ "$ARCHIVE_MODE" == true && -d "$ARCHIVE_DIR" ]] && find_args+=(! -path "${ARCHIVE_DIR}/*")
+    if [[ $location == "input" ]]; then
+      [[ -d $TRASH_DIR ]] && find_args+=(! -path "${TRASH_DIR}/*")
+      [[ $ARCHIVE_MODE == true && -d $ARCHIVE_DIR ]] && find_args+=(! -path "${ARCHIVE_DIR}/*")
     fi
     find_args+=(-printf '%p\0%s\0')
 
@@ -189,18 +189,18 @@ collect_all_files() {
       base="${filename%.*}"
       ts="${base: -14}"
 
-      if [[ ${#ts} -eq 14 && "$ts" == [0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9] ]]; then
+      if [[ ${#ts} -eq 14 && $ts == [0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9] ]]; then
         is_video="false"
-        [[ "$filename" == *.mp4 || "$filename" == *.MP4 ]] && is_video="true"
+        [[ $filename == *.mp4 || $filename == *.MP4 ]] && is_video="true"
 
         TOTAL_FILE_COUNT=$((TOTAL_FILE_COUNT + 1))
 
-        if [[ "$ts" < "$cutoff_ts" ]]; then
+        if [[ $ts < $cutoff_ts ]]; then
           SIZE_LIMIT_FILES+=("$file|$ts|$size|$location")
-          [[ "$location" == "input" ]] && MAIN_PROCESSING_FILES+=("$file|$ts|$size|$is_video")
+          [[ $location == "input" ]] && MAIN_PROCESSING_FILES+=("$file|$ts|$size|$is_video")
         fi
 
-        [[ "$location" == "trash" && "$ts" < "$trash_cutoff_ts" ]] && TRASH_CLEANUP_FILES+=("$file|$ts|$size")
+        [[ $location == "trash" && $ts < $trash_cutoff_ts ]] && TRASH_CLEANUP_FILES+=("$file|$ts|$size")
       fi
     done < <(find "${find_args[@]}" 2>/dev/null)
   done
@@ -214,7 +214,7 @@ parse_size() {
   local input="$1"
   local size_value size_unit
 
-  if [[ "$input" =~ ^([0-9]+\.?[0-9]*)([KMGTkmgt]i?[Bb]?)$ ]]; then
+  if [[ $input =~ ^([0-9]+\.?[0-9]*)([KMGTkmgt]i?[Bb]?)$ ]]; then
     size_value="${BASH_REMATCH[1]}"
     size_unit="${BASH_REMATCH[2]}"
   else
@@ -261,7 +261,7 @@ format_size() {
 
 get_directory_size() {
   local dir="$1"
-  [[ ! -d "$dir" ]] && echo "0" && return
+  [[ ! -d $dir ]] && echo "0" && return
   du -sb "$dir" 2>/dev/null | cut -f1 || echo "0"
 }
 
@@ -269,7 +269,7 @@ get_directory_size() {
 transcode_file() {
   local input="$1" output="$2"
 
-  if [[ "$SKIP_EXISTING" == true ]] && [[ -f "$output" ]] && [[ $(get_file_size "$output") -ge $MIN_OUTPUT_SIZE_BYTES ]]; then
+  if [[ $SKIP_EXISTING == true ]] && [[ -f $output ]] && [[ $(get_file_size "$output") -ge $MIN_OUTPUT_SIZE_BYTES ]]; then
     log_warn "Output exists (>= 1MB), skipping: $(basename "$output")"
     return 0
   fi
@@ -277,7 +277,7 @@ transcode_file() {
   mkdir -p "$(dirname "$output")"
   PROGRESS_FILE_START=$(date +%s)
   local duration=0
-  [[ "$IS_INTERACTIVE" == true ]] && duration=$(get_video_duration "$input")
+  [[ $IS_INTERACTIVE == true ]] && duration=$(get_video_duration "$input")
 
   log_info "Transcoding: $(basename "$input")"
 
@@ -287,7 +287,7 @@ transcode_file() {
   local status=0
 
   set +e
-  if [[ "$IS_INTERACTIVE" == true ]]; then
+  if [[ $IS_INTERACTIVE == true ]]; then
     cmd+=(-progress pipe:1 "$output")
     "${cmd[@]}" 2>&1 | while IFS= read -r line; do update_progress_from_ffmpeg "$duration" "$line"; done
     status=${PIPESTATUS[0]}
@@ -300,7 +300,7 @@ transcode_file() {
 
   clear_progress_line
 
-  if [[ $status -ne 0 ]] || [[ ! -f "$output" ]] || [[ $(get_file_size "$output") -lt $MIN_OUTPUT_SIZE_BYTES ]]; then
+  if [[ $status -ne 0 ]] || [[ ! -f $output ]] || [[ $(get_file_size "$output") -lt $MIN_OUTPUT_SIZE_BYTES ]]; then
     log_error "Transcoding failed or output too small (Code: $status): $(basename "$input")"
     rm -f "$output"
     return 1
@@ -324,15 +324,15 @@ dispose_file() {
   file_size=$(get_file_size "$file")
 
   local will_trash=false
-  [[ "$USE_TRASH" == true && "$force_delete" != true ]] && will_trash=true
+  [[ $USE_TRASH == true && $force_delete != true ]] && will_trash=true
 
   local verb="DELETED"
-  [[ "$will_trash" == true ]] && verb="TRASHED"
-  [[ -z "$stat_prefix" ]] && stat_prefix=$([[ "$will_trash" == true ]] && echo "trashed" || echo "deleted")
+  [[ $will_trash == true ]] && verb="TRASHED"
+  [[ -z $stat_prefix ]] && stat_prefix=$([[ $will_trash == true ]] && echo "trashed" || echo "deleted")
 
-  if [[ "$DRY_RUN" == true ]]; then
+  if [[ $DRY_RUN == true ]]; then
     log "[DRY-RUN] Would ${verb,,}: $file ($reason)"
-  elif [[ "$will_trash" == true ]]; then
+  elif [[ $will_trash == true ]]; then
     local dest
     dest=$(build_trash_path "$file")
     mkdir -p "$(dirname "$dest")"
@@ -363,7 +363,7 @@ handle_archive_strategy() {
   local src_size
   src_size=$(get_file_size "$src")
 
-  if [[ "$DRY_RUN" == true ]]; then
+  if [[ $DRY_RUN == true ]]; then
     log "[DRY-RUN] Would archive: $filename -> $dest"
     STATS[archived_count]=$((STATS[archived_count] + 1))
     STATS[archived_size]=$((STATS[archived_size] + src_size))
@@ -386,7 +386,7 @@ process_file() {
   local filename
   filename=$(basename "$file")
 
-  if [[ "$ARCHIVE_MODE" == true ]] && [[ "$is_video" == true ]]; then
+  if [[ $ARCHIVE_MODE == true ]] && [[ $is_video == true ]]; then
     handle_archive_strategy "$file" "$filename"
   else
     dispose_file "$file" "Old file"
@@ -401,14 +401,14 @@ enforce_size_limit() {
 
   log_info "Calculating directory sizes..."
 
-  if [[ -d "$TRASH_DIR" ]]; then
+  if [[ -d $TRASH_DIR ]]; then
     trash_size=$(get_directory_size "$TRASH_DIR")
     log_info "Trash size: $(format_size "$trash_size")"
   fi
 
-  if [[ -d "$TARGET_DIR" ]]; then
+  if [[ -d $TARGET_DIR ]]; then
     for year_dir in "$TARGET_DIR"/[0-9][0-9][0-9][0-9]; do
-      [[ -d "$year_dir" ]] || continue
+      [[ -d $year_dir ]] || continue
       local year_size
       year_size=$(get_directory_size "$year_dir")
       input_size=$((input_size + year_size))
@@ -416,7 +416,7 @@ enforce_size_limit() {
     log_info "Input size: $(format_size "$input_size")"
   fi
 
-  if [[ "$ARCHIVE_MODE" == true ]] && [[ -d "$ARCHIVE_DIR" ]]; then
+  if [[ $ARCHIVE_MODE == true ]] && [[ -d $ARCHIVE_DIR ]]; then
     archive_size=$(get_directory_size "$ARCHIVE_DIR")
     log_info "Archive size: $(format_size "$archive_size")"
   fi
@@ -458,7 +458,7 @@ enforce_size_limit() {
 
     IFS='|' read -r file_path _ file_size location <<<"$entry"
 
-    if [[ "$location" == "trash" ]]; then
+    if [[ $location == "trash" ]]; then
       dispose_file "$file_path" "Size limit exceeded (already in trash)" "size_limit" true
     else
       dispose_file "$file_path" "Size limit exceeded" "size_limit"
@@ -475,7 +475,7 @@ enforce_size_limit() {
 
 # --- Cleanup & Setup ---
 cleanup_trash_folder() {
-  [[ ! -d "$TRASH_DIR" ]] && return
+  [[ ! -d $TRASH_DIR ]] && return
 
   log_info "Cleaning trash folder (files older than $DEFAULT_TRASH_AGE_DAYS days)..."
 
@@ -485,7 +485,7 @@ cleanup_trash_folder() {
     for entry in "${TRASH_CLEANUP_FILES[@]}"; do
       IFS='|' read -r file_path _ file_size <<<"$entry"
 
-      if [[ "$DRY_RUN" == true ]]; then
+      if [[ $DRY_RUN == true ]]; then
         log "[DRY-RUN] Would permanently delete from trash: $(basename "$file_path")"
       else
         rm -f "$file_path" && log "[PERMANENTLY DELETED] $(basename "$file_path")"
@@ -506,15 +506,15 @@ remove_empty_directories() {
 
   local dirs_to_scan=()
   dirs_to_scan+=("$TARGET_DIR")
-  [[ "$ARCHIVE_MODE" == true ]] && [[ -d "$ARCHIVE_DIR" ]] && dirs_to_scan+=("$ARCHIVE_DIR")
-  [[ "$USE_TRASH" == true ]] && [[ -d "$TRASH_DIR" ]] && dirs_to_scan+=("$TRASH_DIR")
+  [[ $ARCHIVE_MODE == true ]] && [[ -d $ARCHIVE_DIR ]] && dirs_to_scan+=("$ARCHIVE_DIR")
+  [[ $USE_TRASH == true ]] && [[ -d $TRASH_DIR ]] && dirs_to_scan+=("$TRASH_DIR")
 
   for scan_dir in "${dirs_to_scan[@]}"; do
     log_info "Checking for empty directories in: $scan_dir"
 
     while IFS= read -r -d '' dir; do
       if [[ -z "$(ls -A "$dir" 2>/dev/null)" ]]; then
-        if [[ "$DRY_RUN" == true ]]; then
+        if [[ $DRY_RUN == true ]]; then
           log "[DRY-RUN] Would remove empty directory: $dir"
         else
           if rmdir "$dir" 2>/dev/null; then
@@ -529,16 +529,16 @@ remove_empty_directories() {
 # --- Summary Display ---
 display_summary() {
   local mode_label="DRY-RUN"
-  [[ "$DRY_RUN" == false ]] && mode_label="EXECUTED"
+  [[ $DRY_RUN == false ]] && mode_label="EXECUTED"
 
   log_info "Run Mode: $mode_label"
   echo ""
 
   echo "Main Processing (files older than $AGE_DAYS days):"
-  if [[ "$ARCHIVE_MODE" == true ]]; then
+  if [[ $ARCHIVE_MODE == true ]]; then
     printf "  Archived:        %d files (%s)\n" "${STATS[archived_count]}" "$(format_size "${STATS[archived_size]}")"
   fi
-  if [[ "$USE_TRASH" == true ]]; then
+  if [[ $USE_TRASH == true ]]; then
     printf "  Trashed:         %d files (%s)\n" "${STATS[trashed_count]}" "$(format_size "${STATS[trashed_size]}")"
   else
     printf "  Deleted:         %d files (%s)\n" "${STATS[deleted_count]}" "$(format_size "${STATS[deleted_size]}")"
@@ -619,7 +619,7 @@ parse_args() {
       shift 2
       ;;
     --age)
-      [[ ! "$2" =~ ^[0-9]+$ || "$2" -lt 2 ]] && {
+      [[ ! $2 =~ ^[0-9]+$ || $2 -lt 2 ]] && {
         log_error "Age must be integer >= 2"
         exit 1
       }
@@ -628,7 +628,7 @@ parse_args() {
       ;;
     --archive)
       ARCHIVE_MODE=true
-      if [[ $# -gt 1 ]] && [[ "$2" != --* ]]; then
+      if [[ $# -gt 1 ]] && [[ $2 != --* ]]; then
         ARCHIVE_DIR="$2"
         shift 2
       else
@@ -638,7 +638,7 @@ parse_args() {
       ;;
     --trash)
       USE_TRASH=true
-      if [[ $# -gt 1 ]] && [[ "$2" != --* ]]; then
+      if [[ $# -gt 1 ]] && [[ $2 != --* ]]; then
         TRASH_DIR="$2"
         shift 2
       else
@@ -655,7 +655,7 @@ parse_args() {
       shift
       ;;
     --max-size)
-      if [[ "$2" == "0" ]]; then
+      if [[ $2 == "0" ]]; then
         MAX_SIZE_BYTES=0
       else
         MAX_SIZE_BYTES=$(parse_size "$2")
@@ -680,7 +680,7 @@ parse_args() {
       shift
       ;;
     --execute)
-      if [[ "$DRY_RUN_REQUESTED" == false ]]; then
+      if [[ $DRY_RUN_REQUESTED == false ]]; then
         DRY_RUN=false
       fi
       shift
@@ -695,11 +695,11 @@ parse_args() {
 }
 
 validate_environment() {
-  [[ ! -d "$TARGET_DIR" ]] && {
+  [[ ! -d $TARGET_DIR ]] && {
     log_error "Directory not found: $TARGET_DIR"
     exit 1
   }
-  if [[ "$ARCHIVE_MODE" == true ]]; then
+  if [[ $ARCHIVE_MODE == true ]]; then
     command -v ffmpeg &>/dev/null || {
       log_error "ffmpeg not found."
       exit 1
@@ -712,7 +712,7 @@ validate_environment() {
 }
 
 setup_logging() {
-  [[ "$ENABLE_LOGGING" != true ]] && return
+  [[ $ENABLE_LOGGING != true ]] && return
   local log_path="${TARGET_DIR}/${LOG_FILENAME}"
   rotate_logs "$log_path" "$MAX_LOG_ROTATIONS"
   exec > >(tee -a "$log_path")
@@ -726,8 +726,8 @@ display_config() {
   echo "============================================================"
   log_info "Target Dir : $TARGET_DIR"
   log_info "Age        : $AGE_DAYS days (before $cutoff)"
-  log_info "Mode       : $([[ "$ARCHIVE_MODE" == true ]] && echo "ARCHIVE -> $ARCHIVE_DIR" || echo "DELETE")"
-  log_info "Trash      : $([[ "$USE_TRASH" == true ]] && echo "ENABLED -> $TRASH_DIR" || echo "DISABLED")"
+  log_info "Mode       : $([[ $ARCHIVE_MODE == true ]] && echo "ARCHIVE -> $ARCHIVE_DIR" || echo "DELETE")"
+  log_info "Trash      : $([[ $USE_TRASH == true ]] && echo "ENABLED -> $TRASH_DIR" || echo "DISABLED")"
 
   if [[ $MAX_SIZE_BYTES -gt 0 ]]; then
     log_info "Size Limit : $(format_size "$MAX_SIZE_BYTES")"
@@ -735,7 +735,7 @@ display_config() {
     log_info "Size Limit : DISABLED"
   fi
 
-  if [[ "$DRY_RUN" == true ]]; then
+  if [[ $DRY_RUN == true ]]; then
     log_warn "Run Mode   : DRY-RUN (No changes)"
   else
     log_warn "Run Mode   : EXECUTE"
@@ -758,7 +758,7 @@ main() {
   echo "============================================================"
   enforce_size_limit
 
-  if [[ "$USE_TRASH" == true ]] && [[ ${#TRASH_CLEANUP_FILES[@]} -gt 0 ]]; then
+  if [[ $USE_TRASH == true ]] && [[ ${#TRASH_CLEANUP_FILES[@]} -gt 0 ]]; then
     echo "============================================================"
     echo "PHASE 2: Trash Cleanup"
     echo "============================================================"
@@ -773,10 +773,10 @@ main() {
   PROGRESS_RUN_START=$(date +%s)
 
   PROGRESS_TOTAL_FILES=0
-  if [[ "$ARCHIVE_MODE" == true ]] && [[ ${#MAIN_PROCESSING_FILES[@]} -gt 0 ]]; then
+  if [[ $ARCHIVE_MODE == true ]] && [[ ${#MAIN_PROCESSING_FILES[@]} -gt 0 ]]; then
     for entry in "${MAIN_PROCESSING_FILES[@]}"; do
       IFS='|' read -r _ _ _ is_video <<<"$entry"
-      [[ "$is_video" == "true" ]] && PROGRESS_TOTAL_FILES=$((PROGRESS_TOTAL_FILES + 1))
+      [[ $is_video == "true" ]] && PROGRESS_TOTAL_FILES=$((PROGRESS_TOTAL_FILES + 1))
     done
   else
     PROGRESS_TOTAL_FILES=${#MAIN_PROCESSING_FILES[@]}

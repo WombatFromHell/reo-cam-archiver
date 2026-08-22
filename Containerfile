@@ -1,31 +1,36 @@
+# Builder stage: fetches and verifies supercronic. curl/ca-certificates live ONLY here,
+# so the final image ships no network client or CA bundle.
+FROM ghcr.io/linuxserver/ffmpeg:version-9.0-cli AS builder
+
+# Latest releases available at https://github.com/aptible/supercronic/releases
+ENV SUPERCRONIC_URL=https://github.com/aptible/supercronic/releases/download/v0.2.49/supercronic-linux-amd64 \
+    SUPERCRONIC_SHA1SUM=e63c11a9726b775a6a11801e81af4f3fb926aa68 \
+    SUPERCRONIC=supercronic-linux-amd64
+
+RUN apt-get update -y && apt-get install -y curl ca-certificates && \
+    curl -fsSLO "$SUPERCRONIC_URL" && \
+    echo "${SUPERCRONIC_SHA1SUM}  ${SUPERCRONIC}" | sha1sum -c - && \
+    chmod +x "$SUPERCRONIC" && \
+    mv "$SUPERCRONIC" "/usr/local/bin/${SUPERCRONIC}"
+
 FROM ghcr.io/linuxserver/ffmpeg:version-9.0-cli
 
 ARG TZ=$TZ
 
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update -y && \
-  apt-get install -y curl tmux nano ca-certificates && \
-  # ensure we have a timezone set
+  apt-get install -y tini tmux nano && \
   ln -snf /usr/share/zoneinfo/${TZ} /etc/localtime && \
   echo "${TZ}" > /etc/timezone
 
-SHELL ["/bin/bash", "-o", "pipefail", "-c"]
-# Install supercronic v0.2.44
-ENV SUPERCRONIC_URL=https://github.com/aptible/supercronic/releases/download/v0.2.44/supercronic-linux-amd64 \
-  SUPERCRONIC_SHA1SUM=6eb0a8e1e6673675dc67668c1a9b6409f79c37bc \
-  SUPERCRONIC=supercronic-linux-amd64 \
-  TARGET_DIR=/usr/local/bin
-RUN curl -fsSLO "$SUPERCRONIC_URL" \
-  && echo "${SUPERCRONIC_SHA1SUM}  ${SUPERCRONIC}" | sha1sum -c - \
-  && install -D -m 755 "$SUPERCRONIC" "${TARGET_DIR}/${SUPERCRONIC}" \
-  && ln -s "${TARGET_DIR}/${SUPERCRONIC}" "${TARGET_DIR}"/supercronic
+# pull the verified supercronic binary from the builder; no curl/ca-certificates here
+COPY --from=builder /usr/local/bin/supercronic-linux-amd64 /usr/local/bin/supercronic-linux-amd64
+RUN ln -s /usr/local/bin/supercronic-linux-amd64 /usr/local/bin/supercronic
 
-COPY entrypoint.sh /root/
-COPY 99archival /root/99archival
+COPY entrypoint.sh /usr/local/bin/entrypoint.sh
+COPY 99archival /app/99archival
 
-RUN chmod 0644 /root/99archival && \
-  chown root:root /root/99archival && \
-  touch /var/log/cron.log
+RUN chmod 0755 /usr/local/bin/entrypoint.sh /app/99archival
 
 WORKDIR /app/
 
@@ -34,4 +39,6 @@ COPY reo-archiver.sh \
   cleanup-task.sh /app/
 RUN chmod 0755 /app/*.sh
 
-ENTRYPOINT ["/root/entrypoint.sh"]
+# ponytail: tini as PID1 reaps zombies + forwards SIGTERM; the container runs as
+# PUID:PGID (compose `user:`), so supercronic and every job are unprivileged.
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/entrypoint.sh"]

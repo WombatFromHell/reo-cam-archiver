@@ -11,11 +11,16 @@ services:
     container_name: cam_archiver
     pull_policy: never
     restart: unless-stopped
+    user: "${PUID}:${PGID}"
     labels:
       - com.getarcaneapp.arcane.updater=false
     devices:
       - "/dev/dri:/dev/dri"
     group_add:
       - "${RENDER_GROUP}" # host 'render' group
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
     volumes:
       - "${SHAREROOT}:/data"
