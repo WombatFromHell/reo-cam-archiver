@@ -1,4 +1,4 @@
-FROM ghcr.io/linuxserver/ffmpeg:8.0.1
+FROM ghcr.io/linuxserver/ffmpeg:version-9.0-cli
 
 ARG TZ=$TZ
 
@@ -20,8 +20,8 @@ RUN curl -fsSLO "$SUPERCRONIC_URL" \
   && install -D -m 755 "$SUPERCRONIC" "${TARGET_DIR}/${SUPERCRONIC}" \
   && ln -s "${TARGET_DIR}/${SUPERCRONIC}" "${TARGET_DIR}"/supercronic
 
-COPY container/entrypoint.sh /root/
-COPY container/99archival /root/99archival
+COPY entrypoint.sh /root/
+COPY 99archival /root/99archival
 
 RUN chmod 0644 /root/99archival && \
   chown root:root /root/99archival && \
@@ -30,8 +30,8 @@ RUN chmod 0644 /root/99archival && \
 WORKDIR /app/
 
 COPY reo-archiver.sh \
-  container/archive-task.sh \
-  container/cleanup-task.sh /app/
+  archive-task.sh \
+  cleanup-task.sh /app/
 RUN chmod 0755 /app/*.sh
 
 ENTRYPOINT ["/root/entrypoint.sh"]

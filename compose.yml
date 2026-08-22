@@ -1,0 +1,21 @@
+services:
+  cam_archiver:
+    env_file:
+      - compose.env
+    build:
+      context: .
+      dockerfile: Containerfile
+      args:
+        TZ: ${TZ}
+    image: ${IMAGENAME}:${VERSION}
+    container_name: cam_archiver
+    pull_policy: never
+    restart: unless-stopped
+    labels:
+      - com.getarcaneapp.arcane.updater=false
+    devices:
+      - "/dev/dri:/dev/dri"
+    group_add:
+      - "${RENDER_GROUP}" # host 'render' group
+    volumes:
+      - "${SHAREROOT}:/data"

@@ -7,7 +7,7 @@ if [ -r "${ENV_FILE}" ]; then # shellcheck disable=SC1090
 fi
 
 build() {
-  docker build -t "${IMAGENAME}:${VERSION}" -f container/Containerfile "${COMPOSEROOT}"
+  docker build -t "${IMAGENAME}:${VERSION}" -f Containerfile "${COMPOSEROOT}"
 }
 
 run() {
