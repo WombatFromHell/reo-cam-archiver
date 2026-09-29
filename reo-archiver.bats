@@ -6,8 +6,7 @@
 # fails on a missing input, like real ffmpeg. Every test runs in its own
 # tempdir; nothing outside it is touched.
 
-REPO_ROOT="$(cd "$BATS_TEST_DIRNAME/../.." && pwd)"
-SCRIPT="$REPO_ROOT/reo-archiver.sh"
+SCRIPT="./reo-archiver.sh"
 
 setup() {
   TMP="$(mktemp -d)"
@@ -29,9 +28,13 @@ for a in "$@"; do
   prev="$a"
 done
 [[ -f "$input" ]] || exit 1
+if [[ "${FAKE_FFMPEG_PROGRESS:-0}" == 1 ]]; then
+  echo "frame= 1 time=00:00:05.000000 speed=1.0x" >&2
+  echo "frame= 2 time=00:00:10.000000 speed=1.0x" >&2
+fi
 out="${@: -1}"
 mkdir -p "$(dirname "$out")"
-head -c 1048576 /dev/zero >"$out"
+head -c "${FAKE_FFMPEG_SIZE:-1048576}" /dev/zero >"$out"
 EOF
   cat >"$TMP/bin/ffprobe" <<'EOF'
 #!/usr/bin/env bash
@@ -48,7 +51,10 @@ run_archiver() { bash "$SCRIPT" --dir "$DATA" --no-log "$@"; }
 old_ts() { date -d "-10 days" +%Y%m%d%H%M%S; }
 new_ts() { date +%Y%m%d%H%M%S; }
 
-archive_out() { local ts="$1"; echo "$ARCHIVE/${ts:0:4}/${ts:4:2}/${ts:6:2}/archived-$ts.mp4"; }
+archive_out() {
+  local ts="$1"
+  echo "$ARCHIVE/${ts:0:4}/${ts:4:2}/${ts:6:2}/archived-$ts.mp4"
+}
 
 # --- Smoke ---
 
@@ -74,6 +80,7 @@ archive_out() { local ts="$1"; echo "$ARCHIVE/${ts:0:4}/${ts:4:2}/${ts:6:2}/arch
   run run_archiver --archive "$ARCHIVE" --trash "$TRASH" --age 5 --execute
   [[ $status -eq 0 ]]
   [[ -f "$(archive_out "$ts")" ]]
+  [[ ! -f "$DATA/$ts.mp4" ]]
   [[ -f "$DATA/$now.mp4" ]]
   [[ -f "$DATA/no-timestamp.mp4" ]]
 }
@@ -203,4 +210,84 @@ archive_out() { local ts="$1"; echo "$ARCHIVE/${ts:0:4}/${ts:4:2}/${ts:6:2}/arch
   [[ ! -d "$ARCHIVE" ]]
   [[ ! -d "$TRASH" ]]
   [[ "$output" == *"[DRY-RUN] Would archive"* ]]
+}
+
+# --- Bug pins (comprehensive review) ---
+
+@test "archive: mixed-case .Mp4 is transcoded, not trashed" {
+  local ts
+  ts="$(old_ts)"
+  touch "$DATA/$ts.Mp4"
+  run run_archiver --archive "$ARCHIVE" --trash "$TRASH" --age 5 --execute
+  [[ $status -eq 0 ]]
+  [[ -f "$(archive_out "$ts")" ]]
+  [[ ! -f "$DATA/$ts.Mp4" ]]
+  [[ -f "$TRASH/input/$ts.Mp4" ]]
+}
+
+@test "cli: unknown option exits non-zero" {
+  run bash "$SCRIPT" --bogus --no-log
+  [[ $status -ne 0 ]]
+}
+
+@test "cli: --dir with no value is a clean error" {
+  run bash "$SCRIPT" --no-log --dir
+  [[ $status -ne 0 ]]
+  [[ "$output" == *"Missing value"* ]]
+  [[ "$output" != *"unbound variable"* ]]
+}
+
+@test "cli: --max-size invalid format is a clean error" {
+  run bash "$SCRIPT" --max-size 10PB --no-log
+  [[ $status -ne 0 ]]
+  [[ "$output" == *"Invalid size format"* ]]
+}
+
+@test "archive: output under 1MiB is treated as failure, original kept" {
+  local ts
+  ts="$(old_ts)"
+  touch "$DATA/$ts.mp4"
+  FAKE_FFMPEG_SIZE=1024 run run_archiver --archive "$ARCHIVE" --trash "$TRASH" --age 5 --execute
+  [[ $status -eq 0 ]]
+  [[ -f "$DATA/$ts.mp4" ]]
+  [[ ! -f "$(archive_out "$ts")" ]]
+  [[ "$output" == *"Transcoding failed"* ]]
+}
+
+@test "dry-run: trash cleanup does not purge old trashed files" {
+  local ts
+  ts="$(date -d '-30 days' +%Y%m%d%H%M%S)"
+  mkdir -p "$TRASH/input"
+  touch "$TRASH/input/$ts.mp4"
+  run run_archiver --archive "$ARCHIVE" --trash "$TRASH" --age 5 --dry-run
+  [[ $status -eq 0 ]]
+  [[ -f "$TRASH/input/$ts.mp4" ]]
+}
+
+@test "logging: --log file captures warnings" {
+  run bash "$SCRIPT" --dir "$DATA" --age 5 --log archiver.log --dry-run
+  [[ $status -eq 0 ]]
+  [[ -f "$DATA/archiver.log" ]]
+  grep -q "WARN" "$DATA/archiver.log"
+}
+
+# --- Progress bar ---
+
+@test "progress: interactive run draws a progress bar" {
+  local ts
+  ts="$(old_ts)"
+  touch "$DATA/$ts.mp4"
+  IS_INTERACTIVE=true FAKE_FFMPEG_PROGRESS=1 run run_archiver --archive "$ARCHIVE" --trash "$TRASH" --age 5 --execute
+  [[ $status -eq 0 ]]
+  [[ "$output" == *"Progress [1/1]"* ]]
+  [[ "$output" == *"100%"* ]]
+}
+
+@test "progress: non-interactive run draws no progress bar" {
+  local ts
+  ts="$(old_ts)"
+  touch "$DATA/$ts.mp4"
+  FAKE_FFMPEG_PROGRESS=1 run run_archiver --archive "$ARCHIVE" --trash "$TRASH" --age 5 --execute
+  [[ $status -eq 0 ]]
+  [[ "$output" != *"Progress ["* ]]
 }

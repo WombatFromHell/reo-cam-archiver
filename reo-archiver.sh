@@ -39,7 +39,10 @@ declare -a MAIN_PROCESSING_FILES=()
 TOTAL_FILE_COUNT=0
 
 # --- Progress State ---
-IS_INTERACTIVE=false
+# Progress bar + colors only when stderr is a TTY (so cron runs, whose
+# stderr goes to a log file, stay quiet). IS_INTERACTIVE=true forces on —
+# used by the bats suite.
+IS_INTERACTIVE="${IS_INTERACTIVE:-$([[ -t 2 ]] && echo true || echo false)}"
 PROGRESS_TOTAL_FILES=0
 PROGRESS_CURRENT_FILE=0
 PROGRESS_FILE_START=0
@@ -191,7 +194,7 @@ collect_all_files() {
 
       if [[ ${#ts} -eq 14 && $ts == [0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9] ]]; then
         is_video="false"
-        [[ $filename == *.mp4 || $filename == *.MP4 ]] && is_video="true"
+        [[ ${filename,,} == *.mp4 ]] && is_video="true"
 
         TOTAL_FILE_COUNT=$((TOTAL_FILE_COUNT + 1))
 
@@ -321,7 +324,7 @@ transcode_file() {
 dispose_file() {
   local file="$1" reason="$2" stat_prefix="${3:-}" force_delete="${4:-false}"
   local file_size
-  file_size=$(get_file_size "$file")
+  file_size=$(get_file_size "$file" || echo 0)
 
   local will_trash=false
   [[ $USE_TRASH == true && $force_delete != true ]] && will_trash=true
@@ -472,7 +475,6 @@ enforce_size_limit() {
   done
 
   log_success "Size-based cleanup: removed $removed_count files ($(format_size "$removed_size"))"
-  log_info "New total size: $(format_size $((total_size - removed_size)))"
   echo ""
 }
 
@@ -593,7 +595,7 @@ Options:
   --execute          Execute actions
   --help             Show help
 EOF
-  exit 0
+  exit "${1:-0}"
 }
 
 parse_args() {
@@ -618,10 +620,12 @@ parse_args() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
     --dir)
+      [[ $# -ge 2 ]] || { log_error "Missing value for --dir"; exit 1; }
       TARGET_DIR="$2"
       shift 2
       ;;
     --age)
+      [[ $# -ge 2 ]] || { log_error "Missing value for --age"; exit 1; }
       [[ ! $2 =~ ^[0-9]+$ || $2 -lt 2 ]] && {
         log_error "Age must be integer >= 2"
         exit 1
@@ -658,10 +662,11 @@ parse_args() {
       shift
       ;;
     --max-size)
+      [[ $# -ge 2 ]] || { log_error "Missing value for --max-size"; exit 1; }
       if [[ $2 == "0" ]]; then
         MAX_SIZE_BYTES=0
       else
-        MAX_SIZE_BYTES=$(parse_size "$2")
+        MAX_SIZE_BYTES=$(parse_size "$2" || true)
         if [[ $MAX_SIZE_BYTES -eq 0 ]]; then
           log_error "Invalid size format: $2 (use format like 1TiB, 500GiB, 100GB, or 0 to disable)"
           exit 1
@@ -670,6 +675,7 @@ parse_args() {
       shift 2
       ;;
     --log)
+      [[ $# -ge 2 ]] || { log_error "Missing value for --log"; exit 1; }
       LOG_FILENAME="$2"
       shift 2
       ;;
@@ -691,7 +697,7 @@ parse_args() {
     --help | -h) usage ;;
     *)
       log_error "Unknown option: $1"
-      usage
+      usage 1
       ;;
     esac
   done
@@ -718,7 +724,7 @@ setup_logging() {
   [[ $ENABLE_LOGGING != true ]] && return
   local log_path="${TARGET_DIR}/${LOG_FILENAME}"
   rotate_logs "$log_path" "$MAX_LOG_ROTATIONS"
-  exec > >(tee -a "$log_path")
+  exec > >(tee -a "$log_path") 2>&1
 }
 
 display_config() {
