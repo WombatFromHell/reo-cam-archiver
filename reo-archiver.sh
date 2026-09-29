@@ -763,20 +763,7 @@ main() {
   collect_all_files
 
   echo "============================================================"
-  echo "PHASE 1: Size Limit Enforcement"
-  echo "============================================================"
-  enforce_size_limit
-
-  if [[ $USE_TRASH == true ]] && [[ ${#TRASH_CLEANUP_FILES[@]} -gt 0 ]]; then
-    echo "============================================================"
-    echo "PHASE 2: Trash Cleanup"
-    echo "============================================================"
-    cleanup_trash_folder
-    echo ""
-  fi
-
-  echo "============================================================"
-  echo "PHASE 3: Main File Processing"
+  echo "PHASE 1: Main File Processing"
   echo "============================================================"
 
   PROGRESS_RUN_START=$(date +%s)
@@ -801,6 +788,24 @@ main() {
   fi
 
   clear_progress_line
+
+  if [[ $USE_TRASH == true ]] && [[ ${#TRASH_CLEANUP_FILES[@]} -gt 0 ]]; then
+    echo "============================================================"
+    echo "PHASE 2: Trash Cleanup"
+    echo "============================================================"
+    cleanup_trash_folder
+    echo ""
+  fi
+
+  # Re-collect so the size pass sees post-archive locations (originals
+  # trashed, new archive outputs present) rather than stale pre-archive paths.
+  collect_all_files
+
+  echo "============================================================"
+  echo "PHASE 3: Size Limit Enforcement"
+  echo "============================================================"
+  enforce_size_limit
+
   remove_empty_directories
 
   echo ""

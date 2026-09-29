@@ -161,7 +161,7 @@ archive_out() {
 
 # --- PHASE 1: size limit ---
 
-@test "size limit: over limit trashes oldest first, then archive pass runs" {
+@test "size limit: archive pass runs before size enforcement (both videos transcoded)" {
   local old1 old2
   old1="$(date -d '-20 days' +%Y%m%d%H%M%S)"
   old2="$(date -d '-10 days' +%Y%m%d%H%M%S)"
@@ -171,12 +171,28 @@ archive_out() {
   head -c 1000000 /dev/zero >"$DATA/2024/$old2.mp4"
   MAX_SIZE=1MB run run_archiver --archive "$ARCHIVE" --trash "$TRASH" --age 5 --execute
   [[ $status -eq 0 ]]
-  # oldest trashed by PHASE 1 (size limit), newest by PHASE 3 (archive);
-  # the trashed file is skipped in PHASE 3 instead of aborting the run
-  [[ -f "$TRASH/input/2024/$old1.mp4" ]]
-  [[ -f "$TRASH/input/2024/$old2.mp4" ]]
-  [[ -f "$(archive_out "$old2")" ]]
-  [[ "$output" == *"Size-based cleanup: removed 1 files"* ]]
+  # Both old videos are transcoded by the archive pass (PHASE 1) before
+  # size enforcement (PHASE 3). The old order trashed them first, so
+  # nothing was ever transcoded.
+  grep -q -- "-i $DATA/2024/$old1.mp4" "$FAKE_FFMPEG_LOG"
+  grep -q -- "-i $DATA/2024/$old2.mp4" "$FAKE_FFMPEG_LOG"
+  # Size enforcement still ran and removed files.
+  [[ "$output" == *"Size-based cleanup: removed"* ]]
+}
+
+@test "regression: over limit, old video is transcoded, not trashed first" {
+  local old1
+  old1="$(date -d '-20 days' +%Y%m%d%H%M%S)"
+  mkdir -p "$DATA/2024"
+  # 2MB file at a 1MB limit is OVER the limit, so the size pass triggers.
+  # (A 1MB file at a 1MB limit is "within limit" and would never exercise
+  # the bug — the size pass only acts when total > MAX_SIZE.)
+  head -c 2000000 /dev/zero >"$DATA/2024/$old1.mp4"
+  MAX_SIZE=1MB run run_archiver --archive "$ARCHIVE" --trash "$TRASH" --age 5 --execute
+  [[ $status -eq 0 ]]
+  # The video was transcoded by the archive pass, not trashed first by
+  # size enforcement (the old buggy order). Fails on the pre-fix code.
+  grep -q -- "-i $DATA/2024/$old1.mp4" "$FAKE_FFMPEG_LOG"
 }
 
 # --- PHASE 2: trash cleanup ---
