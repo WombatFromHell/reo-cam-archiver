@@ -383,6 +383,9 @@ handle_archive_strategy() {
 process_file() {
   local file="$1"
   local is_video="$2"
+  # ponytail: PHASE 1 (size limit) may have trashed this file after
+  # collection; skip it instead of aborting the run on the missing file.
+  [[ -f $file ]] || { log_warn "Skipping missing file: $file"; return 0; }
   local filename
   filename=$(basename "$file")
 
