@@ -161,7 +161,7 @@ archive_out() {
 
 # --- PHASE 1: size limit ---
 
-@test "size limit: archive pass runs before size enforcement (both videos transcoded)" {
+@test "pre-check: runs before archive pass (both videos transcoded)" {
   local old1 old2
   old1="$(date -d '-20 days' +%Y%m%d%H%M%S)"
   old2="$(date -d '-10 days' +%Y%m%d%H%M%S)"
@@ -171,12 +171,11 @@ archive_out() {
   head -c 1000000 /dev/zero >"$DATA/2024/$old2.mp4"
   MAX_SIZE=1MB run run_archiver --archive "$ARCHIVE" --trash "$TRASH" --age 5 --execute
   [[ $status -eq 0 ]]
-  # Both old videos are transcoded by the archive pass (PHASE 1) before
-  # size enforcement (PHASE 3). The old order trashed them first, so
-  # nothing was ever transcoded.
+  # The pre-check (PHASE 1) runs before the archive pass (PHASE 2) and skips
+  # the transcode set, so both old videos are still transcoded.
   grep -q -- "-i $DATA/2024/$old1.mp4" "$FAKE_FFMPEG_LOG"
   grep -q -- "-i $DATA/2024/$old2.mp4" "$FAKE_FFMPEG_LOG"
-  # Size enforcement still ran and removed files.
+  # The size pass (pre-check) ran and reported its result.
   [[ "$output" == *"Size-based cleanup: removed"* ]]
 }
 
@@ -195,6 +194,55 @@ archive_out() {
   grep -q -- "-i $DATA/2024/$old1.mp4" "$FAKE_FFMPEG_LOG"
 }
 
+# --- PHASE 1: pre-check (size gate) ---
+
+@test "pre-check: over limit removes trash before archive (priority)" {
+  local trash_ts archive_ts out
+  # Both older than --age (5d) so both are in the pre-check pool; the archive
+  # file is newer than --archive-age (15d) so the archive-age prune leaves it.
+  trash_ts="$(date -d '-10 days' +%Y%m%d%H%M%S)"
+  archive_ts="$(date -d '-14 days' +%Y%m%d%H%M%S)"
+  # 1MB trash (newer) + 1MB archive (older) at a 1MB limit -> over limit.
+  mkdir -p "$TRASH/input"
+  head -c 1000000 /dev/zero >"$TRASH/input/$trash_ts.mp4"
+  out="$(archive_out "$archive_ts")"
+  mkdir -p "$(dirname "$out")"
+  head -c 1000000 /dev/zero >"$out"
+  MAX_SIZE=1MB run run_archiver --archive "$ARCHIVE" --trash "$TRASH" --age 5 --execute
+  [[ $status -eq 0 ]]
+  # trash is removed first (priority), even though it is newer than the archive.
+  [[ ! -f "$TRASH/input/$trash_ts.mp4" ]]
+  # archive (durable copy) survives.
+  [[ -f "$out" ]]
+}
+
+@test "pre-check: does not trash a transcode candidate" {
+  local ts
+  ts="$(date -d '-20 days' +%Y%m%d%H%M%S)"
+  mkdir -p "$DATA/2024"
+  # 2MB input video at a 1MB limit -> over limit, pre-check triggers.
+  head -c 2000000 /dev/zero >"$DATA/2024/$ts.mp4"
+  MAX_SIZE=1MB run run_archiver --archive "$ARCHIVE" --trash "$TRASH" --age 5 --execute
+  [[ $status -eq 0 ]]
+  # The pre-check skips the transcode set, so the video is transcoded, not trashed.
+  grep -q -- "-i $DATA/2024/$ts.mp4" "$FAKE_FFMPEG_LOG"
+  [[ -f "$(archive_out "$ts")" ]]
+}
+
+@test "clobber regression: archive files survive the run that creates them" {
+  local old1 old2
+  old1="$(date -d '-20 days' +%Y%m%d%H%M%S)"
+  old2="$(date -d '-10 days' +%Y%m%d%H%M%S)"
+  mkdir -p "$DATA/2024"
+  head -c 1000000 /dev/zero >"$DATA/2024/$old1.mp4"
+  head -c 1000000 /dev/zero >"$DATA/2024/$old2.mp4"
+  MAX_SIZE=1MB run run_archiver --archive "$ARCHIVE" --trash "$TRASH" --age 5 --execute
+  [[ $status -eq 0 ]]
+  # The archive files created this run are NOT trashed by a post-transcode size pass.
+  [[ -f "$(archive_out "$old1")" ]]
+  [[ -f "$(archive_out "$old2")" ]]
+}
+
 # --- PHASE 2: trash cleanup ---
 
 @test "trash cleanup: trashed files older than TRASH_AGE are purged" {
@@ -205,6 +253,46 @@ archive_out() {
   TRASH_AGE=21 run run_archiver --archive "$ARCHIVE" --trash "$TRASH" --age 5 --execute
   [[ $status -eq 0 ]]
   [[ ! -f "$TRASH/input/$ts.mp4" ]]
+}
+
+# --- PHASE 4: archive-age ---
+
+@test "archive-age: archive file older than 15d is trashed, newer kept" {
+  local old_ts new_ts out
+  old_ts="$(date -d '-20 days' +%Y%m%d%H%M%S)"
+  new_ts="$(new_ts)"
+  out="$(archive_out "$old_ts")"
+  mkdir -p "$(dirname "$out")"
+  head -c 100 /dev/zero >"$out"
+  out="$(archive_out "$new_ts")"
+  mkdir -p "$(dirname "$out")"
+  head -c 100 /dev/zero >"$out"
+  run run_archiver --archive "$ARCHIVE" --trash "$TRASH" --age 5 --execute
+  [[ $status -eq 0 ]]
+  # 20d-old archive file is older than the default 15d -> trashed to .deleted/output/
+  [[ -f "$TRASH/output/${old_ts:0:4}/${old_ts:4:2}/${old_ts:6:2}/archived-$old_ts.mp4" ]]
+  # new archive file is kept
+  [[ -f "$(archive_out "$new_ts")" ]]
+}
+
+@test "archive-age: --archive-age 30 keeps a 20d-old archive file" {
+  local old_ts out
+  old_ts="$(date -d '-20 days' +%Y%m%d%H%M%S)"
+  out="$(archive_out "$old_ts")"
+  mkdir -p "$(dirname "$out")"
+  head -c 100 /dev/zero >"$out"
+  run run_archiver --archive "$ARCHIVE" --trash "$TRASH" --age 5 --archive-age 30 --execute
+  [[ $status -eq 0 ]]
+  # 20d-old archive file is within 30d -> kept
+  [[ -f "$out" ]]
+  [[ ! -f "$TRASH/output/${old_ts:0:4}/${old_ts:4:2}/${old_ts:6:2}/archived-$old_ts.mp4" ]]
+}
+
+@test "cli: --archive-age 0 is a clean error" {
+  run bash "$SCRIPT" --no-log --archive-age 0
+  [[ $status -ne 0 ]]
+  [[ "$output" == *"Archive age must be integer >= 1"* ]]
+  [[ "$output" != *"unbound variable"* ]]
 }
 
 # --- Hygiene ---
@@ -229,6 +317,45 @@ archive_out() {
 }
 
 # --- Bug pins (comprehensive review) ---
+
+@test "bug H1: over-limit run with an old archive file exits 0 (no PHASE 4 abort)" {
+  local ts out
+  ts="$(date -d '-20 days' +%Y%m%d%H%M%S)"
+  out="$(archive_out "$ts")"
+  mkdir -p "$(dirname "$out")"
+  # 2MB archive file at a 1MB limit, older than both --age and --archive-age:
+  # PHASE 1 trashes it; PHASE 4 must skip the now-missing file, not abort.
+  head -c 2000000 /dev/zero >"$out"
+  MAX_SIZE=1MB run run_archiver --archive "$ARCHIVE" --trash "$TRASH" --age 5 --execute
+  [[ $status -eq 0 ]]
+  [[ -f "$TRASH/output/${ts:0:4}/${ts:4:2}/${ts:6:2}/archived-$ts.mp4" ]]
+}
+
+@test "bug H2: MAX_SIZE=0 env disables the size limit" {
+  local ts
+  ts="$(old_ts)"
+  mkdir -p "$DATA/2024"
+  head -c 2000000 /dev/zero >"$DATA/2024/$ts.jpg"
+  MAX_SIZE=0 run run_archiver --trash "$TRASH" --age 5 --execute
+  [[ $status -eq 0 ]]
+  [[ "$output" == *"Size Limit : DISABLED"* ]]
+}
+
+@test "bug H4: --log to a missing subpath is a clean error" {
+  run bash "$SCRIPT" --dir "$DATA" --log sub/dir/file.log
+  [[ $status -ne 0 ]]
+  [[ "$output" == *"Cannot write log file"* ]]
+}
+
+@test "known limitation: filename containing '|' is skipped, not processed" {
+  local ts
+  ts="$(old_ts)"
+  touch "$DATA/evil|$ts.mp4"
+  run run_archiver --archive "$ARCHIVE" --trash "$TRASH" --age 5 --execute
+  [[ $status -eq 0 ]]
+  # The pipe breaks the internal entry format; the file is left alone.
+  [[ -f "$DATA/evil|$ts.mp4" ]]
+}
 
 @test "archive: mixed-case .Mp4 is transcoded, not trashed" {
   local ts
@@ -285,6 +412,82 @@ archive_out() {
   [[ $status -eq 0 ]]
   [[ -f "$DATA/archiver.log" ]]
   grep -q "WARN" "$DATA/archiver.log"
+}
+
+# --- Contract pins (comprehensive review) ---
+
+@test "contract: files directly in TARGET_DIR don't count toward the size limit" {
+  local ts
+  ts="$(old_ts)"
+  head -c 2000000 /dev/zero >"$DATA/$ts.jpg"
+  MAX_SIZE=1MB run run_archiver --trash "$TRASH" --age 5 --no-trash --execute
+  [[ $status -eq 0 ]]
+  # Only YYYY/ year dirs are summed, so the 2MB root file sees "within limit".
+  [[ "$output" == *"within limit"* ]]
+}
+
+@test "cli: --max-size 0 disables the size limit" {
+  run run_archiver --max-size 0 --dry-run
+  [[ $status -eq 0 ]]
+  [[ "$output" == *"Size Limit : DISABLED"* ]]
+}
+
+@test "cli: --age 1 is a clean error" {
+  run bash "$SCRIPT" --no-log --age 1
+  [[ $status -ne 0 ]]
+  [[ "$output" == *"Age must be integer >= 2"* ]]
+}
+
+@test "dry-run: over-limit removes nothing" {
+  local ts
+  ts="$(old_ts)"
+  mkdir -p "$TRASH/input"
+  head -c 2000000 /dev/zero >"$TRASH/input/$ts.mp4"
+  MAX_SIZE=1MB run run_archiver --archive "$ARCHIVE" --trash "$TRASH" --age 5 --dry-run
+  [[ $status -eq 0 ]]
+  [[ -f "$TRASH/input/$ts.mp4" ]]
+}
+
+@test "summary: archived count is reported" {
+  local ts
+  ts="$(old_ts)"
+  touch "$DATA/$ts.mp4"
+  run run_archiver --archive "$ARCHIVE" --trash "$TRASH" --age 5 --execute
+  [[ $status -eq 0 ]]
+  [[ "$output" =~ Archived:[[:space:]]+1[[:space:]]+files ]]
+}
+
+@test "archive: filename with spaces is transcoded and trashed" {
+  local ts
+  ts="$(old_ts)"
+  touch "$DATA/my cam $ts.mp4"
+  run run_archiver --archive "$ARCHIVE" --trash "$TRASH" --age 5 --execute
+  [[ $status -eq 0 ]]
+  [[ -f "$TRASH/input/my cam $ts.mp4" ]]
+  [[ ! -f "$DATA/my cam $ts.mp4" ]]
+}
+
+@test "cli: --max-size accepts 1.5GB and 256gb, rejects bare 256" {
+  run run_archiver --max-size 1.5GB --dry-run
+  [[ $status -eq 0 ]]
+  run run_archiver --max-size 256gb --dry-run
+  [[ $status -eq 0 ]]
+  run run_archiver --max-size 256 --dry-run
+  [[ $status -ne 0 ]]
+  [[ "$output" == *"Invalid size format"* ]]
+}
+
+@test "cli: --archive and --trash without paths use defaults" {
+  run run_archiver --archive --trash --dry-run
+  [[ $status -eq 0 ]]
+  [[ "$output" == *"ARCHIVE -> /data/archived"* ]]
+  [[ "$output" == *"ENABLED -> /data/.deleted"* ]]
+}
+
+@test "env: TRASH_AGE=abc fails without unbound variable" {
+  TRASH_AGE=abc run run_archiver --archive "$ARCHIVE" --trash "$TRASH" --age 5 --execute
+  [[ $status -ne 0 ]]
+  [[ "$output" != *"unbound variable"* ]]
 }
 
 # --- Progress bar ---

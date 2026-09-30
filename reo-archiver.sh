@@ -14,6 +14,7 @@ DEFAULT_ARCHIVE_DIR="/data/archived"
 DEFAULT_TRASH_DIR="/data/.deleted"
 DEFAULT_AGE_DAYS="${MAX_AGE:-14}"
 DEFAULT_TRASH_AGE_DAYS="${TRASH_AGE:-21}"
+DEFAULT_ARCHIVE_AGE_DAYS="${ARCHIVE_AGE:-15}"
 DEFAULT_LOG_FILENAME="archiver.log"
 DEFAULT_DRY_RUN=true
 DEFAULT_MAX_SIZE="${MAX_SIZE:-256GB}"
@@ -36,7 +37,7 @@ MAX_SIZE_BYTES=0
 declare -a SIZE_LIMIT_FILES=()
 declare -a TRASH_CLEANUP_FILES=()
 declare -a MAIN_PROCESSING_FILES=()
-TOTAL_FILE_COUNT=0
+declare -a ARCHIVE_AGE_FILES=()
 
 # --- Progress State ---
 # Progress bar + colors only when stderr is a TTY (so cron runs, whose
@@ -55,21 +56,22 @@ declare -A STATS=(
   [trashed_count]=0 [trashed_size]=0
   [size_limit_count]=0 [size_limit_size]=0
   [trash_cleanup_count]=0 [trash_cleanup_size]=0
+  [archive_age_count]=0 [archive_age_size]=0
 )
 
 # --- Logging & Output ---
-log() { echo -e "$*"; }
+log() { printf '%s\n' "$*"; }
 
 _log() {
   local level="$1" color="$2" fd="$3"
   shift 3
-  local msg="[$level] $*"
-
+  # ponytail: %s for the message — no escape interpretation, so filenames
+  # with backslashes can't be mangled. Colors are trusted constants.
   if [[ $IS_INTERACTIVE == true && -n $color ]]; then
-    msg="[$color$level\033[0m] $*"
+    printf '[%b%s\033[0m] %s\n' "$color" "$level" "$*" >&"$fd"
+  else
+    printf '[%s] %s\n' "$level" "$*" >&"$fd"
   fi
-
-  echo -e "$msg" >&"$fd"
 }
 
 log_info() { _log "INFO" "" 1 "$*"; }
@@ -114,15 +116,9 @@ update_progress_from_ffmpeg() {
 }
 
 # --- Utility Functions ---
-get_file_size() { stat -f%z "$1" 2>/dev/null || stat -c%s "$1" 2>/dev/null; }
+get_file_size() { stat -c%s "$1" 2>/dev/null; }
 get_video_duration() { ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$1" 2>/dev/null | cut -d. -f1 || echo "0"; }
 get_cutoff_timestamp() { date -d "-$1 days" +%Y%m%d%H%M%S; }
-
-extract_timestamp() {
-  local base="${1%.*}"
-  local ts="${base: -14}"
-  [[ ${#ts} -eq 14 ]] && [[ $ts =~ ^[0-9]+$ ]] && echo "$ts" || echo ""
-}
 
 build_archive_path() { echo "${ARCHIVE_DIR}/${1:0:4}/${1:4:2}/${1:6:2}/archived-${1}.mp4"; }
 
@@ -138,7 +134,9 @@ build_trash_path() {
   check_archive_dir="${check_archive_dir%/}"
 
   local source_root="$TARGET_DIR" category="input"
-  if [[ -n $check_archive_dir && $file == "$check_archive_dir"* ]]; then
+  # ponytail: trailing slash — a sibling like /data/archived-evil must not
+  # match the /data/archived prefix.
+  if [[ -n $check_archive_dir && $file == "$check_archive_dir/"* ]]; then
     source_root="$check_archive_dir"
     category="output"
   fi
@@ -161,14 +159,17 @@ collect_all_files() {
   local trash_cutoff_ts
   trash_cutoff_ts=$(get_cutoff_timestamp "$DEFAULT_TRASH_AGE_DAYS")
 
+  local archive_cutoff_ts
+  archive_cutoff_ts=$(get_cutoff_timestamp "$ARCHIVE_AGE_DAYS")
+
   log_info "Collecting files from all managed directories..."
 
   SIZE_LIMIT_FILES=()
   TRASH_CLEANUP_FILES=()
   MAIN_PROCESSING_FILES=()
-  TOTAL_FILE_COUNT=0
+  ARCHIVE_AGE_FILES=()
 
-  local file size filename base ts is_video location
+  local file size filename base ts is_video location prio
   local find_args=()
 
   local sources=()
@@ -196,19 +197,21 @@ collect_all_files() {
         is_video="false"
         [[ ${filename,,} == *.mp4 ]] && is_video="true"
 
-        TOTAL_FILE_COUNT=$((TOTAL_FILE_COUNT + 1))
-
         if [[ $ts < $cutoff_ts ]]; then
-          SIZE_LIMIT_FILES+=("$file|$ts|$size|$location")
+          prio=2
+          [[ $location == "trash" ]] && prio=1
+          [[ $location == "archive" ]] && prio=3
+          SIZE_LIMIT_FILES+=("$file|$ts|$size|$location|$prio")
           [[ $location == "input" ]] && MAIN_PROCESSING_FILES+=("$file|$ts|$size|$is_video")
         fi
 
         [[ $location == "trash" && $ts < $trash_cutoff_ts ]] && TRASH_CLEANUP_FILES+=("$file|$ts|$size")
+        [[ $location == "archive" && $ts < $archive_cutoff_ts ]] && ARCHIVE_AGE_FILES+=("$file|$ts|$size")
       fi
-    done < <(find "${find_args[@]}" 2>/dev/null)
+    # ponytail: no 2>/dev/null — permission/IO errors must reach the log.
+    done < <(find "${find_args[@]}")
   done
 
-  log_info "Collected $TOTAL_FILE_COUNT total files across all directories."
   return 0
 }
 
@@ -237,7 +240,7 @@ parse_size() {
   GIB) multiplier=1073741824 ;;
   TB | T) multiplier=1000000000000 ;;
   TIB) multiplier=1099511627776 ;;
-  B | "") multiplier=1 ;;
+  B) multiplier=1 ;;
   *)
     echo "0"
     return 1
@@ -355,8 +358,7 @@ dispose_file() {
 handle_archive_strategy() {
   local src="$1"
   local filename="$2"
-  local ts
-  ts=$(extract_timestamp "$filename")
+  local ts="$3"
 
   local dest
   dest=$(build_archive_path "$ts")
@@ -386,14 +388,15 @@ handle_archive_strategy() {
 process_file() {
   local file="$1"
   local is_video="$2"
+  local ts="$3"
   # ponytail: PHASE 1 (size limit) may have trashed this file after
   # collection; skip it instead of aborting the run on the missing file.
   [[ -f $file ]] || { log_warn "Skipping missing file: $file"; return 0; }
   local filename
-  filename=$(basename "$file")
+  filename="${file##*/}"
 
   if [[ $ARCHIVE_MODE == true ]] && [[ $is_video == true ]]; then
-    handle_archive_strategy "$file" "$filename"
+    handle_archive_strategy "$file" "$filename" "$ts"
   else
     dispose_file "$file" "Old file"
   fi
@@ -443,26 +446,32 @@ enforce_size_limit() {
   if [[ ${#SIZE_LIMIT_FILES[@]} -gt 0 ]]; then
     while IFS= read -r line; do
       sorted_candidates+=("$line")
-    done < <(printf "%s\n" "${SIZE_LIMIT_FILES[@]}" | sort -t'|' -k2)
+    done < <(printf "%s\n" "${SIZE_LIMIT_FILES[@]}" | sort -t'|' -k5,5n -k2,2)
   fi
 
   log_info "Found ${#sorted_candidates[@]} eligible files older than $AGE_DAYS days."
 
-  # Remove files oldest-first until under the limit. Reuses dispose_file
-  # (same trash/dry-run/logging path as main processing) tagged into the
-  # size_limit_* stat bucket, instead of a second copy of that logic.
+  # Remove files by priority (trash -> input -> archive), oldest-first within
+  # a tier, until under the limit. Reuses dispose_file (same trash/dry-run/
+  # logging path as main processing) tagged into the size_limit_* stat bucket.
   #
   # Files whose location is already "trash" must be force-deleted rather than
   # trashed again: TARGET_DIR is a path prefix of TRASH_DIR, so re-trashing an
   # already-trashed file just re-nests it deeper inside itself and never
   # actually frees any space.
+  #
+  # R1: skip the transcode set (location "input") — this is a start-of-run
+  # pre-check whose job is to make room for the transcodes that follow, so it
+  # must not trash a file the transcode pass is about to process.
   local removed_size=0
   local removed_count=0
 
   for entry in "${sorted_candidates[@]}"; do
     [[ $removed_size -ge $excess ]] && break
 
-    IFS='|' read -r file_path _ file_size location <<<"$entry"
+    IFS='|' read -r file_path _ file_size location _ <<<"$entry"
+
+    [[ $location == "input" ]] && continue
 
     if [[ $location == "trash" ]]; then
       dispose_file "$file_path" "Size limit exceeded (already in trash)" "size_limit" true
@@ -490,10 +499,17 @@ cleanup_trash_folder() {
     for entry in "${TRASH_CLEANUP_FILES[@]}"; do
       IFS='|' read -r file_path _ file_size <<<"$entry"
 
+      # ponytail: PHASE 1 (size limit) may have removed this file after
+      # collection; skip it instead of counting a phantom purge.
+      [[ -f $file_path ]] || continue
+
       if [[ $DRY_RUN == true ]]; then
         log "[DRY-RUN] Would permanently delete from trash: $(basename "$file_path")"
+      elif rm -f "$file_path"; then
+        log "[PERMANENTLY DELETED] $(basename "$file_path")"
       else
-        rm -f "$file_path" && log "[PERMANENTLY DELETED] $(basename "$file_path")"
+        log_warn "Failed to delete: $file_path"
+        continue
       fi
 
       cleaned_count=$((cleaned_count + 1))
@@ -503,7 +519,37 @@ cleanup_trash_folder() {
     done
   fi
 
-  [[ $cleaned_count -gt 0 ]] && log_info "Cleaned $cleaned_count files from trash."
+  # ponytail: `[[ ]] && cmd` as the last line returns 1 when the count is 0,
+  # which set -e turns into a mid-run abort — use an if.
+  if [[ $cleaned_count -gt 0 ]]; then
+    log_info "Cleaned $cleaned_count files from trash."
+  fi
+}
+
+purge_archive_age() {
+  [[ ${#ARCHIVE_AGE_FILES[@]} -eq 0 ]] && return
+
+  log_info "Pruning archived files older than $ARCHIVE_AGE_DAYS days..."
+
+  local cleaned_count=0
+
+  for entry in "${ARCHIVE_AGE_FILES[@]}"; do
+    IFS='|' read -r file_path _ file_size <<<"$entry"
+
+    # ponytail: PHASE 1 (size limit) may have trashed this file after
+    # collection; skip it instead of aborting the run on the missing file.
+    [[ -f $file_path ]] || continue
+
+    # Archive files are not in the trash, so dispose_file trashes them to
+    # .deleted/output/... (timestamp preserved — the file is moved, not renamed).
+    dispose_file "$file_path" "Archive age exceeded" "archive_age"
+
+    cleaned_count=$((cleaned_count + 1))
+  done
+
+  if [[ $cleaned_count -gt 0 ]]; then
+    log_info "Pruned $cleaned_count archived files."
+  fi
 }
 
 remove_empty_directories() {
@@ -527,7 +573,7 @@ remove_empty_directories() {
           fi
         fi
       fi
-    done < <(find "$scan_dir" -mindepth 1 -type d -depth -print0 2>/dev/null || true)
+    done < <(find "$scan_dir" -mindepth 1 -type d -depth -print0 || true)
   done
 }
 
@@ -562,8 +608,14 @@ display_summary() {
     echo ""
   fi
 
-  local total_count=$((STATS[archived_count] + STATS[deleted_count] + STATS[trashed_count] + STATS[size_limit_count] + STATS[trash_cleanup_count]))
-  local total_size=$((STATS[archived_size] + STATS[deleted_size] + STATS[trashed_size] + STATS[size_limit_size] + STATS[trash_cleanup_size]))
+  if [[ ${STATS[archive_age_count]} -gt 0 ]]; then
+    echo "Archive Age Pruning (files older than $ARCHIVE_AGE_DAYS days):"
+    printf "  Trashed:         %d files (%s)\n" "${STATS[archive_age_count]}" "$(format_size "${STATS[archive_age_size]}")"
+    echo ""
+  fi
+
+  local total_count=$((STATS[archived_count] + STATS[deleted_count] + STATS[trashed_count] + STATS[size_limit_count] + STATS[trash_cleanup_count] + STATS[archive_age_count]))
+  local total_size=$((STATS[archived_size] + STATS[deleted_size] + STATS[trashed_size] + STATS[size_limit_size] + STATS[trash_cleanup_size] + STATS[archive_age_size]))
 
   echo "============================================================"
   printf "Total Files Processed: %d files (%s)\n" "$total_count" "$(format_size "$total_size")"
@@ -583,7 +635,8 @@ usage() {
 Usage: $SCRIPT_NAME [OPTIONS]
 Options:
   --dir PATH         Directory to search (Default: $DEFAULT_TARGET_DIR)
-  --age DAYS         Remove files older than this many days (Default: $DEFAULT_AGE_DAYS)
+  --age DAYS         Remove files older than this many days (Default: $DEFAULT_AGE_DAYS, env MAX_AGE)
+  --archive-age DAYS Prune archived files older than this many days (Default: $DEFAULT_ARCHIVE_AGE_DAYS)
   --archive [PATH]   Transcode files to archive directory (Default: $DEFAULT_ARCHIVE_DIR)
   --trash [PATH]     Move deleted files to trash (Default: $DEFAULT_TRASH_DIR)
   --no-trash         Permanently delete files (disabled by default)
@@ -594,6 +647,11 @@ Options:
   --dry-run          Simulate actions (Default)
   --execute          Execute actions
   --help             Show help
+
+Notes:
+  Filenames must not contain '|' (pipe) or newlines: internal file
+  lists are pipe-delimited. Such files are skipped when the size gate
+  is not active; an over-limit run aborts.
 EOF
   exit "${1:-0}"
 }
@@ -601,6 +659,7 @@ EOF
 parse_args() {
   TARGET_DIR="$DEFAULT_TARGET_DIR"
   AGE_DAYS="$DEFAULT_AGE_DAYS"
+  ARCHIVE_AGE_DAYS="$DEFAULT_ARCHIVE_AGE_DAYS"
   DRY_RUN="$DEFAULT_DRY_RUN"
   LOG_FILENAME="$DEFAULT_LOG_FILENAME"
   ENABLE_LOGGING=true
@@ -610,7 +669,12 @@ parse_args() {
   USE_TRASH=true
   TRASH_DIR="$DEFAULT_TRASH_DIR"
 
-  if ! MAX_SIZE_BYTES=$(parse_size "$DEFAULT_MAX_SIZE"); then
+  # ponytail: "0" is the documented disable value — special-case it here
+  # exactly as the --max-size CLI path does, since parse_size rejects bare
+  # numbers (the unit char is mandatory).
+  if [[ $DEFAULT_MAX_SIZE == "0" ]]; then
+    MAX_SIZE_BYTES=0
+  elif ! MAX_SIZE_BYTES=$(parse_size "$DEFAULT_MAX_SIZE"); then
     log_error "Invalid default MAX_SIZE value: '$DEFAULT_MAX_SIZE'"
     exit 1
   fi
@@ -631,6 +695,15 @@ parse_args() {
         exit 1
       }
       AGE_DAYS="$2"
+      shift 2
+      ;;
+    --archive-age)
+      [[ $# -ge 2 ]] || { log_error "Missing value for --archive-age"; exit 1; }
+      [[ ! $2 =~ ^[0-9]+$ || $2 -lt 1 ]] && {
+        log_error "Archive age must be integer >= 1"
+        exit 1
+      }
+      ARCHIVE_AGE_DAYS="$2"
       shift 2
       ;;
     --archive)
@@ -723,6 +796,12 @@ validate_environment() {
 setup_logging() {
   [[ $ENABLE_LOGGING != true ]] && return
   local log_path="${TARGET_DIR}/${LOG_FILENAME}"
+  # ponytail: if tee can't open the file (e.g. missing subdirectory), every
+  # subsequent echo is silently lost while the script exits 0 — fail fast.
+  : >>"$log_path" 2>/dev/null || {
+    log_error "Cannot write log file: $log_path"
+    exit 1
+  }
   rotate_logs "$log_path" "$MAX_LOG_ROTATIONS"
   exec > >(tee -a "$log_path") 2>&1
 }
@@ -763,7 +842,12 @@ main() {
   collect_all_files
 
   echo "============================================================"
-  echo "PHASE 1: Main File Processing"
+  echo "PHASE 1: Pre-check (Size Limit)"
+  echo "============================================================"
+  enforce_size_limit
+
+  echo "============================================================"
+  echo "PHASE 2: Main File Processing"
   echo "============================================================"
 
   PROGRESS_RUN_START=$(date +%s)
@@ -782,8 +866,8 @@ main() {
 
   if [[ ${#MAIN_PROCESSING_FILES[@]} -gt 0 ]]; then
     for entry in "${MAIN_PROCESSING_FILES[@]}"; do
-      IFS='|' read -r file_path _ _ is_video <<<"$entry"
-      process_file "$file_path" "$is_video"
+      IFS='|' read -r file_path ts _ is_video <<<"$entry"
+      process_file "$file_path" "$is_video" "$ts"
     done
   fi
 
@@ -791,26 +875,25 @@ main() {
 
   if [[ $USE_TRASH == true ]] && [[ ${#TRASH_CLEANUP_FILES[@]} -gt 0 ]]; then
     echo "============================================================"
-    echo "PHASE 2: Trash Cleanup"
+    echo "PHASE 3: Trash Cleanup"
     echo "============================================================"
     cleanup_trash_folder
     echo ""
   fi
 
-  # Re-collect so the size pass sees post-archive locations (originals
-  # trashed, new archive outputs present) rather than stale pre-archive paths.
-  collect_all_files
-
-  echo "============================================================"
-  echo "PHASE 3: Size Limit Enforcement"
-  echo "============================================================"
-  enforce_size_limit
+  if [[ ${#ARCHIVE_AGE_FILES[@]} -gt 0 ]]; then
+    echo "============================================================"
+    echo "PHASE 4: Archive Age Pruning"
+    echo "============================================================"
+    purge_archive_age
+    echo ""
+  fi
 
   remove_empty_directories
 
   echo ""
   echo "============================================================"
-  echo "PHASE 4: Summary"
+  echo "PHASE 5: Summary"
   echo "============================================================"
   display_summary
 
